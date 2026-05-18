@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+*.dylib
+
+# Test artifacts
+tests/*.log
+tests/server.pem
+tests/server.key
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

@@ -1,0 +1,46 @@
+# amalgame-net-http — HTTP/1.1 client + server primitives.
+#
+# Pure-Amalgame HTTP/1.1 parser (request line, headers, body parsing —
+# urlencoded form, JSON, multipart). Raw socket I/O is delegated to
+# `amalgame-net` (TcpServer / TcpClient). TLS is delegated to
+# `amalgame-tls` for `https://` endpoints.
+#
+# HTTP/2 support via nghttp2 is planned for v0.1.x (the C runtime
+# header below stubs the public surface so user code does not need to
+# change when HTTP/2 lands).
+#
+# Install:
+#   amc package add net-http
+#
+# This package depends on:
+#   - amalgame-tls   (for HTTPS — already a dep of amalgame-web)
+#
+# See proposal: docs/proposals/amalgame-web.md (§4.2)
+
+[package]
+name              = "amalgame-net-http"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "HTTP/1.1 client+server primitives (pure-AM parser + amalgame-tls for HTTPS)."
+required-amalgame = ">=0.8.29"
+schema-version    = 1
+
+[stdlib]
+# Multi-class manifest. The package ships a pure-AM facade so that
+# every class except the optional nghttp2 binding is pure Amalgame.
+classes   = [
+    "HttpRequest",
+    "HttpResponse",
+    "HttpServer",
+    "HttpClient",
+    "Cookie",
+    "HttpRequestBuilder",
+]
+header    = "runtime/Amalgame_Net_Http.h"
+namespace = "Amalgame.Net.Http"
+facade    = "facade.am"
+
+# `libs` stays empty for v0.1 (HTTP/1.1 only — TLS comes from
+# amalgame-tls, sockets from amalgame-net). nghttp2 will join here
+# when HTTP/2 lands.
+libs = []

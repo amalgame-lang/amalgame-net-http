@@ -15,14 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        amc-tag: [v0.8.33]
+        amc-tag: [v0.8.34]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libgc-dev libssl-dev libcurl4-openssl-dev
+          sudo apt-get install -y libgc-dev libssl-dev libcurl4-openssl-dev libnghttp2-dev
 
       - name: Download amc ${{ matrix.amc-tag }}
         run: |

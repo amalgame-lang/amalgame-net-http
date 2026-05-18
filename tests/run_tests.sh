@@ -95,4 +95,41 @@ sleep 0.3
 wait $SERVER_PID 2>/dev/null || true
 SERVER_PID=""
 
+# ── h2c smoke (HTTP/2 cleartext via nghttp2, v0.2+) ──────────────
+# Mirrors amalgame-tls's smoke pattern: the AM-level e2e would need
+# the package-loader to register itself (chicken-and-egg), so we
+# verify the runtime header builds + nghttp2 links from a small C
+# program. The full AM-level path is exercised by user code in
+# downstream demos / amalgame-web.
+echo -e "\n── h2c smoke (header + nghttp2 link) ──"
+cat > "$BUILD_DIR/h2c_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+int main(void) {
+    GC_INIT();
+    i64 avail = Amalgame_Net_Http_H2_Available();
+    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(0);
+    int listening = Amalgame_Net_Http_H2Server_IsListening(srv);
+    Amalgame_Net_Http_H2Server_Close(srv);
+    printf("H2_Available: %lld\n", (long long)avail);
+    printf("H2Server_Listen(0) ok: %d\n", listening);
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$BUILD_DIR/h2c_smoke.c" \
+    -lnghttp2 -lgc -o "$BUILD_DIR/h2c_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/h2c_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (h2c smoke build)"
+    exit 1
+fi
+SMOKE_OUT=$("$BUILD_DIR/h2c_smoke")
+echo "$SMOKE_OUT"
+if echo "$SMOKE_OUT" | grep -q "H2_Available: 1" && \
+   echo "$SMOKE_OUT" | grep -q "H2Server_Listen(0) ok: 1"; then
+    echo -e "${GREEN}PASS${NC} (nghttp2 detected + linked, H2Server listens)"
+else
+    echo -e "${RED}FAIL${NC} (nghttp2 not detected at compile time)"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

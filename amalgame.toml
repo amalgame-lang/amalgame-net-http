@@ -1,33 +1,35 @@
-# amalgame-net-http — HTTP/1.1 client + server primitives.
+# amalgame-net-http — HTTP/1.1 + HTTP/2 client + server primitives.
 #
-# Pure-Amalgame HTTP/1.1 parser (request line, headers, body parsing —
-# urlencoded form, JSON, multipart). Raw socket I/O is delegated to
-# `amalgame-net` (TcpServer / TcpClient). TLS is delegated to
-# `amalgame-tls` for `https://` endpoints.
+# v0.1: pure-Amalgame HTTP/1.1 parser + render (request line, headers,
+# body parsing — urlencoded form, JSON). Raw socket I/O delegates to
+# `amalgame-net` (TcpServer / TcpClient). TLS for HTTPS delegates to
+# `amalgame-tls`.
 #
-# HTTP/2 support via nghttp2 is planned for v0.1.x (the C runtime
-# header below stubs the public surface so user code does not need to
-# change when HTTP/2 lands).
+# v0.2: nghttp2 binding for h2c (HTTP/2 cleartext) server. Lets you
+# serve HTTP/2 to clients that speak it with prior knowledge — e.g.
+# `curl --http2-prior-knowledge`, gRPC peers, h2 test tooling.
+# TLS + ALPN h2 negotiation is planned for v0.2.x.
 #
 # Install:
 #   amc package add net-http
 #
-# This package depends on:
-#   - amalgame-tls   (for HTTPS — already a dep of amalgame-web)
+# Depends on:
+#   - amalgame-tls (for HTTPS — already a dep of amalgame-web)
+#   - libnghttp2   (system library, for the v0.2 H2 binding)
 #
 # See proposal: docs/proposals/amalgame-web.md (§4.2)
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 client+server primitives (pure-AM parser + amalgame-tls for HTTPS)."
-required-amalgame = ">=0.8.29"
+description       = "HTTP/1.1 + h2c HTTP/2 (nghttp2) client+server primitives."
+required-amalgame = ">=0.8.34"
 schema-version    = 1
 
 [stdlib]
-# Multi-class manifest. The package ships a pure-AM facade so that
-# every class except the optional nghttp2 binding is pure Amalgame.
+# Multi-class manifest. The package ships a pure-AM facade for
+# HTTP/1.1 plus a thin nghttp2 binding for the H2 path.
 classes   = [
     "HttpRequest",
     "HttpResponse",
@@ -35,12 +37,35 @@ classes   = [
     "HttpClient",
     "Cookie",
     "HttpRequestBuilder",
+    "H2Server",
+    "H2Conn",
+    "H2",
+    "Http2",
 ]
 header    = "runtime/Amalgame_Net_Http.h"
 namespace = "Amalgame.Net.Http"
 facade    = "facade.am"
 
-# `libs` stays empty for v0.1 (HTTP/1.1 only — TLS comes from
-# amalgame-tls, sockets from amalgame-net). nghttp2 will join here
-# when HTTP/2 lands.
-libs = []
+libs = ["nghttp2"]
+
+[stdlib.functions]
+# ── H2Server — h2c listening socket (v0.2) ───────────────────────
+H2Server_Listen              = { returns = "AmalgameH2Server*" }
+H2Server_IsListening         = { returns = "code_bool" }
+H2Server_Accept              = { returns = "AmalgameH2Conn*" }
+H2Server_Close               = { returns = "void" }
+# ── H2Conn — h2c server connection (v0.2) ─────────────────────────
+H2Conn_NewFromFd             = { returns = "AmalgameH2Conn*" }
+H2Conn_NextRequest           = { returns = "i64" }
+H2Conn_Method                = { returns = "code_string" }
+H2Conn_Path                  = { returns = "code_string" }
+H2Conn_Authority             = { returns = "code_string" }
+H2Conn_Header                = { returns = "code_string" }
+H2Conn_Body                  = { returns = "code_string" }
+H2Conn_BodyLen               = { returns = "i64" }
+H2Conn_Respond               = { returns = "void" }
+H2Conn_Close                 = { returns = "void" }
+H2_Available                 = { returns = "i64" }
+# (H2.Available — runtime probe for nghttp2 availability)
+# ── Http2.Serve(port, handler) — high-level h2c server entry ─────
+Http2_Serve                  = { returns = "i64" }

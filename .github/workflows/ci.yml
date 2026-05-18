@@ -34,6 +34,7 @@ jobs:
           mkdir -p $RUNNER_TEMP/amc-install
           tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
           echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
 
       - name: Run tests
         run: ./tests/run_tests.sh "$AMC"

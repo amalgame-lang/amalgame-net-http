@@ -1,0 +1,87 @@
+// End-to-end test: spin up an HTTP server in a background thread,
+// hit it with HttpClient, verify the round trip.
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+import Amalgame.Threading
+
+public class ServerThread {
+    public static void Run(HttpServer srv) {
+        srv.Serve(fn(req) {
+            if (req.Path == "/") {
+                return HttpResponse.New().Text("hello, " + req.Method)
+            }
+            if (req.Path == "/echo") {
+                return HttpResponse.New().Text(req.BodyText())
+            }
+            if (req.Path == "/json") {
+                return HttpResponse.New().Json("{\"ok\":true}")
+            }
+            return HttpResponse.New().Status(404).Text("not found")
+        })
+    }
+}
+
+public class Program {
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-http — e2e test")
+
+        // Start server on port 18080 in background.
+        let srv: HttpServer = HttpServer.Listen(":18080", null)
+        Thread.Spawn(fn() { ServerThread.Run(srv) })
+        Thread.SleepMs(200)
+        Console.WriteLine("[PASS] server started")
+
+        // GET /
+        let r1: HttpResponse = HttpClient.Get("http://127.0.0.1:18080/")
+        if (r1.StatusCode == 200 && r1.BodyText == "hello, GET") {
+            Console.WriteLine("[PASS] GET /")
+        } else {
+            Console.WriteLine("[FAIL] GET / got " + String_FromInt(r1.StatusCode) + " '" + r1.BodyText + "'")
+        }
+
+        // POST /echo with body
+        let r2: HttpResponse = HttpClient.Post(
+            "http://127.0.0.1:18080/echo",
+            "round trip payload",
+            "text/plain")
+        if (r2.StatusCode == 200 && r2.BodyText == "round trip payload") {
+            Console.WriteLine("[PASS] POST /echo round-trip")
+        } else {
+            Console.WriteLine("[FAIL] POST /echo got '" + r2.BodyText + "'")
+        }
+
+        // GET /json
+        let r3: HttpResponse = HttpClient.Get("http://127.0.0.1:18080/json")
+        if (r3.StatusCode == 200 && r3.BodyText == "{\"ok\":true}") {
+            Console.WriteLine("[PASS] GET /json")
+        } else {
+            Console.WriteLine("[FAIL] GET /json")
+        }
+
+        // 404
+        let r4: HttpResponse = HttpClient.Get("http://127.0.0.1:18080/missing")
+        if (r4.StatusCode == 404) {
+            Console.WriteLine("[PASS] GET 404")
+        } else {
+            Console.WriteLine("[FAIL] GET 404 got " + String_FromInt(r4.StatusCode))
+        }
+
+        // Custom builder: PATCH with header + JSON body
+        let r5: HttpResponse = HttpClient.Request("PATCH", "http://127.0.0.1:18080/echo")
+            .Header("X-Custom", "abc")
+            .BodyJson("{\"k\":42}")
+            .Send()
+        if (r5.StatusCode == 200 && r5.BodyText == "{\"k\":42}") {
+            Console.WriteLine("[PASS] PATCH /echo via builder")
+        } else {
+            Console.WriteLine("[FAIL] PATCH /echo")
+        }
+
+        srv.Shutdown()
+        Console.WriteLine("done")
+    }
+}

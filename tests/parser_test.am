@@ -13,8 +13,14 @@ public class Program {
     public static void Main(string[] args) {
         Console.WriteLine("amalgame-net-http — parser tests")
 
+        // AM string literals don't escape \r (only \n is recognized).
+        // Build CR LF explicitly from byte 13.
+        let cr: string = String_FromByte(13)
+        let crlf: string = cr + "\n"
+        let dcrlf: string = crlf + crlf
+
         // ── HttpParser.ParseFull: basic GET ────────────────────────
-        let raw1: string = "GET /users/42?x=1&y=hello HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n"
+        let raw1: string = "GET /users/42?x=1&y=hello HTTP/1.1" + crlf + "Host: example.com" + crlf + "User-Agent: test" + dcrlf
         let req1: HttpRequest = HttpParser.ParseFull(raw1)
         if (req1 != null && req1.Method == "GET") {
             Console.WriteLine("[PASS] parse GET method")
@@ -48,7 +54,7 @@ public class Program {
         }
 
         // ── HttpParser.ParseFull: POST with body ───────────────────
-        let raw2: string = "POST /api/login HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 25\r\n\r\nuser=alice&password=secret"
+        let raw2: string = "POST /api/login HTTP/1.1" + crlf + "Content-Type: application/x-www-form-urlencoded" + crlf + "Content-Length: 25" + dcrlf + "user=alice&password=secret"
         let req2: HttpRequest = HttpParser.ParseFull(raw2)
         if (req2 != null && req2.Method == "POST") {
             Console.WriteLine("[PASS] parse POST method")
@@ -76,7 +82,7 @@ public class Program {
         }
 
         // ── Cookie parsing ────────────────────────────────────────
-        let raw3: string = "GET / HTTP/1.1\r\nCookie: sessionid=abc123; theme=dark; lang=fr\r\n\r\n"
+        let raw3: string = "GET / HTTP/1.1" + crlf + "Cookie: sessionid=abc123; theme=dark; lang=fr" + dcrlf
         let req3: HttpRequest = HttpParser.ParseFull(raw3)
         if (req3.Cookie("sessionid") == "abc123" && req3.Cookie("theme") == "dark" && req3.Cookie("lang") == "fr") {
             Console.WriteLine("[PASS] cookie parsing")
@@ -92,7 +98,7 @@ public class Program {
         if (String_Contains(rendered1, "HTTP/1.1 200 OK") &&
             String_Contains(rendered1, "Content-Length: 5") &&
             String_Contains(rendered1, "Content-Type: text/plain") &&
-            String_EndsWith(rendered1, "\r\n\r\nhello")) {
+            String_EndsWith(rendered1, dcrlf + "hello")) {
             Console.WriteLine("[PASS] response render text")
         } else {
             Console.WriteLine("[FAIL] response render text")
@@ -115,6 +121,7 @@ public class Program {
             Console.WriteLine("[PASS] response redirect")
         } else {
             Console.WriteLine("[FAIL] response redirect")
+            Console.WriteLine("  got: " + rendered3)
         }
 
         // ── Cookie serialization ──────────────────────────────────
@@ -135,7 +142,7 @@ public class Program {
         }
 
         // ── Response parsing (client side) ────────────────────────
-        let respRaw: string = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+        let respRaw: string = "HTTP/1.1 200 OK" + crlf + "Content-Type: text/plain" + crlf + "Content-Length: 5" + dcrlf + "hello"
         let resp4: HttpResponse = HttpParser.ParseResponse(respRaw)
         if (resp4 != null && resp4.StatusCode == 200 && resp4.BodyText == "hello") {
             Console.WriteLine("[PASS] response parsing")

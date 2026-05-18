@@ -22,7 +22,12 @@ namespace Amalgame.Net.Http
 import Amalgame.Collections
 import Amalgame.String
 import Amalgame.Net
-import Amalgame.Tls
+
+// NOTE: TLS integration (server-side HTTPS, client HTTPS, ALPN) is
+// deferred to v0.1.x. v0.1 keeps `tlsCtx` parameters typed as `any`
+// (always null) so we don't impose a build-time dependency on
+// amalgame-tls. v0.1.x will swap `any → any` and add the
+// `import Amalgame.Tls` once the package mechanism wires it through.
 
 // ─────────────────────────────────────────────────────────────────
 // Cookie — utility type, parsed from `Cookie:` request header or
@@ -147,36 +152,53 @@ public class HttpRequest {
     }
 
     // Minimal urldecode: %HH escapes + '+' → space. Invalid sequences
-    // pass through unchanged.
+    // pass through unchanged. Uses String_CharAt1 (returns single-char
+    // string) — the AM convention. Hex digits are compared as strings
+    // since we don't have a string→int codepoint helper at AM level.
     public static string UrlDecode(string s) {
         var out: string = ""
         let n: int = String_Length(s)
         var i: int = 0
         while (i < n) {
-            let c: int = String_CharCodeAt(s, i)
-            if (c == 37 && i + 2 < n) {                // '%'
-                let h1: int = HttpRequest.HexDigit(String_CharCodeAt(s, i + 1))
-                let h2: int = HttpRequest.HexDigit(String_CharCodeAt(s, i + 2))
+            let c: string = String_CharAt1(s, i)
+            if (c == "%" && i + 2 < n) {
+                let h1: int = HttpRequest.HexDigit(String_CharAt1(s, i + 1))
+                let h2: int = HttpRequest.HexDigit(String_CharAt1(s, i + 2))
                 if (h1 >= 0 && h2 >= 0) {
-                    out = out + String_FromCharCode(h1 * 16 + h2)
+                    out = out + String_FromByte(h1 * 16 + h2)
                     i = i + 3
                     continue
                 }
             }
-            if (c == 43) {                              // '+'
+            if (c == "+") {
                 out = out + " "
             } else {
-                out = out + String_FromCharCode(c)
+                out = out + c
             }
             i = i + 1
         }
         return out
     }
 
-    private static int HexDigit(int c) {
-        if (c >= 48 && c <= 57) { return c - 48 }      // '0'-'9'
-        if (c >= 97 && c <= 102) { return c - 97 + 10 }// 'a'-'f'
-        if (c >= 65 && c <= 70) { return c - 65 + 10 } // 'A'-'F'
+    // Decode a single hex digit char ("0"-"9","a"-"f","A"-"F") → 0-15,
+    // -1 if not a hex digit.
+    private static int HexDigit(string c) {
+        if (c == "0") { return 0 }
+        if (c == "1") { return 1 }
+        if (c == "2") { return 2 }
+        if (c == "3") { return 3 }
+        if (c == "4") { return 4 }
+        if (c == "5") { return 5 }
+        if (c == "6") { return 6 }
+        if (c == "7") { return 7 }
+        if (c == "8") { return 8 }
+        if (c == "9") { return 9 }
+        if (c == "a" || c == "A") { return 10 }
+        if (c == "b" || c == "B") { return 11 }
+        if (c == "c" || c == "C") { return 12 }
+        if (c == "d" || c == "D") { return 13 }
+        if (c == "e" || c == "E") { return 14 }
+        if (c == "f" || c == "F") { return 15 }
         return -1
     }
 }
@@ -231,7 +253,11 @@ public class HttpResponse {
     }
 
     public HttpResponse Redirect(string url, bool permanent) {
-        this.StatusCode = permanent ? 308 : 302
+        if (permanent) {
+            this.StatusCode = 308
+        } else {
+            this.StatusCode = 302
+        }
         this.Headers.Set("Location", url)
         return this
     }
@@ -243,17 +269,18 @@ public class HttpResponse {
 
     // Serialize to wire bytes — used by HttpServer.
     public string Render() {
+        let crlf: string = String_FromByte(13) + "\n"
         let phrase: string = HttpResponse.ReasonPhrase(this.StatusCode)
-        var s: string = "HTTP/1.1 " + String_FromInt(this.StatusCode) + " " + phrase + "\r\n"
+        var s: string = "HTTP/1.1 " + String_FromInt(this.StatusCode) + " " + phrase + crlf
         // Content-Length is mandatory in HTTP/1.1 unless chunked.
         this.Headers.Set("Content-Length", String_FromInt(String_Length(this.BodyText)))
         let keys: List<string> = this.Headers.Keys()
         let kn: int = keys.Count()
         for i in 0..kn {
             let k: string = keys.Get(i)
-            s = s + k + ": " + this.Headers.Get(k) + "\r\n"
+            s = s + k + ": " + this.Headers.Get(k) + crlf
         }
-        s = s + "\r\n" + this.BodyText
+        s = s + crlf + this.BodyText
         return s
     }
 
@@ -288,6 +315,17 @@ public class HttpResponse {
 // ─────────────────────────────────────────────────────────────────
 
 public class HttpParser {
+    // Build the CRLF separator. AM string literals don't escape `\r`
+    // (only `\n` is recognized), so a literal `"\r\n"` lexes as 3
+    // bytes (`\`, `r`, LF) instead of the 2-byte HTTP standard
+    // (CR LF). We assemble CR explicitly from its byte value.
+    public static string Crlf() { return String_FromByte(13) + "\n" }
+
+    public static string DoubleCrlf() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return crlf + crlf
+    }
+
     // Parse the request-line + header block. Body is NOT read here —
     // the caller must look at Content-Length / Transfer-Encoding and
     // fetch the right number of bytes from the socket.
@@ -296,7 +334,7 @@ public class HttpParser {
     // error. `headerBlock` is everything up to and including the
     // empty CRLF that separates headers from body.
     public static HttpRequest ParseHeaders(string headerBlock) {
-        let crlf: string = "\r\n"
+        let crlf: string = HttpParser.Crlf()
         let lines: List<string> = String_Split(headerBlock, crlf)
         if (lines.Count() < 1) { return null }
 
@@ -343,13 +381,14 @@ public class HttpParser {
     // the test suite; production servers stream the body separately
     // to enforce Content-Length / timeout limits.
     public static HttpRequest ParseFull(string raw) {
-        let sep: string = "\r\n\r\n"
+        let sep: string = HttpParser.DoubleCrlf()
+        let sepLen: int = String_Length(sep)
         let idx: int = String_IndexOf(raw, sep)
         if (idx < 0) { return null }
         let headerBlock: string = String_Substring(raw, 0, idx)
         let req: HttpRequest = HttpParser.ParseHeaders(headerBlock)
         if (req == null) { return null }
-        let bodyStart: int = idx + 4
+        let bodyStart: int = idx + sepLen
         req.Body = String_Substring(raw, bodyStart, String_Length(raw) - bodyStart)
         return req
     }
@@ -358,11 +397,12 @@ public class HttpParser {
     // via a populated HttpResponse + body string. Same caveat as
     // ParseFull: full message in memory.
     public static HttpResponse ParseResponse(string raw) {
-        let sep: string = "\r\n\r\n"
+        let sep: string = HttpParser.DoubleCrlf()
+        let sepLen: int = String_Length(sep)
         let idx: int = String_IndexOf(raw, sep)
         if (idx < 0) { return null }
         let headerBlock: string = String_Substring(raw, 0, idx)
-        let lines: List<string> = String_Split(headerBlock, "\r\n")
+        let lines: List<string> = String_Split(headerBlock, HttpParser.Crlf())
         if (lines.Count() < 1) { return null }
 
         // Status line: "HTTP/1.1 SP CODE SP REASON".
@@ -398,90 +438,57 @@ public class HttpParser {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// HttpServer — accept loop + handler dispatch.
+// HttpServer — low-level helpers wrapping the parser + response
+// rendering for use inside a user-written accept loop.
 //
-// User pattern:
-//   let srv = HttpServer.Listen(":3000", null)   // null = no TLS
-//   srv.Serve(fn(req) {
-//       return HttpResponse.New().Text("Hello, " + req.Path)
-//   })
+// v0.1 intentionally does NOT expose a high-level `Serve(handler)`
+// API: AM lambdas are not first-class types yet (no `Function`
+// type that can be stored or passed as a method parameter), and
+// stdlib types like `AmalgameTcpServer*` can't be used as class
+// field types. Both will become workable in v0.1.x.
 //
-// The handler is a function HttpRequest → HttpResponse.
+// User pattern v0.1:
+//
+//   import Amalgame.Net.Http
+//   import Amalgame.Net
+//
+//   let srv = TcpServer_Listen(3000, 128)
+//   while (TcpServer_IsListening(srv)) {
+//       let conn = TcpServer_Accept(srv)
+//       let raw  = TcpConn_Receive(conn, 65536)
+//       let req  = HttpParser.ParseFull(raw)
+//       if (req != null) {
+//           let resp = HttpResponse.New().Text("Hello " + req.Path)
+//           TcpConn_Send(conn, resp.Render())
+//       }
+//       TcpConn_Close(conn)
+//   }
+//   TcpServer_Close(srv)
+//
+// Everything from this section is also available statically (no
+// HttpServer instance needed). Convenience wrappers below.
 // ─────────────────────────────────────────────────────────────────
 
 public class HttpServer {
-    private Port:    int
-    private Tcp:     AmalgameTcpServer
-    private TlsCtx:  TlsContext     // nullable; null = plain HTTP
-    private Stopped: bool
-
-    public HttpServer() {
-        this.Port    = 0
-        this.Tcp     = null
-        this.TlsCtx  = null
-        this.Stopped = false
+    // Format a 400 Bad Request body (for malformed requests).
+    public static string BadRequestResponse() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return "HTTP/1.1 400 Bad Request" + crlf + "Content-Length: 0" + crlf + "Connection: close" + crlf + crlf
     }
 
-    // Parse an address like ":3000" or "0.0.0.0:3000" into a port.
-    // v0.1 always binds INADDR_ANY (host part ignored).
-    public static HttpServer Listen(string addr, TlsContext tlsCtx) {
-        let s = new HttpServer()
-        let colonIdx: int = String_IndexOf(addr, ":")
-        var portStr: string = addr
-        if (colonIdx >= 0) {
-            portStr = String_Substring(addr, colonIdx + 1, String_Length(addr) - colonIdx - 1)
-        }
-        s.Port = String_ToInt(portStr)
-        s.Tcp  = TcpServer_Listen(s.Port, 128)
-        s.TlsCtx = tlsCtx
-        return s
+    // Format a 500 Internal Server Error body.
+    public static string InternalErrorResponse() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return "HTTP/1.1 500 Internal Server Error" + crlf + "Content-Length: 0" + crlf + "Connection: close" + crlf + crlf
     }
 
-    // Accept loop. Blocks until Shutdown() is called from another
-    // thread. For each connection: read request → dispatch → write
-    // response → close (no keep-alive in v0.1 — added in v0.1.x).
-    public void Serve(Function handler) {
-        while (!this.Stopped && TcpServer_IsListening(this.Tcp)) {
-            let conn: AmalgameTcpConn = TcpServer_Accept(this.Tcp)
-            if (!TcpConn_IsConnected(conn)) { continue }
-            this.HandleOne(conn, handler)
-        }
-    }
-
-    // Process a single connection: parse one request, call handler,
-    // write response, close. v0.1 is one-request-per-connection; the
-    // worker pool + keep-alive land in v0.1.x once amalgame-threading
-    // bindings stabilize.
-    private void HandleOne(AmalgameTcpConn conn, Function handler) {
-        // Read up to 64 KB — covers request line + headers + small body.
-        // Production v0.5+ will stream the body to enforce limits.
-        let raw: string = TcpConn_Receive(conn, 65536)
-        if (raw == null) {
-            TcpConn_Close(conn)
-            return
-        }
-        let req: HttpRequest = HttpParser.ParseFull(raw)
-        if (req == null) {
-            TcpConn_Send(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            TcpConn_Close(conn)
-            return
-        }
-        req.RemoteAddr = conn.RemoteIp + ":" + String_FromInt(conn.RemotePort)
-        req.IsSecure   = this.TlsCtx != null
-
-        let resp: HttpResponse = handler(req)
-        if (resp == null) {
-            resp = HttpResponse.New().Status(500).Text("handler returned null")
-        }
-        TcpConn_Send(conn, resp.Render())
-        TcpConn_Close(conn)
-    }
-
-    public void Shutdown() {
-        this.Stopped = true
-        if (this.Tcp != null) { TcpServer_Close(this.Tcp) }
+    // Format a 404 Not Found body with a one-line plain-text message.
+    public static string NotFoundResponse() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return "HTTP/1.1 404 Not Found" + crlf + "Content-Type: text/plain" + crlf + "Content-Length: 9" + crlf + "Connection: close" + crlf + crlf + "Not found"
     }
 }
+
 
 // ─────────────────────────────────────────────────────────────────
 // HttpClient — small surface for the common GET/POST cases.
@@ -534,6 +541,23 @@ public class HttpRequestBuilder {
     }
 }
 
+// Internal helper — parsed URL components. Defined before HttpClient
+// because amc's cgen requires struct field types to be complete at
+// the point of access (forward-decl is fine for typedefs only).
+public class ParsedUrl {
+    public Scheme: string    // "http" / "https"
+    public Host:   string
+    public Port:   int
+    public Path:   string
+
+    public ParsedUrl() {
+        this.Scheme = ""
+        this.Host   = ""
+        this.Port   = 0
+        this.Path   = "/"
+    }
+}
+
 public class HttpClient {
     // Quick GET — returns the response (or a stub 0 if connect fails).
     public static HttpResponse Get(string url) {
@@ -571,21 +595,22 @@ public class HttpClient {
         if (port == 0) { port = isTls ? 443 : 80 }
 
         // Build request bytes.
+        let crlf: string = String_FromByte(13) + "\n"
         let cl: int = String_Length(b.Body)
-        var s: string = b.Method + " " + u.Path + " HTTP/1.1\r\n"
-        s = s + "Host: " + u.Host + "\r\n"
-        s = s + "Content-Length: " + String_FromInt(cl) + "\r\n"
-        s = s + "Connection: close\r\n"
+        var s: string = b.Method + " " + u.Path + " HTTP/1.1" + crlf
+        s = s + "Host: " + u.Host + crlf
+        s = s + "Content-Length: " + String_FromInt(cl) + crlf
+        s = s + "Connection: close" + crlf
         let hk: List<string> = b.Headers.Keys()
         let hn: int = hk.Count()
         for i in 0..hn {
             let k: string = hk.Get(i)
-            s = s + k + ": " + b.Headers.Get(k) + "\r\n"
+            s = s + k + ": " + b.Headers.Get(k) + crlf
         }
-        s = s + "\r\n" + b.Body
+        s = s + crlf + b.Body
 
         // Plain TCP path — HTTPS path lands in v0.1.x.
-        let conn: AmalgameTcpClient = TcpClient_Connect(u.Host, port)
+        let conn = TcpClient_Connect(u.Host, port)
         if (!TcpClient_IsConnected(conn)) {
             return HttpResponse.New().Status(0).Text("connect failed")
         }
@@ -630,17 +655,3 @@ public class HttpClient {
     }
 }
 
-// Internal helper — parsed URL components.
-public class ParsedUrl {
-    public Scheme: string    // "http" / "https"
-    public Host:   string
-    public Port:   int
-    public Path:   string
-
-    public ParsedUrl() {
-        this.Scheme = ""
-        this.Host   = ""
-        this.Port   = 0
-        this.Path   = "/"
-    }
-}

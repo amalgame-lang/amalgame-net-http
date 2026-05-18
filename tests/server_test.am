@@ -1,0 +1,54 @@
+// e2e test, server side: runs a one-shot HTTP/1.1 server on 18080.
+// Serves 5 requests then exits.
+//
+// Run alongside client_test.am via run_tests.sh.
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net
+import Amalgame.Net.Http
+
+public class Program {
+    public static void Main(string[] args) {
+        let srv = TcpServer_Listen(18080, 16)
+        if (!TcpServer_IsListening(srv)) {
+            Console.WriteLine("[FAIL] server listen")
+            return
+        }
+        Console.WriteLine("[PASS] server listening on 18080")
+
+        var served: int = 0
+        while (served < 5 && TcpServer_IsListening(srv)) {
+            let conn = TcpServer_Accept(srv)
+            let raw: string = TcpConn_Receive(conn, 65536)
+            if (raw == null) {
+                TcpConn_Close(conn)
+                continue
+            }
+            let req: HttpRequest = HttpParser.ParseFull(raw)
+            if (req == null) {
+                TcpConn_Send(conn, HttpServer.BadRequestResponse())
+                TcpConn_Close(conn)
+                continue
+            }
+            var resp: HttpResponse = new HttpResponse()
+            if (req.Path == "/") {
+                resp = HttpResponse.New().Text("hello, " + req.Method)
+            } else if (req.Path == "/echo") {
+                resp = HttpResponse.New().Text(req.BodyText())
+            } else if (req.Path == "/json") {
+                resp = HttpResponse.New().Json("{\"ok\":true}")
+            } else {
+                resp = HttpResponse.New().Status(404).Text("not found")
+            }
+            TcpConn_Send(conn, resp.Render())
+            TcpConn_Close(conn)
+            served = served + 1
+            Console.WriteLine("served " + String_FromInt(served) + ": " + req.Method + " " + req.Path)
+        }
+        TcpServer_Close(srv)
+        Console.WriteLine("[PASS] server done after " + String_FromInt(served) + " requests")
+    }
+}

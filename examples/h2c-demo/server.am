@@ -1,0 +1,61 @@
+// Mosaic-style demo server — HTTP/2 cleartext via amalgame-net-http
+// v0.2. Three routes: homepage, JSON API, echo.
+//
+// Run:
+//   amc build server.am
+//   ./server
+//
+// Test (in another shell):
+//   curl --http2-prior-knowledge -v http://localhost:3000/
+//   curl --http2-prior-knowledge http://localhost:3000/api/info
+//   curl --http2-prior-knowledge -d 'ping' http://localhost:3000/echo
+
+namespace Demo
+
+import Amalgame.Net.Http
+
+public class Program {
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-http v0.2 — h2c demo")
+        Console.WriteLine("  nghttp2 available: " + String_FromInt(H2.Available()))
+        Console.WriteLine("  listening on http://localhost:3000")
+        Console.WriteLine("  try:  curl --http2-prior-knowledge http://localhost:3000/")
+        Console.WriteLine("")
+
+        let handler = conn => {
+            let path: string   = H2Conn.Path(conn)
+            let method: string = H2Conn.Method(conn)
+            Console.WriteLine("[" + method + "] " + path)
+
+            if (path == "/") {
+                let html: string = "<!doctype html><html><head><title>Amalgame H2</title>" +
+                    "<style>body{font-family:system-ui,sans-serif;max-width:42em;margin:3em auto;color:#222}" +
+                    "code{background:#f4f4f4;padding:2px 6px;border-radius:3px}" +
+                    "</style></head><body>" +
+                    "<h1>Hello HTTP/2</h1>" +
+                    "<p>Served by <code>amalgame-net-http v0.2</code> over h2c " +
+                    "(HTTP/2 cleartext).</p>" +
+                    "<p>Routes: <code>/</code>, <code>/api/info</code>, <code>/echo</code></p>" +
+                    "</body></html>"
+                H2Conn.Respond(conn, 200, "text/html; charset=utf-8", html)
+            } else if (path == "/api/info") {
+                let json: string = "{\"server\":\"amalgame-net-http\",\"version\":\"0.2.0\"," +
+                    "\"protocol\":\"HTTP/2\",\"transport\":\"h2c\"," +
+                    "\"powered_by\":\"nghttp2 + Amalgame\"}"
+                H2Conn.Respond(conn, 200, "application/json", json)
+            } else if (path == "/echo") {
+                let body: string = H2Conn.Body(conn)
+                let n: int       = H2Conn.BodyLen(conn)
+                let reply: string = "Method: " + method + "\nPath: " + path +
+                    "\nBody length: " + String_FromInt(n) + " bytes" +
+                    "\nBody: " + body + "\n"
+                H2Conn.Respond(conn, 200, "text/plain", reply)
+            } else {
+                H2Conn.Respond(conn, 404, "text/plain", "Not Found\n")
+            }
+            return 0
+        }
+
+        Http2.Serve(3000, handler)
+    }
+}

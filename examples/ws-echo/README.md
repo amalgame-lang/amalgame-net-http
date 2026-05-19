@@ -6,10 +6,16 @@ a WS server that echoes every text message it receives.
 ## Run
 
 ```bash
-amc package add net-http@v0.4.0
+cd examples/ws-echo
+amc package add net-http@v0.4.0   # populates amalgame.lock next to amalgame.toml
 amc build server.am
-./server                # listens on ws://localhost:8080
+./server                           # listens on ws://localhost:8080
 ```
+
+The `amc package add` call must run **inside this directory** — it
+writes `amalgame.lock` here. If you skip it (or run it from a
+different cwd) the resolver won't find the `net-http` dep and the
+build dies with `Unknown symbol 'WsConn'`.
 
 Open [`client.html`](client.html) in your browser (just
 double-click the file; no HTTP server needed since the JS connects

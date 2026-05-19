@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.4.0"
+version           = "0.4.1"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.34"
 schema-version    = 1
 
@@ -53,6 +53,8 @@ classes   = [
     "WsServer",
     "WsConn",
     "Ws",
+    "WssServer",
+    "Wss",
 ]
 header    = "runtime/Amalgame_Net_Http.h"
 namespace = "Amalgame.Net.Http"
@@ -115,3 +117,10 @@ WsConn_SendText              = { returns = "code_bool" }
 WsConn_IsClosed              = { returns = "code_bool" }
 WsConn_Close                 = { returns = "void" }
 Ws_Serve                     = { returns = "i64" }
+
+# ── WssServer / Wss.Serve — wss:// (WebSocket over TLS, v0.4.1) ──
+WssServer_Listen             = { returns = "AmalgameWssServer*" }
+WssServer_IsListening        = { returns = "code_bool" }
+WssServer_Accept             = { returns = "AmalgameWsConn*" }
+WssServer_Close              = { returns = "void" }
+Wss_Serve                    = { returns = "i64" }

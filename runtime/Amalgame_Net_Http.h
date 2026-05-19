@@ -1283,6 +1283,7 @@ typedef struct AmalgameWsServer {
 typedef struct AmalgameWsConn {
     int       fd;
     int32_t   closed;
+    SSL*      ssl;        /* non-NULL on the wss:// path (v0.4.1+) */
 } AmalgameWsConn;
 
 /* ── Server lifecycle ──────────────────────────────────────────── */
@@ -1340,31 +1341,58 @@ static int amalgame_ws_compute_accept(const char* key_b64, size_t key_len,
 }
 
 /* ── Frame helpers ────────────────────────────────────────────── */
-/* Read N bytes off fd. Returns 0 on success, -1 on error/EOF. */
-static int amalgame_ws_read_full(int fd, void* buf, size_t n) {
+/* Read N bytes. When `ssl` is non-NULL, route through SSL_read
+ * (wss:// path); otherwise raw recv() on `fd`. Returns 0 on
+ * success, -1 on error/EOF. */
+static int amalgame_ws_read_full(int fd, SSL* ssl, void* buf, size_t n) {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = recv(fd, (char*)buf + got, n - got, 0);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+        ssize_t r;
+        if (ssl) {
+            int rr = SSL_read(ssl, (char*)buf + got, (int)(n - got));
+            if (rr > 0) {
+                r = rr;
+            } else {
+                int err = SSL_get_error(ssl, rr);
+                if (err == SSL_ERROR_ZERO_RETURN) return -1;
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+                return -1;
+            }
+        } else {
+            r = recv(fd, (char*)buf + got, n - got, 0);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (r == 0) return -1;
         }
-        if (r == 0) return -1;
         got += (size_t)r;
     }
     return 0;
 }
 
-/* Write N bytes to fd. Returns 0 on success, -1 on error. */
-static int amalgame_ws_write_full(int fd, const void* buf, size_t n) {
+/* Write N bytes. When `ssl` is non-NULL, route through SSL_write. */
+static int amalgame_ws_write_full(int fd, SSL* ssl, const void* buf, size_t n) {
     size_t sent = 0;
     while (sent < n) {
-        ssize_t w = send(fd, (const char*)buf + sent, n - sent, 0);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+        ssize_t w;
+        if (ssl) {
+            int ww = SSL_write(ssl, (const char*)buf + sent, (int)(n - sent));
+            if (ww > 0) {
+                w = ww;
+            } else {
+                int err = SSL_get_error(ssl, ww);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+                return -1;
+            }
+        } else {
+            w = send(fd, (const char*)buf + sent, n - sent, 0);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (w == 0) return -1;
         }
-        if (w == 0) return -1;
         sent += (size_t)w;
     }
     return 0;
@@ -1372,7 +1400,7 @@ static int amalgame_ws_write_full(int fd, const void* buf, size_t n) {
 
 /* Send a server-to-client frame. opcode 0x1=text, 0x2=binary,
  * 0x8=close, 0x9=ping, 0xA=pong. MASK=0 (server doesn't mask). */
-static int amalgame_ws_send_frame(int fd, int opcode,
+static int amalgame_ws_send_frame(int fd, SSL* ssl, int opcode,
                                     const char* payload, size_t plen) {
     unsigned char hdr[10];
     int hlen;
@@ -1391,8 +1419,8 @@ static int amalgame_ws_send_frame(int fd, int opcode,
         for (int i = 0; i < 8; i++) hdr[2 + i] = (unsigned char)(pl >> ((7 - i) * 8));
         hlen = 10;
     }
-    if (amalgame_ws_write_full(fd, hdr, hlen) < 0) return -1;
-    if (plen > 0 && amalgame_ws_write_full(fd, payload, plen) < 0) return -1;
+    if (amalgame_ws_write_full(fd, ssl, hdr, hlen) < 0) return -1;
+    if (plen > 0 && amalgame_ws_write_full(fd, ssl, payload, plen) < 0) return -1;
     return 0;
 }
 
@@ -1400,32 +1428,32 @@ static int amalgame_ws_send_frame(int fd, int opcode,
  * *out (GC), sets *out_len, *opcode_out. Returns 0 on success,
  * -1 on protocol error / EOF. PING is replied with PONG
  * transparently and we loop until a non-PING frame arrives. */
-static int amalgame_ws_recv_frame(int fd, char** out, size_t* out_len,
+static int amalgame_ws_recv_frame(int fd, SSL* ssl, char** out, size_t* out_len,
                                     int* opcode_out) {
     for (;;) {
         unsigned char hdr[2];
-        if (amalgame_ws_read_full(fd, hdr, 2) < 0) return -1;
+        if (amalgame_ws_read_full(fd, ssl, hdr, 2) < 0) return -1;
         int fin    = (hdr[0] & 0x80) >> 7;
         int opcode = hdr[0] & 0x0F;
         int masked = (hdr[1] & 0x80) >> 7;
         uint64_t plen = hdr[1] & 0x7F;
         if (plen == 126) {
             unsigned char ext[2];
-            if (amalgame_ws_read_full(fd, ext, 2) < 0) return -1;
+            if (amalgame_ws_read_full(fd, ssl, ext, 2) < 0) return -1;
             plen = ((uint64_t)ext[0] << 8) | ext[1];
         } else if (plen == 127) {
             unsigned char ext[8];
-            if (amalgame_ws_read_full(fd, ext, 8) < 0) return -1;
+            if (amalgame_ws_read_full(fd, ssl, ext, 8) < 0) return -1;
             plen = 0;
             for (int i = 0; i < 8; i++) plen = (plen << 8) | ext[i];
         }
         if (plen > AMALGAME_WS_MAX_PAYLOAD) return -1;
         unsigned char mask[4] = {0};
         if (masked) {
-            if (amalgame_ws_read_full(fd, mask, 4) < 0) return -1;
+            if (amalgame_ws_read_full(fd, ssl, mask, 4) < 0) return -1;
         }
         char* buf = (char*)GC_MALLOC_ATOMIC((size_t)plen + 1);
-        if (plen > 0 && amalgame_ws_read_full(fd, buf, (size_t)plen) < 0) return -1;
+        if (plen > 0 && amalgame_ws_read_full(fd, ssl, buf, (size_t)plen) < 0) return -1;
         if (masked) {
             for (uint64_t i = 0; i < plen; i++) buf[i] ^= mask[i & 3];
         }
@@ -1433,7 +1461,7 @@ static int amalgame_ws_recv_frame(int fd, char** out, size_t* out_len,
 
         if (opcode == 0x9) {
             /* PING — auto-respond with PONG. */
-            amalgame_ws_send_frame(fd, 0xA, buf, (size_t)plen);
+            amalgame_ws_send_frame(fd, ssl, 0xA, buf, (size_t)plen);
             continue;
         }
         if (opcode == 0xA) {
@@ -1459,12 +1487,12 @@ static inline code_string Amalgame_Net_Http_WsConn_ReceiveText(
     char* buf = NULL;
     size_t blen = 0;
     int op = 0;
-    if (amalgame_ws_recv_frame(c->fd, &buf, &blen, &op) < 0) {
+    if (amalgame_ws_recv_frame(c->fd, c->ssl, &buf, &blen, &op) < 0) {
         c->closed = 1;
         return "";
     }
     if (op == 0x8) {                   /* CLOSE */
-        amalgame_ws_send_frame(c->fd, 0x8, "", 0);
+        amalgame_ws_send_frame(c->fd, c->ssl, 0x8, "", 0);
         c->closed = 1;
         return "";
     }
@@ -1478,7 +1506,7 @@ static inline code_bool Amalgame_Net_Http_WsConn_SendText(
         AmalgameWsConn* c, code_string msg) {
     if (!c || c->closed || c->fd < 0 || !msg) return 0;
     size_t mlen = strlen(msg);
-    if (amalgame_ws_send_frame(c->fd, 0x1, msg, mlen) < 0) {
+    if (amalgame_ws_send_frame(c->fd, c->ssl, 0x1, msg, mlen) < 0) {
         c->closed = 1;
         return 0;
     }
@@ -1493,7 +1521,12 @@ static inline code_bool Amalgame_Net_Http_WsConn_IsClosed(
 static inline void Amalgame_Net_Http_WsConn_Close(AmalgameWsConn* c) {
     if (!c) return;
     if (!c->closed && c->fd >= 0) {
-        amalgame_ws_send_frame(c->fd, 0x8, "", 0);
+        amalgame_ws_send_frame(c->fd, c->ssl, 0x8, "", 0);
+    }
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
     }
     if (c->fd >= 0) close(c->fd);
     c->fd = -1; c->closed = 1;
@@ -1501,16 +1534,24 @@ static inline void Amalgame_Net_Http_WsConn_Close(AmalgameWsConn* c) {
 
 /* ── Upgrade handshake + accept ─────────────────────────────────── */
 
-/* Read a CRLF-terminated header line from fd into buf. Returns the
- * line length (excluding CRLF), -1 on error, 0 on empty line (end
- * of headers). */
-static int amalgame_ws_read_header_line(int fd, char* buf, size_t cap) {
+/* Read a CRLF-terminated header line. Reads one byte at a time so
+ * we stop exactly at the end of the line — leftover bytes (the WS
+ * frames that may follow the empty line) stay buffered in the
+ * socket / SSL session for the frame parser to pick up. Returns
+ * the line length excl. CRLF, 0 on empty line, -1 on error/EOF. */
+static int amalgame_ws_read_header_line(int fd, SSL* ssl,
+                                         char* buf, size_t cap) {
     size_t i = 0;
     char prev = 0;
     while (i < cap - 1) {
         char c;
-        ssize_t r = recv(fd, &c, 1, 0);
-        if (r != 1) return -1;
+        if (ssl) {
+            int r = SSL_read(ssl, &c, 1);
+            if (r != 1) return -1;
+        } else {
+            ssize_t r = recv(fd, &c, 1, 0);
+            if (r != 1) return -1;
+        }
         buf[i++] = c;
         if (prev == '\r' && c == '\n') {
             buf[i - 2] = 0;
@@ -1521,32 +1562,22 @@ static int amalgame_ws_read_header_line(int fd, char* buf, size_t cap) {
     return -1;
 }
 
-/* Accept one connection + perform WS handshake. Returns the new
- * AmalgameWsConn, or NULL on handshake failure. */
-static inline AmalgameWsConn* Amalgame_Net_Http_WsServer_Accept(
-        AmalgameWsServer* s) {
-    if (!s || !s->listening || s->fd < 0) return NULL;
-    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
-    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
-    if (cfd < 0) return NULL;
-
-    /* Read request headers, find Sec-WebSocket-Key. */
+/* Run the WebSocket upgrade handshake on a connected (and, if TLS,
+ * post-handshake) socket. Returns a fresh AmalgameWsConn on success,
+ * NULL on protocol error (closes the fd in that case). */
+static inline AmalgameWsConn* amalgame_ws_do_upgrade(int cfd, SSL* ssl) {
     char key[256] = {0};
     int seen_upgrade = 0;
     char line[1024];
     int rv;
-    /* request line */
-    rv = amalgame_ws_read_header_line(cfd, line, sizeof(line));
-    if (rv <= 0) { close(cfd); return NULL; }
-    /* headers */
-    while ((rv = amalgame_ws_read_header_line(cfd, line, sizeof(line))) > 0) {
+    rv = amalgame_ws_read_header_line(cfd, ssl, line, sizeof(line));
+    if (rv <= 0) goto fail;
+    while ((rv = amalgame_ws_read_header_line(cfd, ssl, line, sizeof(line))) > 0) {
         if (strncasecmp(line, "Sec-WebSocket-Key:", 18) == 0) {
             const char* v = line + 18;
             while (*v == ' ' || *v == '\t') v++;
             strncpy(key, v, sizeof(key) - 1);
         } else if (strncasecmp(line, "Upgrade:", 8) == 0) {
-            /* Case-insensitive substring search for "websocket".
-             * Avoids GNU strcasestr — keeps header POSIX-pure. */
             const char* p = line;
             while (*p) {
                 if ((p[0] == 'w' || p[0] == 'W') &&
@@ -1557,36 +1588,44 @@ static inline AmalgameWsConn* Amalgame_Net_Http_WsServer_Accept(
             }
         }
     }
-    if (rv < 0) { close(cfd); return NULL; }
+    if (rv < 0) goto fail;
     if (!seen_upgrade || !key[0]) {
         const char* bad = "HTTP/1.1 400 Bad Request\r\n"
-                          "Content-Length: 0\r\n"
-                          "Connection: close\r\n\r\n";
-        send(cfd, bad, strlen(bad), 0);
-        close(cfd);
-        return NULL;
+                          "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        amalgame_ws_write_full(cfd, ssl, bad, strlen(bad));
+        goto fail;
     }
 
-    /* Compute Sec-WebSocket-Accept. */
     char accept_b64[40];
     int alen2 = amalgame_ws_compute_accept(key, strlen(key),
                                             accept_b64, sizeof(accept_b64));
-    if (alen2 < 0) { close(cfd); return NULL; }
+    if (alen2 < 0) goto fail;
 
-    /* Send 101 response. */
     char resp[512];
     int rlen = snprintf(resp, sizeof(resp),
         "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %s\r\n\r\n", accept_b64);
-    if (amalgame_ws_write_full(cfd, resp, rlen) < 0) {
-        close(cfd); return NULL;
-    }
+    if (amalgame_ws_write_full(cfd, ssl, resp, rlen) < 0) goto fail;
 
     AmalgameWsConn* c = (AmalgameWsConn*)GC_MALLOC(sizeof(*c));
-    c->fd = cfd; c->closed = 0;
+    c->fd = cfd; c->closed = 0; c->ssl = ssl;
     return c;
+
+fail:
+    if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
+    close(cfd);
+    return NULL;
+}
+
+/* Accept one connection + perform WS handshake (raw ws://). */
+static inline AmalgameWsConn* Amalgame_Net_Http_WsServer_Accept(
+        AmalgameWsServer* s) {
+    if (!s || !s->listening || s->fd < 0) return NULL;
+    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
+    if (cfd < 0) return NULL;
+    return amalgame_ws_do_upgrade(cfd, NULL);
 }
 
 /* ── High-level entry point: Ws.Serve(port, handler) ────────────── */
@@ -1613,6 +1652,149 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
         Amalgame_Net_Http_WsConn_Close(conn);
     }
     Amalgame_Net_Http_WsServer_Close(srv);
+    return 0;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * WssServer — wss:// (TLS-wrapped WebSocket), v0.4.1+
+ *
+ * Same shape as `WsServer` plus an SSL_CTX. For each accepted TCP
+ * connection we SSL_accept, then run the WebSocket upgrade
+ * handshake over SSL_read/SSL_write, and hand back a WsConn whose
+ * `ssl` field is set — all subsequent frame I/O routes through
+ * SSL_read/SSL_write transparently (same code path as ws://, the
+ * helpers branch on conn->ssl).
+ *
+ *     Wss.Serve(443, "cert.pem", "key.pem", handler)
+ *
+ * Browsers reach this endpoint with `new WebSocket("wss://host/")`
+ * which is the only allowed form when the page is loaded over
+ * HTTPS (mixed-content rules forbid plain ws://).
+ *
+ * Same constraints as the Ws server (no fragmentation, 1 MB payload
+ * cap) + the constraints of the Https server (one cert per
+ * listener, TLS 1.2+).
+ * ──────────────────────────────────────────────────────────────── */
+
+typedef struct AmalgameWssServer {
+    int       fd;
+    int32_t   listening;
+    i64       port;
+    SSL_CTX*  ssl_ctx;
+} AmalgameWssServer;
+
+static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
+        i64 port, code_string cert_file, code_string key_file) {
+    AmalgameWssServer* s =
+        (AmalgameWssServer*)GC_MALLOC(sizeof(AmalgameWssServer));
+    memset(s, 0, sizeof(*s));
+    s->port = port; s->fd = -1;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return s;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 64) < 0) {
+        close(fd); return s;
+    }
+    s->fd = fd;
+
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) { close(fd); s->fd = -1; return s; }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        close(fd); s->fd = -1;
+        return s;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        fprintf(stderr, "Wss.Serve: cert/key mismatch\n");
+        SSL_CTX_free(ctx);
+        close(fd); s->fd = -1;
+        return s;
+    }
+    s->ssl_ctx = ctx;
+    s->listening = 1;
+    return s;
+}
+
+static inline code_bool Amalgame_Net_Http_WssServer_IsListening(
+        AmalgameWssServer* s) {
+    return s && s->listening ? 1 : 0;
+}
+
+static inline AmalgameWsConn* Amalgame_Net_Http_WssServer_Accept(
+        AmalgameWssServer* s) {
+    if (!s || !s->listening || s->fd < 0) return NULL;
+    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
+    if (cfd < 0) return NULL;
+
+    SSL* ssl = SSL_new(s->ssl_ctx);
+    if (!ssl) { close(cfd); return NULL; }
+    SSL_set_fd(ssl, cfd);
+    int rv = SSL_accept(ssl);
+    if (rv != 1) {
+        fprintf(stderr, "Wss.Serve: TLS handshake failed\n");
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        close(cfd);
+        return NULL;
+    }
+    return amalgame_ws_do_upgrade(cfd, ssl);
+}
+
+static inline void Amalgame_Net_Http_WssServer_Close(AmalgameWssServer* s) {
+    if (!s) return;
+    if (s->fd >= 0) close(s->fd);
+    if (s->ssl_ctx) SSL_CTX_free(s->ssl_ctx);
+    s->fd = -1; s->ssl_ctx = NULL; s->listening = 0;
+}
+
+static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
+                                               code_string cert_file,
+                                               code_string key_file,
+                                               AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Wss.Serve: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Wss.Serve: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_Listen(
+        port, cert_file, key_file);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Wss.Serve: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Wss.Serve: listening on :%lld (wss://)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening) {
+        AmalgameWsConn* conn = Amalgame_Net_Http_WssServer_Accept(srv);
+        if (!conn) continue;
+        AmalgameClosure_call1(handler, (void*)conn);
+        Amalgame_Net_Http_WsConn_Close(conn);
+    }
+    Amalgame_Net_Http_WssServer_Close(srv);
     return 0;
 }
 
@@ -1643,6 +1825,22 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
         AmalgameClosure* h) {
     (void)port; (void)h;
     fprintf(stderr, "Ws.Serve: built without OpenSSL — SHA1+base64 needed for the upgrade handshake.\n");
+    return -3;
+}
+typedef struct AmalgameWssServer AmalgameWssServer;
+static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
+        i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
+static inline code_bool Amalgame_Net_Http_WssServer_IsListening(
+        AmalgameWssServer* s) { (void)s; return 0; }
+static inline AmalgameWsConn* Amalgame_Net_Http_WssServer_Accept(
+        AmalgameWssServer* s) { (void)s; return NULL; }
+static inline void Amalgame_Net_Http_WssServer_Close(AmalgameWssServer* s) {
+    (void)s;
+}
+static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h;
+    fprintf(stderr, "Wss.Serve: built without OpenSSL.\n");
     return -3;
 }
 

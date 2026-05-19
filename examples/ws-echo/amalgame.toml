@@ -1,10 +1,12 @@
+
 [package]
-name        = "ws-echo"
-version     = "0.1.0"
-entry       = "server.am"
+name = "ws-echo"
+version = "0.1.0"
+entry = "server.am"
 description = "WebSocket echo demo for amalgame-net-http v0.4."
 
-[[dependencies]]
-name = "net-http"
-git  = "github.com/amalgame-lang/amalgame-net-http"
-tag  = "v0.4.0"
+[dependencies]
+
+[dependencies.http]
+git = "github.com/amalgame-lang/amalgame-net-http"
+tag = "v0.4.0"

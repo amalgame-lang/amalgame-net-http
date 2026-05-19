@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.2.1"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + h2c HTTP/2 client+server primitives (nghttp2)."
+description       = "HTTP/1.1 + HTTP/2 client+server (h2c + HTTPS+ALPN h2)."
 required-amalgame = ">=0.8.34"
 schema-version    = 1
 
@@ -48,12 +48,14 @@ classes   = [
     "H2Conn",
     "H2",
     "Http2",
+    "HttpsServer",
+    "Https",
 ]
 header    = "runtime/Amalgame_Net_Http.h"
 namespace = "Amalgame.Net.Http"
 facade    = "facade.am"
 
-libs = ["nghttp2"]
+libs = ["nghttp2", "ssl", "crypto"]
 
 [stdlib.functions]
 # ── H1Server — HTTP/1.1 listening socket (v0.2.1) ────────────────
@@ -92,3 +94,10 @@ H2Conn_Close                 = { returns = "void" }
 H2_Available                 = { returns = "i64" }
 # ── Http2.Serve(port, handler) — high-level h2c server entry ─────
 Http2_Serve                  = { returns = "i64" }
+
+# ── HttpsServer + Https.Serve — HTTPS + ALPN h2 (v0.3) ───────────
+HttpsServer_Listen           = { returns = "AmalgameHttpsServer*" }
+HttpsServer_IsListening      = { returns = "code_bool" }
+HttpsServer_Accept           = { returns = "AmalgameH2Conn*" }
+HttpsServer_Close            = { returns = "void" }
+Https_Serve                  = { returns = "i64" }

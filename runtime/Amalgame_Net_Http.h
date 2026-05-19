@@ -62,6 +62,22 @@
 #  endif
 #endif
 
+/* OpenSSL probe (v0.3+) — needed for the HTTPS server path. If
+ * present, `Https.Serve` is enabled. If absent, the HTTPS entry
+ * point returns -3 and stderr explains how to install OpenSSL
+ * devel. mirrors amalgame-tls's pattern. */
+#if defined(__has_include)
+#  if __has_include(<openssl/ssl.h>)
+#    define AMALGAME_HAS_OPENSSL 1
+#    include <openssl/ssl.h>
+#    include <openssl/err.h>
+#  elif defined(__APPLE__) && __has_include("/opt/homebrew/opt/openssl@3/include/openssl/ssl.h")
+#    define AMALGAME_HAS_OPENSSL 1
+#    include "/opt/homebrew/opt/openssl@3/include/openssl/ssl.h"
+#    include "/opt/homebrew/opt/openssl@3/include/openssl/err.h"
+#  endif
+#endif
+
 /* ────────────────────────────────────────────────────────────────
  * AmalgameH2Conn — one h2c connection.
  * ──────────────────────────────────────────────────────────────── */
@@ -76,6 +92,11 @@ typedef struct AmalgameH2Header {
 
 typedef struct AmalgameH2Conn {
     int       fd;
+#ifdef AMALGAME_HAS_OPENSSL
+    SSL*      ssl;            /* HTTPS path: non-NULL → use TLS I/O */
+#else
+    void*     ssl;
+#endif
 #ifdef AMALGAME_HAS_NGHTTP2
     nghttp2_session* session;
 #else
@@ -125,7 +146,27 @@ static ssize_t amalgame_h2_send_cb(nghttp2_session* sess, const uint8_t* data,
                                     size_t len, int flags, void* user) {
     (void)sess; (void)flags;
     AmalgameH2Conn* c = (AmalgameH2Conn*)user;
-    if (!c || c->fd < 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (!c) return NGHTTP2_ERR_CALLBACK_FAILURE;
+#ifdef AMALGAME_HAS_OPENSSL
+    /* HTTPS path: TLS-wrapped — write via SSL. SSL_write either
+     * succeeds with N > 0 bytes (≤ len, partial allowed) or fails
+     * (negative). Loop until len bytes are written or fatal error. */
+    if (c->ssl) {
+        ssize_t total = 0;
+        while ((size_t)total < len) {
+            int n = SSL_write(c->ssl, data + total, (int)(len - total));
+            if (n > 0) { total += n; continue; }
+            int err = SSL_get_error(c->ssl, n);
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                return total > 0 ? total : NGHTTP2_ERR_WOULDBLOCK;
+            }
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        return total;
+    }
+#endif
+    /* h2c path: raw TCP fd. */
+    if (c->fd < 0) return NGHTTP2_ERR_CALLBACK_FAILURE;
     ssize_t total = 0;
     while ((size_t)total < len) {
         ssize_t n = send(c->fd, data + total, len - total, 0);
@@ -301,11 +342,27 @@ static inline i64 Amalgame_Net_Http_H2Conn_NextRequest(AmalgameH2Conn* c) {
         int rv = nghttp2_session_send(c->session);
         if (rv != 0) return -1;
 
-        ssize_t n = recv(c->fd, recv_buf, sizeof(recv_buf), 0);
-        if (n == 0) return 0;          /* peer closed cleanly */
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
+        ssize_t n;
+#ifdef AMALGAME_HAS_OPENSSL
+        if (c->ssl) {
+            int r = SSL_read(c->ssl, recv_buf, sizeof(recv_buf));
+            if (r > 0) {
+                n = r;
+            } else {
+                int err = SSL_get_error(c->ssl, r);
+                if (err == SSL_ERROR_ZERO_RETURN) return 0;
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) continue;
+                return -1;
+            }
+        } else
+#endif
+        {
+            n = recv(c->fd, recv_buf, sizeof(recv_buf), 0);
+            if (n == 0) return 0;          /* peer closed cleanly */
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
         }
         ssize_t consumed = nghttp2_session_mem_recv(c->session, recv_buf,
                                                      (size_t)n);
@@ -395,6 +452,13 @@ static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
         nghttp2_session_del(c->session);
         c->session = NULL;
     }
+#ifdef AMALGAME_HAS_OPENSSL
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+    }
+#endif
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
@@ -487,6 +551,244 @@ static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
     return 0;
 }
 
+/* ────────────────────────────────────────────────────────────────
+ * HTTPS server with ALPN h2 (v0.3+)
+ *
+ * Opens a TCP listener, then for each accepted connection:
+ *   1. Wraps it in a TLS session (OpenSSL SSL_new + SSL_accept)
+ *   2. Negotiates ALPN — advertise only "h2" so browsers that
+ *      offer both end up on H2; clients that can't speak h2 are
+ *      rejected during handshake (refused TLS_ALPN_NEGOTIATION)
+ *   3. Drives the H2 protocol over the TLS stream (the existing
+ *      H2Conn code, with the ssl field set so send/recv route
+ *      through SSL_write / SSL_read instead of raw TCP)
+ *
+ * Cert + key are loaded from PEM files at listen time. For dev,
+ * a self-signed cert is plenty (browser shows a warning the first
+ * time, then remembers). For prod, pair with amalgame-tls v0.2's
+ * planned ACME client to provision real certs automatically.
+ *
+ * Scope of v0.3:
+ *   - TLS 1.2+ via SSL_CTX_set_min_proto_version
+ *   - ALPN h2 ONLY (no http/1.1 fallback yet — v0.3.x)
+ *   - One concurrent connection at a time (no threading)
+ *   - SNI not enforced (single cert per listener)
+ *   - libnghttp2 + libssl + libcrypto at link time
+ *
+ * Public API:
+ *   Https.Serve(port, certFile, keyFile, handler)
+ *     returns 0 / -1 / -2 / -3 (see Http2.Serve for codes)
+ *     returns -3 when OpenSSL not compiled in
+ *     returns -4 on TLS setup failure (bad cert/key file, etc.)
+ * ──────────────────────────────────────────────────────────────── */
+
+#ifdef AMALGAME_HAS_OPENSSL
+
+typedef struct AmalgameHttpsServer {
+    int       fd;
+    int32_t   listening;
+    i64       port;
+    SSL_CTX*  ssl_ctx;
+} AmalgameHttpsServer;
+
+/* ALPN selection callback — server side. nghttp2 ships a helper
+ * (nghttp2_select_next_protocol) that handles the wire format
+ * (length-prefixed names), but reimplementing the trivial "h2 in,
+ * h2 out" case keeps us decoupled from nghttp2 ALPN helpers. */
+static int amalgame_https_alpn_select_cb(SSL* ssl,
+        const unsigned char** out, unsigned char* outlen,
+        const unsigned char* in, unsigned int inlen, void* arg) {
+    (void)ssl; (void)arg;
+    /* Walk the wire-format ALPN list: 1-byte length + name, repeated. */
+    for (unsigned int i = 0; i < inlen; ) {
+        unsigned int plen = in[i];
+        if (i + 1 + plen > inlen) break;
+        if (plen == 2 && in[i+1] == 'h' && in[i+2] == '2') {
+            *out    = &in[i+1];
+            *outlen = 2;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += 1 + plen;
+    }
+    /* No "h2" in client's offer → reject (TLS handshake fails). */
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
+        i64 port, code_string cert_file, code_string key_file) {
+    AmalgameHttpsServer* s =
+        (AmalgameHttpsServer*)GC_MALLOC(sizeof(AmalgameHttpsServer));
+    memset(s, 0, sizeof(*s));
+    s->port = port; s->fd = -1;
+
+    /* TCP listener (same as H2Server_Listen). */
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return s;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 64) < 0) {
+        close(fd); return s;
+    }
+    s->fd = fd;
+
+    /* SSL_CTX with cert + key. */
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) { close(fd); s->fd = -1; return s; }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        close(fd); s->fd = -1;
+        return s;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        fprintf(stderr, "Https.Serve: cert/key mismatch\n");
+        SSL_CTX_free(ctx);
+        close(fd); s->fd = -1;
+        return s;
+    }
+    SSL_CTX_set_alpn_select_cb(ctx, amalgame_https_alpn_select_cb, NULL);
+
+    s->ssl_ctx = ctx;
+    s->listening = 1;
+    return s;
+}
+
+static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
+        AmalgameHttpsServer* s) {
+    if (!s || !s->listening || s->fd < 0) return NULL;
+    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
+    if (cfd < 0) return NULL;
+
+    SSL* ssl = SSL_new(s->ssl_ctx);
+    if (!ssl) { close(cfd); return NULL; }
+    SSL_set_fd(ssl, cfd);
+    int rv = SSL_accept(ssl);
+    if (rv != 1) {
+        int err = SSL_get_error(ssl, rv);
+        fprintf(stderr, "Https.Serve: TLS handshake failed (SSL err %d)\n", err);
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        close(cfd);
+        return NULL;
+    }
+
+    /* Verify ALPN negotiated h2 — if not, our select_cb rejected,
+     * we shouldn't be here, but belt-and-braces. */
+    const unsigned char* alpn = NULL; unsigned int alen2 = 0;
+    SSL_get0_alpn_selected(ssl, &alpn, &alen2);
+    if (alen2 != 2 || alpn[0] != 'h' || alpn[1] != '2') {
+        fprintf(stderr, "Https.Serve: client didn't negotiate h2\n");
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(cfd);
+        return NULL;
+    }
+
+    /* Wrap in an H2Conn with the ssl field set — send/recv now
+     * dispatch through SSL_write / SSL_read automatically. */
+    AmalgameH2Conn* c = Amalgame_Net_Http_H2Conn_NewFromFd((i64)cfd);
+    if (!c) {
+        SSL_shutdown(ssl); SSL_free(ssl); close(cfd);
+        return NULL;
+    }
+    c->ssl = ssl;
+    return c;
+}
+
+static inline void Amalgame_Net_Http_HttpsServer_Close(AmalgameHttpsServer* s) {
+    if (!s) return;
+    if (s->fd >= 0) close(s->fd);
+    if (s->ssl_ctx) SSL_CTX_free(s->ssl_ctx);
+    s->fd = -1; s->ssl_ctx = NULL; s->listening = 0;
+}
+
+static inline code_bool Amalgame_Net_Http_HttpsServer_IsListening(
+        AmalgameHttpsServer* s) {
+    return s && s->listening ? 1 : 0;
+}
+
+/* High-level entry point. Same closure shape as Http2.Serve —
+ * handler is called once per request with an H2Conn pointer. */
+static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
+                                                 code_string cert_file,
+                                                 code_string key_file,
+                                                 AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Https.Serve: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Https.Serve: certFile and keyFile required\n");
+        return -4;
+    }
+    /* OpenSSL global init — idempotent. */
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+
+    AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_Listen(
+        port, cert_file, key_file);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Https.Serve: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Https.Serve: listening on :%lld (HTTPS, ALPN h2)\n",
+            (long long)port);
+    fflush(stdout);
+
+    while (srv->listening) {
+        AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
+        if (!conn) continue;
+        for (;;) {
+            i64 sid = Amalgame_Net_Http_H2Conn_NextRequest(conn);
+            if (sid <= 0) break;
+            AmalgameClosure_call1(handler, (void*)conn);
+        }
+        Amalgame_Net_Http_H2Conn_Close(conn);
+    }
+    Amalgame_Net_Http_HttpsServer_Close(srv);
+    return 0;
+}
+
+#else  /* !AMALGAME_HAS_OPENSSL — HTTPS stubs */
+
+typedef struct AmalgameHttpsServer AmalgameHttpsServer;
+
+static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
+        i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
+static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
+        AmalgameHttpsServer* s) { (void)s; return NULL; }
+static inline void Amalgame_Net_Http_HttpsServer_Close(AmalgameHttpsServer* s) {
+    (void)s;
+}
+static inline code_bool Amalgame_Net_Http_HttpsServer_IsListening(
+        AmalgameHttpsServer* s) { (void)s; return 0; }
+static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h;
+    fprintf(stderr,
+        "Https.Serve: built without OpenSSL — install libssl-dev "
+        "and rebuild this package (rm -rf the cache for net-http "
+        "before re-running mosaic build).\n");
+    return -3;
+}
+
+#endif /* AMALGAME_HAS_OPENSSL */
+
 #else  /* !AMALGAME_HAS_NGHTTP2 — stub fallback */
 
 static inline AmalgameH2Conn* Amalgame_Net_Http_H2Conn_NewFromFd(i64 fd) {
@@ -535,6 +837,21 @@ static inline void Amalgame_Net_Http_H2Server_Close(AmalgameH2Server* s) {
 static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
                                                  AmalgameClosure* handler) {
     (void)port; (void)handler; return -1;
+}
+typedef struct AmalgameHttpsServer AmalgameHttpsServer;
+static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
+        i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
+static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
+        AmalgameHttpsServer* s) { (void)s; return NULL; }
+static inline void Amalgame_Net_Http_HttpsServer_Close(AmalgameHttpsServer* s) {
+    (void)s;
+}
+static inline code_bool Amalgame_Net_Http_HttpsServer_IsListening(
+        AmalgameHttpsServer* s) { (void)s; return 0; }
+static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h;
+    return -1;
 }
 
 #endif /* AMALGAME_HAS_NGHTTP2 */

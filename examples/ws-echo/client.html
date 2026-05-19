@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>amalgame-net-http v0.4 — WS echo demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 42em; margin: 2em auto; color: #222; }
+  h1 { font-size: 1.4em; }
+  #log { background: #f4f4f4; padding: 1em; border-radius: 4px;
+         font-family: ui-monospace, monospace; height: 20em;
+         overflow-y: auto; white-space: pre-wrap; font-size: 0.95em; }
+  .me  { color: #069; }
+  .srv { color: #060; }
+  .sys { color: #999; font-style: italic; }
+  input[type=text] { width: 70%; padding: 0.5em; }
+  button { padding: 0.5em 1em; }
+</style>
+</head>
+<body>
+<h1>amalgame-net-http v0.4 — WebSocket echo</h1>
+<p>Connects to <code>ws://localhost:8080/</code>, sends text, displays echoes.</p>
+<div id="log"></div>
+<p>
+  <input id="msg" type="text" placeholder="type a message…" autofocus />
+  <button id="send">Send</button>
+</p>
+<script>
+const log = document.getElementById('log');
+const msg = document.getElementById('msg');
+const send = document.getElementById('send');
+const write = (cls, txt) => {
+  const div = document.createElement('div');
+  div.className = cls;
+  div.textContent = txt;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+};
+write('sys', 'connecting to ws://localhost:8080/ ...');
+const ws = new WebSocket('ws://localhost:8080/');
+ws.onopen    = () => write('sys', 'connected.');
+ws.onmessage = e  => write('srv', '← ' + e.data);
+ws.onclose   = () => write('sys', 'disconnected.');
+ws.onerror   = e  => write('sys', 'error: ' + e);
+const submit = () => {
+  if (!msg.value) return;
+  write('me', '→ ' + msg.value);
+  ws.send(msg.value);
+  msg.value = '';
+};
+send.addEventListener('click', submit);
+msg.addEventListener('keydown', e => { if (e.key === 'Enter') submit(); });
+</script>
+</body>
+</html>

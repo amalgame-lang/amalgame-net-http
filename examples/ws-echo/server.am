@@ -1,0 +1,36 @@
+// WebSocket echo demo.
+//
+// Run:
+//     amc build server.am
+//     ./server
+//
+// Then open client.html in your browser. Browser-side JS connects
+// to ws://localhost:8080/, sends text, and shows the echoes.
+
+namespace App
+
+import Amalgame.Net.Http
+
+public class Program {
+    public static void Main(string[] args) {
+        Console.WriteLine("=== WebSocket echo demo ===")
+        Console.WriteLine("Open examples/ws-echo/client.html in your browser.")
+        Console.WriteLine("")
+
+        let handler = conn => {
+            Console.WriteLine("[ws] client connected")
+            while (!WsConn.IsClosed(conn)) {
+                let msg: string = WsConn.ReceiveText(conn)
+                if (String_Length(msg) == 0) {
+                    Console.WriteLine("[ws] client disconnected")
+                    return 0
+                }
+                Console.WriteLine("[ws] recv: " + msg)
+                WsConn.SendText(conn, "echo @ " + msg)
+            }
+            return 0
+        }
+
+        Ws.Serve(8080, handler)
+    }
+}

@@ -461,9 +461,18 @@ static inline void Amalgame_Net_Http_H2Server_Close(AmalgameH2Server* s) {
  */
 static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
                                                  AmalgameClosure* handler) {
-    if (!handler) return -1;
+    if (!handler) {
+        fprintf(stderr, "Http2.Serve: handler is NULL\n");
+        return -1;
+    }
     AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port);
-    if (!srv || !srv->listening) return -2;
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http2.Serve: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Http2.Serve: listening on :%lld (h2c)\n", (long long)port);
+    fflush(stdout);
     while (srv->listening) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
         if (!conn) continue;
@@ -536,6 +545,375 @@ static inline i64 Amalgame_Net_Http_H2_Available(void) {
 #else
     return 0;
 #endif
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * HTTP/1.1 server (v0.2.1+) — browser-friendly counterpart to the
+ * h2c server above. Same handler closure shape:
+ *
+ *     Http1.Serve(port, conn => {
+ *         let path   = H1Conn.Path(conn)
+ *         let method = H1Conn.Method(conn)
+ *         H1Conn.Respond(conn, 200, "text/plain", "hi")
+ *         return 0
+ *     })
+ *
+ * Scope of v0.2.1:
+ *   - One request per connection (no keep-alive; Connection: close).
+ *   - Up to AMALGAME_H1_MAX_HEADERS headers per request.
+ *   - Header lookup is case-insensitive (stored lowercased).
+ *   - Body buffer capped at AMALGAME_H1_MAX_BODY bytes.
+ *   - No multipart / chunked encoding parsing (read whole body
+ *     into RAM by Content-Length).
+ *
+ * Designed for the Mosaic demo and small services. For heavy
+ * throughput, sit it behind nginx / caddy.
+ * ──────────────────────────────────────────────────────────────── */
+
+#define AMALGAME_H1_MAX_HEADERS 64
+#define AMALGAME_H1_RECV_BUF    65536
+#define AMALGAME_H1_MAX_BODY    (8 * 1024 * 1024)
+
+typedef struct AmalgameH1Header {
+    char* name;   /* lowercased for case-insensitive lookup */
+    char* value;
+} AmalgameH1Header;
+
+typedef struct AmalgameH1Conn {
+    int       fd;
+    char*     method;        /* "GET" / "POST" / ... */
+    char*     path;          /* "/users/42" (query stripped) */
+    char*     raw_target;    /* "/users/42?x=1" (with query) */
+    char*     version;       /* "HTTP/1.1" */
+    char*     body;
+    int32_t   body_len;
+    AmalgameH1Header headers[AMALGAME_H1_MAX_HEADERS];
+    int32_t   header_count;
+    int32_t   response_sent;
+} AmalgameH1Conn;
+
+typedef struct AmalgameH1Server {
+    int       fd;
+    int32_t   listening;
+    i64       port;
+} AmalgameH1Server;
+
+/* ── parse one HTTP/1.1 request off the wire ─────────────────────
+ * Returns 1 on success, 0 on clean peer close, -1 on parse error.
+ * Caller owns the conn struct; we fill in method/path/headers/body. */
+static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
+    char* buf = (char*)GC_MALLOC_ATOMIC(AMALGAME_H1_RECV_BUF + 1);
+    int total = 0;
+    char* eoh = NULL;
+    while (total < AMALGAME_H1_RECV_BUF) {
+        ssize_t n = recv(c->fd, buf + total, AMALGAME_H1_RECV_BUF - total, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) {
+            if (total == 0) return 0;
+            return -1;  /* connection closed mid-request */
+        }
+        total += (int)n;
+        buf[total] = 0;
+        eoh = strstr(buf, "\r\n\r\n");
+        if (eoh) break;
+    }
+    if (!eoh) return -1;          /* request line + headers > 64 KB */
+    int headers_len = (int)(eoh - buf);
+
+    /* ── Request line: METHOD SP TARGET SP HTTP/1.1 CRLF ──────── */
+    char* sp1 = (char*)memchr(buf, ' ', headers_len);
+    if (!sp1) return -1;
+    char* sp2 = (char*)memchr(sp1 + 1, ' ', headers_len - (int)(sp1 - buf) - 1);
+    if (!sp2) return -1;
+    char* eol = strstr(sp2 + 1, "\r\n");
+    if (!eol || eol > eoh) return -1;
+
+    int meth_len = (int)(sp1 - buf);
+    int targ_len = (int)(sp2 - sp1 - 1);
+    int vers_len = (int)(eol - sp2 - 1);
+
+    c->method = (char*)GC_MALLOC_ATOMIC(meth_len + 1);
+    memcpy(c->method, buf, meth_len);
+    c->method[meth_len] = 0;
+
+    c->raw_target = (char*)GC_MALLOC_ATOMIC(targ_len + 1);
+    memcpy(c->raw_target, sp1 + 1, targ_len);
+    c->raw_target[targ_len] = 0;
+
+    char* q = strchr(c->raw_target, '?');
+    if (q) {
+        int path_len = (int)(q - c->raw_target);
+        c->path = (char*)GC_MALLOC_ATOMIC(path_len + 1);
+        memcpy(c->path, c->raw_target, path_len);
+        c->path[path_len] = 0;
+    } else {
+        c->path = c->raw_target;
+    }
+
+    c->version = (char*)GC_MALLOC_ATOMIC(vers_len + 1);
+    memcpy(c->version, sp2 + 1, vers_len);
+    c->version[vers_len] = 0;
+
+    /* ── Headers ───────────────────────────────────────────────── */
+    c->header_count = 0;
+    char* line = eol + 2;
+    while (line < eoh && c->header_count < AMALGAME_H1_MAX_HEADERS) {
+        char* eol2 = strstr(line, "\r\n");
+        if (!eol2 || eol2 > eoh) break;
+        char* colon = (char*)memchr(line, ':', eol2 - line);
+        if (colon) {
+            int name_len = (int)(colon - line);
+            const char* vp = colon + 1;
+            while (vp < eol2 && (*vp == ' ' || *vp == '\t')) vp++;
+            int val_len = (int)(eol2 - vp);
+
+            char* name = (char*)GC_MALLOC_ATOMIC(name_len + 1);
+            for (int i = 0; i < name_len; i++) {
+                char ch = line[i];
+                if (ch >= 'A' && ch <= 'Z') ch += 32;
+                name[i] = ch;
+            }
+            name[name_len] = 0;
+            char* val = (char*)GC_MALLOC_ATOMIC(val_len + 1);
+            if (val_len > 0) memcpy(val, vp, val_len);
+            val[val_len] = 0;
+
+            c->headers[c->header_count].name  = name;
+            c->headers[c->header_count].value = val;
+            c->header_count++;
+        }
+        line = eol2 + 2;
+    }
+
+    /* ── Body — only if Content-Length present ─────────────────── */
+    int content_length = 0;
+    for (int i = 0; i < c->header_count; i++) {
+        if (strcmp(c->headers[i].name, "content-length") == 0) {
+            content_length = atoi(c->headers[i].value);
+            break;
+        }
+    }
+    if (content_length > AMALGAME_H1_MAX_BODY) return -1;
+
+    if (content_length > 0) {
+        c->body = (char*)GC_MALLOC_ATOMIC(content_length + 1);
+        int body_in_buf = total - (headers_len + 4);
+        if (body_in_buf > 0) {
+            int copy = body_in_buf > content_length ? content_length : body_in_buf;
+            memcpy(c->body, eoh + 4, copy);
+            c->body_len = copy;
+        }
+        while (c->body_len < content_length) {
+            ssize_t n = recv(c->fd, c->body + c->body_len,
+                             content_length - c->body_len, 0);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                return -1;
+            }
+            c->body_len += (int32_t)n;
+        }
+        c->body[c->body_len] = 0;
+    } else {
+        c->body = "";
+        c->body_len = 0;
+    }
+    return 1;
+}
+
+/* ── H1Server — TCP listener ─────────────────────────────────────*/
+
+static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port) {
+    AmalgameH1Server* s =
+        (AmalgameH1Server*)GC_MALLOC(sizeof(AmalgameH1Server));
+    s->fd = -1; s->listening = 0; s->port = port;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return s;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 64) < 0) {
+        close(fd);
+        return s;
+    }
+    s->fd = fd;
+    s->listening = 1;
+    return s;
+}
+
+static inline code_bool Amalgame_Net_Http_H1Server_IsListening(
+        AmalgameH1Server* s) {
+    return s && s->listening ? 1 : 0;
+}
+
+static inline AmalgameH1Conn* Amalgame_Net_Http_H1Server_Accept(
+        AmalgameH1Server* s) {
+    if (!s || !s->listening || s->fd < 0) return NULL;
+    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
+    if (cfd < 0) return NULL;
+    AmalgameH1Conn* c =
+        (AmalgameH1Conn*)GC_MALLOC(sizeof(AmalgameH1Conn));
+    memset(c, 0, sizeof(*c));
+    c->fd = cfd;
+    return c;
+}
+
+static inline void Amalgame_Net_Http_H1Server_Close(AmalgameH1Server* s) {
+    if (!s) return;
+    if (s->fd >= 0) close(s->fd);
+    s->fd = -1; s->listening = 0;
+}
+
+/* ── H1Conn — request accessors + response writer ────────────────*/
+
+static inline code_string Amalgame_Net_Http_H1Conn_Method(AmalgameH1Conn* c) {
+    return (c && c->method) ? c->method : "";
+}
+static inline code_string Amalgame_Net_Http_H1Conn_Path(AmalgameH1Conn* c) {
+    return (c && c->path) ? c->path : "";
+}
+static inline code_string Amalgame_Net_Http_H1Conn_RawTarget(AmalgameH1Conn* c) {
+    return (c && c->raw_target) ? c->raw_target : "";
+}
+static inline code_string Amalgame_Net_Http_H1Conn_Header(AmalgameH1Conn* c,
+                                                          code_string name) {
+    if (!c || !name) return "";
+    /* Compare case-insensitively (stored lowercased). */
+    size_t nlen = strlen(name);
+    char* needle = (char*)GC_MALLOC_ATOMIC(nlen + 1);
+    for (size_t i = 0; i < nlen; i++) {
+        char ch = name[i];
+        if (ch >= 'A' && ch <= 'Z') ch += 32;
+        needle[i] = ch;
+    }
+    needle[nlen] = 0;
+    for (int i = 0; i < c->header_count; i++) {
+        if (strcmp(c->headers[i].name, needle) == 0) {
+            return c->headers[i].value;
+        }
+    }
+    return "";
+}
+static inline code_string Amalgame_Net_Http_H1Conn_Body(AmalgameH1Conn* c) {
+    return (c && c->body) ? c->body : "";
+}
+static inline i64 Amalgame_Net_Http_H1Conn_BodyLen(AmalgameH1Conn* c) {
+    return (c && c->body) ? (i64)c->body_len : 0;
+}
+
+static inline void Amalgame_Net_Http_H1Conn_Respond(AmalgameH1Conn* c,
+                                                     i64 status,
+                                                     code_string ct,
+                                                     code_string body) {
+    if (!c || c->fd < 0 || c->response_sent) return;
+
+    /* Minimal reason-phrase table — RFC 7231 + a few common
+     * extensions. Anything not listed gets "OK" as a safe default. */
+    const char* reason = "OK";
+    switch ((int)status) {
+        case 100: reason = "Continue"; break;
+        case 200: reason = "OK"; break;
+        case 201: reason = "Created"; break;
+        case 202: reason = "Accepted"; break;
+        case 204: reason = "No Content"; break;
+        case 301: reason = "Moved Permanently"; break;
+        case 302: reason = "Found"; break;
+        case 303: reason = "See Other"; break;
+        case 304: reason = "Not Modified"; break;
+        case 307: reason = "Temporary Redirect"; break;
+        case 308: reason = "Permanent Redirect"; break;
+        case 400: reason = "Bad Request"; break;
+        case 401: reason = "Unauthorized"; break;
+        case 403: reason = "Forbidden"; break;
+        case 404: reason = "Not Found"; break;
+        case 405: reason = "Method Not Allowed"; break;
+        case 409: reason = "Conflict"; break;
+        case 410: reason = "Gone"; break;
+        case 413: reason = "Payload Too Large"; break;
+        case 415: reason = "Unsupported Media Type"; break;
+        case 422: reason = "Unprocessable Content"; break;
+        case 429: reason = "Too Many Requests"; break;
+        case 500: reason = "Internal Server Error"; break;
+        case 501: reason = "Not Implemented"; break;
+        case 502: reason = "Bad Gateway"; break;
+        case 503: reason = "Service Unavailable"; break;
+        case 504: reason = "Gateway Timeout"; break;
+    }
+
+    size_t blen = body ? strlen(body) : 0;
+    const char* ctype = (ct && ct[0]) ? ct : "text/plain; charset=utf-8";
+
+    char header[1024];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 %lld %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        (long long)status, reason, ctype, blen);
+
+    if (header_len > 0) {
+        ssize_t w = send(c->fd, header, (size_t)header_len, 0);
+        (void)w;
+        if (blen > 0) {
+            w = send(c->fd, body, blen, 0);
+            (void)w;
+        }
+    }
+    c->response_sent = 1;
+}
+
+static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
+    if (!c) return;
+    if (c->fd >= 0) {
+        close(c->fd);
+        c->fd = -1;
+    }
+}
+
+/* ── Http1.Serve(port, handler) — high-level entry point ─────────
+ * Same shape as Http2.Serve: one handler closure called once per
+ * request with the H1Conn pointer. Returns:
+ *    0  clean shutdown (unreachable currently — loops forever)
+ *   -1  handler is NULL
+ *   -2  listen() failed (port in use, EACCES, …)
+ */
+static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
+                                                AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http1.Serve: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http1.Serve: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Http1.Serve: listening on :%lld (HTTP/1.1)\n",
+            (long long)port);
+    fflush(stdout);
+
+    while (srv->listening) {
+        AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
+        if (!conn) continue;
+        if (amalgame_h1_parse_request(conn) > 0) {
+            AmalgameClosure_call1(handler, (void*)conn);
+        }
+        Amalgame_Net_Http_H1Conn_Close(conn);
+    }
+    Amalgame_Net_Http_H1Server_Close(srv);
+    return 0;
 }
 
 #endif /* AMALGAME_NET_HTTP_H */

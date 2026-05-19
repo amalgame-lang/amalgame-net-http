@@ -1,35 +1,39 @@
 # amalgame-net-http — HTTP/1.1 + HTTP/2 client + server primitives.
 #
-# v0.1: pure-Amalgame HTTP/1.1 parser + render (request line, headers,
-# body parsing — urlencoded form, JSON). Raw socket I/O delegates to
-# `amalgame-net` (TcpServer / TcpClient). TLS for HTTPS delegates to
-# `amalgame-tls`.
+# v0.1: pure-Amalgame HTTP/1.1 parser + render. User had to bring
+#       their own accept loop.
+# v0.2: nghttp2 binding for h2c (HTTP/2 cleartext) server +
+#       Http2.Serve(port, handler) high-level entry point.
+# v0.2.1: HTTP/1.1 high-level server (Http1.Serve(port, handler)) —
+#       browser-friendly, mirror-API to Http2.Serve. Same closure
+#       shape, just speaks HTTP/1.1 on the wire (one request per
+#       connection, Connection: close). Use this when you want to
+#       open the demo in Chrome / Firefox.
 #
-# v0.2: nghttp2 binding for h2c (HTTP/2 cleartext) server. Lets you
-# serve HTTP/2 to clients that speak it with prior knowledge — e.g.
-# `curl --http2-prior-knowledge`, gRPC peers, h2 test tooling.
-# TLS + ALPN h2 negotiation is planned for v0.2.x.
+# TLS + ALPN h2 negotiation is planned for v0.2.x — that's what
+# unblocks h2 over HTTPS in real browsers.
 #
 # Install:
 #   amc package add net-http
 #
 # Depends on:
-#   - amalgame-tls (for HTTPS — already a dep of amalgame-web)
+#   - amalgame-tls (planned for HTTPS — already a dep of amalgame-web)
 #   - libnghttp2   (system library, for the v0.2 H2 binding)
 #
 # See proposal: docs/proposals/amalgame-web.md (§4.2)
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.2.0"
+version           = "0.2.1"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + h2c HTTP/2 (nghttp2) client+server primitives."
+description       = "HTTP/1.1 + h2c HTTP/2 client+server primitives (nghttp2)."
 required-amalgame = ">=0.8.34"
 schema-version    = 1
 
 [stdlib]
 # Multi-class manifest. The package ships a pure-AM facade for
-# HTTP/1.1 plus a thin nghttp2 binding for the H2 path.
+# request/response types + a thin nghttp2 binding (H2*) and a
+# pure-C HTTP/1.1 server (H1*) for browser compatibility.
 classes   = [
     "HttpRequest",
     "HttpResponse",
@@ -37,6 +41,9 @@ classes   = [
     "HttpClient",
     "Cookie",
     "HttpRequestBuilder",
+    "H1Server",
+    "H1Conn",
+    "Http1",
     "H2Server",
     "H2Conn",
     "H2",
@@ -49,6 +56,23 @@ facade    = "facade.am"
 libs = ["nghttp2"]
 
 [stdlib.functions]
+# ── H1Server — HTTP/1.1 listening socket (v0.2.1) ────────────────
+H1Server_Listen              = { returns = "AmalgameH1Server*" }
+H1Server_IsListening         = { returns = "code_bool" }
+H1Server_Accept              = { returns = "AmalgameH1Conn*" }
+H1Server_Close               = { returns = "void" }
+# ── H1Conn — HTTP/1.1 server connection (v0.2.1) ─────────────────
+H1Conn_Method                = { returns = "code_string" }
+H1Conn_Path                  = { returns = "code_string" }
+H1Conn_RawTarget             = { returns = "code_string" }
+H1Conn_Header                = { returns = "code_string" }
+H1Conn_Body                  = { returns = "code_string" }
+H1Conn_BodyLen               = { returns = "i64" }
+H1Conn_Respond               = { returns = "void" }
+H1Conn_Close                 = { returns = "void" }
+# ── Http1.Serve(port, handler) — high-level HTTP/1.1 entry ───────
+Http1_Serve                  = { returns = "i64" }
+
 # ── H2Server — h2c listening socket (v0.2) ───────────────────────
 H2Server_Listen              = { returns = "AmalgameH2Server*" }
 H2Server_IsListening         = { returns = "code_bool" }
@@ -66,6 +90,5 @@ H2Conn_BodyLen               = { returns = "i64" }
 H2Conn_Respond               = { returns = "void" }
 H2Conn_Close                 = { returns = "void" }
 H2_Available                 = { returns = "i64" }
-# (H2.Available — runtime probe for nghttp2 availability)
 # ── Http2.Serve(port, handler) — high-level h2c server entry ─────
 Http2_Serve                  = { returns = "i64" }

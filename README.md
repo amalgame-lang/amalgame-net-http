@@ -117,10 +117,12 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
   upgrade handshake, wrong for long-lived frame loops. Handlers
   that intend long idle waits should clear/raise the timeout
   themselves (or wait for v0.4.5's post-upgrade clearing).
-- The size-limit fields (`MaxBodyBytes` / `MaxHeaderBytes` /
-  `MaxUrlBytes`) are accepted in HttpServerConfig but the H1 parser
-  still uses compile-time `AMALGAME_H1_MAX_BODY` etc. constants.
-  Wiring through the parser lands in v0.4.5.
+- ✅ **HttpServerConfig size limits wired** (v0.4.5): the H1 parser
+  now reads `max_body_bytes` / `max_header_bytes` / `max_url_bytes`
+  from the per-conn config (stashed by `Http1.ServeWith`). Zero in
+  any field = fall back to the library default (current
+  `AMALGAME_H1_MAX_BODY` etc.). Over-limit requests close the
+  connection with a parse error.
 
 ## What's NOT in v0.1 (deferred to v0.1.x)
 

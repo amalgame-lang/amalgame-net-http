@@ -158,6 +158,48 @@ public class Program {
             Console.WriteLine("[FAIL] reject malformed")
         }
 
+        // ── CRLF injection guard (v0.4.2) ────────────────────────
+        // Header() drops values containing CR or LF. HeaderUnsafe
+        // bypasses the guard for trusted internal values.
+        let respGuard1: HttpResponse = HttpResponse.New()
+            .Header("X-Safe",    "hello")
+            .Header("X-Injected", "evil" + crlf + "Set-Cookie: pwn=1")
+            .Header("X-Also-Safe", "world")
+        if (respGuard1.Headers.Get("X-Safe") == "hello"
+            && !respGuard1.Headers.Has("X-Injected")
+            && respGuard1.Headers.Get("X-Also-Safe") == "world") {
+            Console.WriteLine("[PASS] CRLF guard drops injected header, keeps siblings")
+        } else {
+            Console.WriteLine("[FAIL] CRLF guard injected-header check failed")
+        }
+
+        // Pure CR is also blocked.
+        let respGuard2: HttpResponse = HttpResponse.New()
+            .Header("X-CR-Only", "hi" + cr + "Injected: 1")
+        if (!respGuard2.Headers.Has("X-CR-Only")) {
+            Console.WriteLine("[PASS] CRLF guard catches bare CR")
+        } else {
+            Console.WriteLine("[FAIL] CRLF guard missed bare CR")
+        }
+
+        // Pure LF is also blocked.
+        let respGuard3: HttpResponse = HttpResponse.New()
+            .Header("X-LF-Only", "hi" + "\n" + "Injected: 1")
+        if (!respGuard3.Headers.Has("X-LF-Only")) {
+            Console.WriteLine("[PASS] CRLF guard catches bare LF")
+        } else {
+            Console.WriteLine("[FAIL] CRLF guard missed bare LF")
+        }
+
+        // HeaderUnsafe bypasses the guard — caller takes responsibility.
+        let respUnsafe: HttpResponse = HttpResponse.New()
+            .HeaderUnsafe("X-Raw", "anything" + crlf + "even-this")
+        if (respUnsafe.Headers.Has("X-Raw")) {
+            Console.WriteLine("[PASS] HeaderUnsafe bypasses guard")
+        } else {
+            Console.WriteLine("[FAIL] HeaderUnsafe was guarded")
+        }
+
         Console.WriteLine("done")
     }
 }

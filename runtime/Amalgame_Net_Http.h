@@ -1125,6 +1125,13 @@ typedef struct AmalgameH1Conn {
     AmalgameH1Header headers[AMALGAME_H1_MAX_HEADERS];
     int32_t   header_count;
     int32_t   response_sent;
+    /* v0.4.5: per-conn config snapshot. NULL = library defaults
+     * (current AMALGAME_H1_MAX_* constants). Set by Http1.ServeWith
+     * after accept; the parser then honors non-zero size-limit
+     * fields. The struct itself is forward-declared near the top
+     * of the file (it precedes the H2 / Https / Ws / Wss Serve
+     * variants that also consume it). */
+    AmalgameNetHttpServerConfig* config;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -1158,6 +1165,13 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     if (!eoh) return -1;          /* request line + headers > 64 KB */
     int headers_len = (int)(eoh - buf);
 
+    /* Per-conn header-block cap. Zero in config = use the library
+     * default (currently bounded only by AMALGAME_H1_RECV_BUF). */
+    if (c->config && c->config->max_header_bytes > 0
+        && headers_len > c->config->max_header_bytes) {
+        return -1;
+    }
+
     /* ── Request line: METHOD SP TARGET SP HTTP/1.1 CRLF ──────── */
     char* sp1 = (char*)memchr(buf, ' ', headers_len);
     if (!sp1) return -1;
@@ -1169,6 +1183,12 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     int meth_len = (int)(sp1 - buf);
     int targ_len = (int)(sp2 - sp1 - 1);
     int vers_len = (int)(eol - sp2 - 1);
+
+    /* Per-conn URL cap. Same fallback rule. */
+    if (c->config && c->config->max_url_bytes > 0
+        && targ_len > c->config->max_url_bytes) {
+        return -1;
+    }
 
     c->method = (char*)GC_MALLOC_ATOMIC(meth_len + 1);
     memcpy(c->method, buf, meth_len);
@@ -1231,7 +1251,14 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
             break;
         }
     }
-    if (content_length > AMALGAME_H1_MAX_BODY) return -1;
+    /* Body-size cap. Per-conn config (set by Http1.ServeWith)
+     * overrides the compile-time constant. Zero in config = use
+     * the library default (current behavior). */
+    int max_body = AMALGAME_H1_MAX_BODY;
+    if (c->config && c->config->max_body_bytes > 0) {
+        max_body = (int)c->config->max_body_bytes;
+    }
+    if (content_length > max_body) return -1;
 
     if (content_length > 0) {
         c->body = (char*)GC_MALLOC_ATOMIC(content_length + 1);
@@ -1485,6 +1512,11 @@ static inline i64 Amalgame_Net_Http_Http1_ServeWith(
     while (srv->listening) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
+        /* Stash the config on the conn so the parser can honor
+         * max_body_bytes / max_header_bytes / max_url_bytes
+         * (v0.4.5). ApplyToFd does the socket-timeout half of the
+         * config (v0.4.3). */
+        conn->config = config;
         Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
         if (amalgame_h1_parse_request(conn) > 0) {
             AmalgameClosure_call1(handler, (void*)conn);

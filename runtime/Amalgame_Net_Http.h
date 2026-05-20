@@ -1679,6 +1679,102 @@ static inline i64 Amalgame_Net_Http_Http1_ServeMt(i64 port,
     return 0;
 }
 
+/* ── Http1.ServeMtWith(port, config, handler) — multi-thread + config ─
+ * v0.6.1. The full-featured server: multi-thread accept (from
+ * ServeMt) + per-connection request loop + HttpServerConfig
+ * (timeouts + size limits + idle_timeout keep-alive) merged into
+ * one entry point. This is what production Mosaic apps should
+ * call — everything from v0.4.3 + v0.5.0 + v0.6.0 wired together.
+ *
+ * Per-connection request loop (mirrors Http1.ServeWith v0.5.0):
+ *   parse request → call handler → if keep-alive, ResetForReuse
+ *   and parse the next request off the same TCP connection.
+ *   SO_RCVTIMEO bounds the idle wait; recv() returns EAGAIN past
+ *   the deadline and parse_request returns -1, breaking the loop.
+ *
+ * Threading model + GC safety unchanged from ServeMt — see the
+ * comment block on Http1.ServeMt above. The same caveats apply
+ * (per-thread stack ~8MB, handler must be thread-safe).
+ */
+typedef struct {
+    AmalgameH1Conn*               conn;
+    AmalgameClosure*              handler;
+    AmalgameNetHttpServerConfig*  config;
+} amalgame_h1_mt_with_arg;
+
+static void* amalgame_h1_mt_with_worker(void* p) {
+    amalgame_h1_mt_with_arg* a = (amalgame_h1_mt_with_arg*) p;
+    /* Stash the config so the parser honors size limits. */
+    a->conn->config = a->config;
+    Amalgame_Net_Http_HttpServerConfig_ApplyToFd(a->conn->fd, a->config);
+
+    int keep_alive_enabled = a->config ? (a->config->idle_timeout_sec > 0) : 0;
+    while (1) {
+        int parsed = amalgame_h1_parse_request(a->conn);
+        if (parsed <= 0) break;
+        a->conn->keep_alive = keep_alive_enabled
+            ? amalgame_h1_request_keep_alive(a->conn) : 0;
+        AmalgameClosure_call1(a->handler, (void*)a->conn);
+        if (!a->conn->keep_alive) break;
+        /* Switch SO_RCVTIMEO to idle_timeout for the wait on the
+         * next request. */
+        if (a->config && a->config->idle_timeout_sec > 0) {
+            struct timeval tv;
+            tv.tv_sec  = a->config->idle_timeout_sec;
+            tv.tv_usec = 0;
+            setsockopt(a->conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
+        Amalgame_Net_Http_H1Conn_ResetForReuse(a->conn);
+    }
+    Amalgame_Net_Http_H1Conn_Close(a->conn);
+    return NULL;
+}
+
+static inline i64 Amalgame_Net_Http_Http1_ServeMtWith(i64 port,
+        AmalgameNetHttpServerConfig* config, AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http1.ServeMtWith: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(
+        port, config ? config->listen_backlog : 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http1.ServeMtWith: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    int t = config ? config->header_timeout_sec : 0;
+    if (config && config->body_timeout_sec > t) t = config->body_timeout_sec;
+    int ka = config ? config->idle_timeout_sec : 0;
+    fprintf(stdout, "Http1.ServeMtWith: listening on :%lld (HTTP/1.1, multi-thread, timeout=%ds, keep-alive=%ds)\n",
+            (long long)port, t, ka);
+    fflush(stdout);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    while (srv->listening) {
+        AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
+        if (!conn) continue;
+        amalgame_h1_mt_with_arg* a =
+            (amalgame_h1_mt_with_arg*) GC_MALLOC(sizeof(*a));
+        a->conn    = conn;
+        a->handler = handler;
+        a->config  = config;
+        pthread_t th;
+        int rc = GC_pthread_create(&th, &attr, amalgame_h1_mt_with_worker, a);
+        if (rc != 0) {
+            fprintf(stderr, "Http1.ServeMtWith: GC_pthread_create failed (%s), running inline\n",
+                    strerror(rc));
+            amalgame_h1_mt_with_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    Amalgame_Net_Http_H1Server_Close(srv);
+    return 0;
+}
+
 /* ── Http1.ServeWith(port, config, handler) — Http1.Serve + config ─
  * Same shape as Http1.Serve but applies HttpServerConfig to every
  * accepted connection. Today that means setting SO_RCVTIMEO /

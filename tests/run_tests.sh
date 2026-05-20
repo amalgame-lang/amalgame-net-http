@@ -168,8 +168,10 @@ int main(void) {
      * them in. Never executed at runtime. */
     if (0) {
         Amalgame_Net_Http_Http1_ServeMt(0, NULL);
+        Amalgame_Net_Http_Http1_ServeMtWith(0, NULL, NULL);
         amalgame_h1_mt_arg dummy = {0};
-        (void) dummy;
+        amalgame_h1_mt_with_arg dummy2 = {0};
+        (void) dummy; (void) dummy2;
     }
     printf("mt_smoke_linked: 1\n");
     return 0;

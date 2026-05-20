@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.4.7"
+version           = "0.4.8"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.34"
@@ -120,6 +120,7 @@ HttpServerConfig_MaxHeaderBytes         = { returns = "i64" }
 HttpServerConfig_MaxUrlBytes            = { returns = "i64" }
 HttpServerConfig_ListenBacklog          = { returns = "i64" }
 HttpServerConfig_ApplyToFd              = { returns = "void" }
+HttpServerConfig_ClearTimeoutsOnFd      = { returns = "void" }
 
 # ── H2Server — h2c listening socket (v0.2) ───────────────────────
 H2Server_Listen              = { returns = "AmalgameH2Server*" }

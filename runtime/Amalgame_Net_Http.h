@@ -611,7 +611,7 @@ static inline i64 Amalgame_Net_Http_HttpServerConfig_ListenBacklog(AmalgameNetHt
 /* Apply the wired-today knobs (SO_RCVTIMEO / SO_SNDTIMEO) to a
  * connected fd. Quiet no-op when `config` is NULL or both timeout
  * fields are 0 (= no timeout, current default behavior). Uses the
- * larger of header/body timeouts as a single deadline — v0.4.5 will
+ * larger of header/body timeouts as a single deadline — v0.5.x will
  * switch to a poll-based loop with phase-specific deadlines. */
 static inline void Amalgame_Net_Http_HttpServerConfig_ApplyToFd(
         int fd, AmalgameNetHttpServerConfig* config) {
@@ -625,6 +625,19 @@ static inline void Amalgame_Net_Http_HttpServerConfig_ApplyToFd(
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
+}
+
+/* Reset SO_RCVTIMEO / SO_SNDTIMEO to 0 (= no timeout). Used by
+ * Ws.ServeWith / Wss.ServeWith after the upgrade handshake completes,
+ * so the long-lived frame loop doesn't inherit the handshake-phase
+ * deadline. Safe to call on any fd; no-op on fd < 0. */
+static inline void Amalgame_Net_Http_HttpServerConfig_ClearTimeoutsOnFd(int fd) {
+    if (fd < 0) return;
+    struct timeval tv;
+    tv.tv_sec  = 0;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 /* ── High-level entry point: Http2.Serve(port, handler) ──────────
@@ -1953,14 +1966,20 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
 }
 
 /* ── Ws.ServeWith(port, config, handler) ──────────────────────────
- * Ws.Serve + HttpServerConfig applied to the underlying fd right
- * after the upgrade handshake completes — gates a slow client
- * from holding the upgrade open forever. NOTE: SO_RCVTIMEO sticks
- * for the connection lifetime, which is wrong for long-lived
- * WebSocket frame loops. Handlers that intend long idle waits
- * should clear/raise the timeout themselves (or use a poll-based
- * loop). v0.4.5 plans to clear the timeout post-upgrade
- * automatically. */
+ * Ws.Serve + HttpServerConfig with the timeout dance done RIGHT
+ * (v0.4.8): we accept the raw TCP socket ourselves, apply the
+ * configured timeout BEFORE the upgrade handshake (so a slow client
+ * can't hold the half-upgraded connection open), then CLEAR the
+ * timeout after the upgrade succeeds so the long-lived frame loop
+ * isn't subject to the handshake-phase deadline.
+ *
+ * Older v0.4.4–v0.4.7 versions of this function applied the
+ * timeout AFTER WsServer_Accept (which does the upgrade
+ * internally), which had the opposite of the intended effect:
+ * upgrade unprotected, frame loop forcibly cut. This fixes that.
+ *
+ * WsServer_Accept stays available for users who want a one-shot
+ * accept-and-upgrade with no timeout management. */
 static inline i64 Amalgame_Net_Http_Ws_ServeWith(
         i64 port,
         AmalgameNetHttpServerConfig* config,
@@ -1975,13 +1994,19 @@ static inline i64 Amalgame_Net_Http_Ws_ServeWith(
                 (long long)port, strerror(errno));
         return -2;
     }
-    fprintf(stdout, "Ws.ServeWith: listening on :%lld (WebSocket, config-aware)\n",
+    fprintf(stdout, "Ws.ServeWith: listening on :%lld (WebSocket, timeout-protected upgrade)\n",
             (long long)port);
     fflush(stdout);
     while (srv->listening) {
-        AmalgameWsConn* conn = Amalgame_Net_Http_WsServer_Accept(srv);
+        /* Manual accept-then-upgrade so we can bracket the upgrade
+         * with timeout-apply / timeout-clear. */
+        struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+        int cfd = accept(srv->fd, (struct sockaddr*)&addr, &alen);
+        if (cfd < 0) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(cfd, config);
+        AmalgameWsConn* conn = amalgame_ws_do_upgrade(cfd, NULL);
         if (!conn) continue;
-        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
+        Amalgame_Net_Http_HttpServerConfig_ClearTimeoutsOnFd(conn->fd);
         AmalgameClosure_call1(handler, (void*)conn);
         Amalgame_Net_Http_WsConn_Close(conn);
     }
@@ -2133,8 +2158,9 @@ static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
 }
 
 /* ── Wss.ServeWith(port, cert, key, config, handler) ──────────────
- * Wss.Serve + HttpServerConfig. Same caveat as Ws.ServeWith re:
- * long-lived connection vs. server-side SO_RCVTIMEO. */
+ * Wss.Serve + HttpServerConfig with the same timeout dance as
+ * Ws.ServeWith (v0.4.8): apply timeout before SSL_accept + upgrade,
+ * clear timeout before the long-lived frame loop. */
 static inline i64 Amalgame_Net_Http_Wss_ServeWith(
         i64 port,
         code_string cert_file,
@@ -2163,13 +2189,32 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(
                 (long long)port, strerror(errno));
         return -2;
     }
-    fprintf(stdout, "Wss.ServeWith: listening on :%lld (wss://, config-aware)\n",
+    fprintf(stdout, "Wss.ServeWith: listening on :%lld (wss://, timeout-protected upgrade)\n",
             (long long)port);
     fflush(stdout);
     while (srv->listening) {
-        AmalgameWsConn* conn = Amalgame_Net_Http_WssServer_Accept(srv);
+        /* Manual accept → SSL_accept → upgrade → clear-timeout
+         * sequence so the timeout brackets the slow phases (raw
+         * accept, TLS handshake, HTTP upgrade) but doesn't bleed
+         * into the WebSocket frame loop. */
+        struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+        int cfd = accept(srv->fd, (struct sockaddr*)&addr, &alen);
+        if (cfd < 0) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(cfd, config);
+        SSL* ssl = SSL_new(srv->ssl_ctx);
+        if (!ssl) { close(cfd); continue; }
+        SSL_set_fd(ssl, cfd);
+        int rv = SSL_accept(ssl);
+        if (rv != 1) {
+            fprintf(stderr, "Wss.ServeWith: TLS handshake failed\n");
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(cfd);
+            continue;
+        }
+        AmalgameWsConn* conn = amalgame_ws_do_upgrade(cfd, ssl);
         if (!conn) continue;
-        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
+        Amalgame_Net_Http_HttpServerConfig_ClearTimeoutsOnFd(conn->fd);
         AmalgameClosure_call1(handler, (void*)conn);
         Amalgame_Net_Http_WsConn_Close(conn);
     }

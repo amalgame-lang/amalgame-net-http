@@ -1148,6 +1148,12 @@ typedef struct AmalgameH1Conn {
      * of the file (it precedes the H2 / Https / Ws / Wss Serve
      * variants that also consume it). */
     AmalgameNetHttpServerConfig* config;
+    /* v0.5.0: keep-alive flag, set by the dispatch loop based on
+     * the request's `Connection` header + the protocol version.
+     * When non-zero, Respond omits the hardcoded `Connection: close`
+     * header so the client keeps the TCP connection open for the
+     * next request. */
+    int32_t   keep_alive;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -1431,14 +1437,19 @@ static inline void Amalgame_Net_Http_H1Conn_Respond(AmalgameH1Conn* c,
     size_t blen = body ? strlen(body) : 0;
     const char* ctype = (ct && ct[0]) ? ct : "text/plain; charset=utf-8";
 
+    /* Connection header: explicit "close" unless the conn is in
+     * keep-alive mode (v0.5.0). The dispatch loop sets keep_alive=1
+     * after parsing a request whose `Connection` header allows
+     * reuse (HTTP/1.1 default = keep-alive; HTTP/1.0 default = close). */
+    const char* conn_hdr = c->keep_alive ? "keep-alive" : "close";
     char header[1024];
     int header_len = snprintf(header, sizeof(header),
         "HTTP/1.1 %lld %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
+        "Connection: %s\r\n"
         "\r\n",
-        (long long)status, reason, ctype, blen);
+        (long long)status, reason, ctype, blen, conn_hdr);
 
     if (header_len > 0) {
         ssize_t w = send(c->fd, header, (size_t)header_len, 0);
@@ -1457,6 +1468,66 @@ static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
         close(c->fd);
         c->fd = -1;
     }
+}
+
+/* ── Keep-alive helpers (v0.5.0) ─────────────────────────────────
+ * Used by the Http1.ServeWith dispatch loop to read the next
+ * request off the same TCP connection. AM-side users who write
+ * their own accept loop can call these too.
+ */
+
+/* Clear per-request state on a conn so the next parse can reuse
+ * the struct. Keeps fd, config and keep_alive intact. */
+static inline void Amalgame_Net_Http_H1Conn_ResetForReuse(AmalgameH1Conn* c) {
+    if (!c) return;
+    c->method        = NULL;
+    c->path          = NULL;
+    c->raw_target    = NULL;
+    c->version       = NULL;
+    c->body          = NULL;
+    c->body_len      = 0;
+    c->header_count  = 0;
+    c->response_sent = 0;
+    /* fd / config / keep_alive are intentionally preserved. */
+}
+
+/* Tiny case-insensitive substring search — strcasestr is glibc-only
+ * and we don't want to taint the whole header with _GNU_SOURCE. */
+static inline int amalgame_substr_ci(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return 0;
+    size_t nlen = strlen(needle);
+    for (const char* p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nlen && p[i]) {
+            char a = p[i];
+            char b = needle[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+            i++;
+        }
+        if (i == nlen) return 1;
+    }
+    return 0;
+}
+
+/* Decide whether the just-parsed request asks to keep the connection
+ * open. RFC 7230 defaults: HTTP/1.1 → keep-alive unless `Connection: close`
+ * was sent; HTTP/1.0 → close unless `Connection: keep-alive` was sent.
+ * The parser lowercases header names + values are stored verbatim. */
+static inline int amalgame_h1_request_keep_alive(AmalgameH1Conn* c) {
+    if (!c || !c->version) return 0;
+    int is_http11 = (strcmp(c->version, "HTTP/1.1") == 0);
+    int default_keep = is_http11 ? 1 : 0;
+    for (int i = 0; i < c->header_count; i++) {
+        if (strcmp(c->headers[i].name, "connection") == 0) {
+            const char* v = c->headers[i].value ? c->headers[i].value : "";
+            if (amalgame_substr_ci(v, "close")) return 0;
+            if (amalgame_substr_ci(v, "keep-alive")) return 1;
+            return default_keep;
+        }
+    }
+    return default_keep;
 }
 
 /* ── Http1.Serve(port, handler) — high-level entry point ─────────
@@ -1534,8 +1605,35 @@ static inline i64 Amalgame_Net_Http_Http1_ServeWith(
          * config (v0.4.3). */
         conn->config = config;
         Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
-        if (amalgame_h1_parse_request(conn) > 0) {
+
+        /* v0.5.0 — keep-alive inner loop. Each iteration parses one
+         * request and runs the handler. If the request asks to keep
+         * the connection open (HTTP/1.1 default OR `Connection: keep-alive`)
+         * AND the configured `idle_timeout_sec` is non-zero, we reset
+         * the conn and parse the next request off the same TCP
+         * connection. SO_RCVTIMEO (already applied above) bounds the
+         * idle wait — recv() returns EAGAIN past the deadline and
+         * the next parse_request returns -1, which breaks the loop.
+         *
+         * Set idle_timeout_sec=0 to disable keep-alive entirely
+         * (legacy one-request-per-conn behavior). */
+        int keep_alive_enabled = config ? (config->idle_timeout_sec > 0) : 0;
+        while (1) {
+            int parsed = amalgame_h1_parse_request(conn);
+            if (parsed <= 0) break;
+            conn->keep_alive = keep_alive_enabled ? amalgame_h1_request_keep_alive(conn) : 0;
             AmalgameClosure_call1(handler, (void*)conn);
+            if (!conn->keep_alive) break;
+            /* Honor the configured idle timeout for the next-request
+             * wait. If idle_timeout differs from body/header timeout,
+             * swap to the dedicated value here. */
+            if (config && config->idle_timeout_sec > 0) {
+                struct timeval tv;
+                tv.tv_sec  = config->idle_timeout_sec;
+                tv.tv_usec = 0;
+                setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            }
+            Amalgame_Net_Http_H1Conn_ResetForReuse(conn);
         }
         Amalgame_Net_Http_H1Conn_Close(conn);
     }

@@ -156,5 +156,43 @@ public class HttpResponse {
         if (code == 503) { return "Service Unavailable" }
         return "Status"
     }
+
+    // ── v0.7.0: Bridge to H1Conn ───────────────────
+    //
+    // Render this HttpResponse onto the H1Conn that handed us the
+    // request. Picks Content-Type from the headers map if present
+    // (`Content-Type` or `content-type`), defaults to text/plain
+    // otherwise. The H1Conn.Respond C entry handles the
+    // status-line + Content-Length + Connection: close/keep-alive
+    // framing.
+    //
+    // Headers beyond Content-Type are NOT yet propagated through
+    // H1Conn.Respond (its signature only takes status / ct / body).
+    // For richer header control, a follow-up v0.7.x will add
+    // H1Conn.RespondFull(conn, status, headers_map, body) that
+    // walks every entry of the headers map.
+    //
+    // Returns this for chaining (e.g. final-cleanup callers).
+    //
+    // `conn` is passed as int (pointer-as-i64 handle) for the same
+    // self-build reason explained on HttpRequest.FromH1Conn.
+    public HttpResponse WriteToH1Conn(conn: int) {
+        var ct: string = "text/plain"
+        if (this.Headers.Has("Content-Type")) {
+            ct = this.Headers.Get("Content-Type")
+        } else if (this.Headers.Has("content-type")) {
+            ct = this.Headers.Get("content-type")
+        }
+        @c {
+            AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+            if (c) {
+                Amalgame_Net_Http_H1Conn_Respond(c,
+                    (i64) self->StatusCode,
+                    (code_string) ct,
+                    (code_string) self->BodyText);
+            }
+        }
+        return this
+    }
 }
 

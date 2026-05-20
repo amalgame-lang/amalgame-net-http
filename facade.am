@@ -41,6 +41,15 @@ import Amalgame.Collections
 import Amalgame.String
 import Amalgame.Net
 
+// v0.7.0: pull the package's runtime header into every @c {} block
+// so HttpRequest.FromH1Conn / HttpResponse.WriteToH1Conn (which cast
+// the conn-as-int back to AmalgameH1Conn*) can name the struct.
+// Each generated .c sees this declaration at the top, which is
+// enough — _runtime.h provides stdint.h transitively for uintptr_t.
+@c {
+    #include "Amalgame_Net_Http.h"
+}
+
 // NOTE: TLS integration (server-side HTTPS, client HTTPS, ALPN) is
 // deferred to v0.1.x. v0.1 keeps `tlsCtx` parameters typed as `any`
 // (always null) so we don't impose a build-time dependency on

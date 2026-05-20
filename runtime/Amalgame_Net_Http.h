@@ -693,6 +693,63 @@ static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
     return 0;
 }
 
+/* ── Http2.ServeMt(port, handler) — multi-thread h2c (v0.7.0) ──
+ * Same pattern as Http1.ServeMt: thread-per-connection,
+ * GC_pthread_create, detached, run the per-conn request loop
+ * (h2 multiplexes streams over one conn, so one thread drives
+ * one nghttp2 session). */
+typedef struct {
+    AmalgameH2Conn*  conn;
+    AmalgameClosure* handler;
+} amalgame_h2_mt_arg;
+
+static void* amalgame_h2_mt_worker(void* p) {
+    amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) p;
+    for (;;) {
+        i64 sid = Amalgame_Net_Http_H2Conn_NextRequest(a->conn);
+        if (sid <= 0) break;
+        AmalgameClosure_call1(a->handler, (void*) a->conn);
+    }
+    Amalgame_Net_Http_H2Conn_Close(a->conn);
+    return NULL;
+}
+
+static inline i64 Amalgame_Net_Http_Http2_ServeMt(i64 port,
+                                                   AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http2.ServeMt: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http2.ServeMt: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Http2.ServeMt: listening on :%lld (h2c, multi-thread)\n",
+            (long long)port);
+    fflush(stdout);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    while (srv->listening) {
+        AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
+        if (!conn) continue;
+        amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) GC_MALLOC(sizeof(*a));
+        a->conn = conn; a->handler = handler;
+        pthread_t t;
+        int rc = GC_pthread_create(&t, &attr, amalgame_h2_mt_worker, a);
+        if (rc != 0) {
+            fprintf(stderr, "Http2.ServeMt: thread create failed (%s), inline\n",
+                    strerror(rc));
+            amalgame_h2_mt_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    Amalgame_Net_Http_H2Server_Close(srv);
+    return 0;
+}
+
 /* ── Http2.ServeWith(port, config, handler) — Http2.Serve + config ─
  * Same as Http2.Serve plus HttpServerConfig applied to every
  * accepted connection (SO_RCVTIMEO / SO_SNDTIMEO from
@@ -945,6 +1002,58 @@ static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
     return 0;
 }
 
+/* ── Https.ServeMt(port, cert, key, handler) — multi-thread (v0.7.0) ─
+ * Same pattern as Http2.ServeMt: thread per accepted TLS conn,
+ * drives the h2 stream loop inside the worker. The TLS handshake
+ * happens in HttpsServer_Accept, so each worker enters with an
+ * upgraded H2Conn ready to serve streams. */
+static inline i64 Amalgame_Net_Http_Https_ServeMt(i64 port,
+        code_string cert_file, code_string key_file,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Https.ServeMt: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Https.ServeMt: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_Listen(
+        port, cert_file, key_file, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Https.ServeMt: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Https.ServeMt: listening on :%lld (HTTPS h2, multi-thread)\n",
+            (long long)port);
+    fflush(stdout);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    while (srv->listening) {
+        AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
+        if (!conn) continue;
+        amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) GC_MALLOC(sizeof(*a));
+        a->conn = conn; a->handler = handler;
+        pthread_t t;
+        int rc = GC_pthread_create(&t, &attr, amalgame_h2_mt_worker, a);
+        if (rc != 0) {
+            fprintf(stderr, "Https.ServeMt: thread create failed (%s), inline\n",
+                    strerror(rc));
+            amalgame_h2_mt_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    Amalgame_Net_Http_HttpsServer_Close(srv);
+    return 0;
+}
+
 /* ── Https.ServeWith(port, cert, key, config, handler) ─────────────
  * Https.Serve + HttpServerConfig applied post-accept. Same single-
  * deadline-per-conn caveat as Http2.ServeWith (H2 stream multiplexing).
@@ -1082,6 +1191,10 @@ static inline i64 Amalgame_Net_Http_Http2_ServeWith(i64 port,
         AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
     (void)port; (void)cfg; (void)h; return -1;
 }
+static inline i64 Amalgame_Net_Http_Http2_ServeMt(i64 port,
+        AmalgameClosure* h) {
+    (void)port; (void)h; return -1;
+}
 typedef struct AmalgameHttpsServer AmalgameHttpsServer;
 static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
         i64 p, code_string c, code_string k, i64 b) {
@@ -1103,6 +1216,10 @@ static inline i64 Amalgame_Net_Http_Https_ServeWith(i64 port,
         AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
     (void)port; (void)cert; (void)key; (void)cfg; (void)h;
     return -1;
+}
+static inline i64 Amalgame_Net_Http_Https_ServeMt(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h; return -1;
 }
 
 #endif /* AMALGAME_HAS_NGHTTP2 */
@@ -1171,6 +1288,11 @@ typedef struct AmalgameH1Conn {
      * header so the client keeps the TCP connection open for the
      * next request. */
     int32_t   keep_alive;
+    /* v0.7.0: client peer address captured at accept time, formatted
+     * "ip:port" (e.g. "192.0.2.1:54321") for IPv4. Empty string when
+     * the accept call failed to capture it. Read by middlewares that
+     * key off the client IP — primarily RateLimit "ip" strategy. */
+    char      remote_addr[64];
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -1366,6 +1488,13 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_H1Server_Accept(
         (AmalgameH1Conn*)GC_MALLOC(sizeof(AmalgameH1Conn));
     memset(c, 0, sizeof(*c));
     c->fd = cfd;
+    /* v0.7.0: capture peer "ip:port" into a stack-NUL-terminated
+     * buffer. inet_ntoa is fine for IPv4 (sockaddr_in); a v0.8.x
+     * extension can switch to inet_ntop for IPv6 once sockaddr_in6
+     * is plumbed through the rest of the server stack. */
+    snprintf(c->remote_addr, sizeof(c->remote_addr),
+             "%s:%u", inet_ntoa(addr.sin_addr),
+             (unsigned) ntohs(addr.sin_port));
     return c;
 }
 
@@ -2270,6 +2399,61 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
     return 0;
 }
 
+/* ── Ws.ServeMt(port, handler) — multi-thread WebSocket (v0.7.0) ──
+ * Each upgraded WsConn gets its own worker thread for the frame
+ * loop. Critical for fan-out scenarios — chat / notifications /
+ * presence — where one slow client must not block the others.
+ * Same GC-safe thread-per-conn pattern as Http1.ServeMt; the
+ * handler stays alive in its worker for the connection's lifetime
+ * (i.e. until the user closure returns or the client disconnects). */
+typedef struct {
+    AmalgameWsConn*  conn;
+    AmalgameClosure* handler;
+} amalgame_ws_mt_arg;
+
+static void* amalgame_ws_mt_worker(void* p) {
+    amalgame_ws_mt_arg* a = (amalgame_ws_mt_arg*) p;
+    AmalgameClosure_call1(a->handler, (void*) a->conn);
+    Amalgame_Net_Http_WsConn_Close(a->conn);
+    return NULL;
+}
+
+static inline i64 Amalgame_Net_Http_Ws_ServeMt(i64 port,
+                                                AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Ws.ServeMt: handler is NULL\n");
+        return -1;
+    }
+    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Ws.ServeMt: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Ws.ServeMt: listening on :%lld (WebSocket, multi-thread)\n",
+            (long long)port);
+    fflush(stdout);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    while (srv->listening) {
+        AmalgameWsConn* conn = Amalgame_Net_Http_WsServer_Accept(srv);
+        if (!conn) continue;
+        amalgame_ws_mt_arg* a = (amalgame_ws_mt_arg*) GC_MALLOC(sizeof(*a));
+        a->conn = conn; a->handler = handler;
+        pthread_t t;
+        int rc = GC_pthread_create(&t, &attr, amalgame_ws_mt_worker, a);
+        if (rc != 0) {
+            fprintf(stderr, "Ws.ServeMt: thread create failed (%s), inline\n",
+                    strerror(rc));
+            amalgame_ws_mt_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    Amalgame_Net_Http_WsServer_Close(srv);
+    return 0;
+}
+
 /* ── Ws.ServeWith(port, config, handler) ──────────────────────────
  * Ws.Serve + HttpServerConfig with the timeout dance done RIGHT
  * (v0.4.8): we accept the raw TCP socket ourselves, apply the
@@ -2462,6 +2646,56 @@ static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
     return 0;
 }
 
+/* ── Wss.ServeMt(port, cert, key, handler) — multi-thread (v0.7.0) ─
+ * wss:// equivalent of Ws.ServeMt: thread per accepted TLS+upgrade
+ * WebSocket conn, drives the frame loop inside the worker. */
+static inline i64 Amalgame_Net_Http_Wss_ServeMt(i64 port,
+        code_string cert_file, code_string key_file,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Wss.ServeMt: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Wss.ServeMt: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_Listen(
+        port, cert_file, key_file, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Wss.ServeMt: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Wss.ServeMt: listening on :%lld (wss://, multi-thread)\n",
+            (long long)port);
+    fflush(stdout);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    while (srv->listening) {
+        AmalgameWsConn* conn = Amalgame_Net_Http_WssServer_Accept(srv);
+        if (!conn) continue;
+        amalgame_ws_mt_arg* a = (amalgame_ws_mt_arg*) GC_MALLOC(sizeof(*a));
+        a->conn = conn; a->handler = handler;
+        pthread_t t;
+        int rc = GC_pthread_create(&t, &attr, amalgame_ws_mt_worker, a);
+        if (rc != 0) {
+            fprintf(stderr, "Wss.ServeMt: thread create failed (%s), inline\n",
+                    strerror(rc));
+            amalgame_ws_mt_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    Amalgame_Net_Http_WssServer_Close(srv);
+    return 0;
+}
+
 /* ── Wss.ServeWith(port, cert, key, config, handler) ──────────────
  * Wss.Serve + HttpServerConfig with the same timeout dance as
  * Ws.ServeWith (v0.4.8): apply timeout before SSL_accept + upgrade,
@@ -2563,6 +2797,12 @@ static inline i64 Amalgame_Net_Http_Ws_ServeWith(i64 port,
     fprintf(stderr, "Ws.ServeWith: built without OpenSSL.\n");
     return -3;
 }
+static inline i64 Amalgame_Net_Http_Ws_ServeMt(i64 port,
+        AmalgameClosure* h) {
+    (void)port; (void)h;
+    fprintf(stderr, "Ws.ServeMt: built without OpenSSL.\n");
+    return -3;
+}
 typedef struct AmalgameWssServer AmalgameWssServer;
 static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
         i64 p, code_string c, code_string k, i64 b) {
@@ -2585,6 +2825,12 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(i64 port,
         AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
     (void)port; (void)cert; (void)key; (void)cfg; (void)h;
     fprintf(stderr, "Wss.ServeWith: built without OpenSSL.\n");
+    return -3;
+}
+static inline i64 Amalgame_Net_Http_Wss_ServeMt(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h;
+    fprintf(stderr, "Wss.ServeMt: built without OpenSSL.\n");
     return -3;
 }
 

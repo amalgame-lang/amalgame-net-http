@@ -54,9 +54,18 @@ NC='\033[0m'
 
 cd "$PKG_DIR"
 
+# v0.4.6: facade.am split across multiple source files (cookie,
+# http_request, http_response, http_parser, http_server, http_client).
+# Order matches amalgame.toml's `sources = [...]` for cross-file refs.
+NETHTTP_SOURCES="facade.am cookie.am http_request.am http_response.am http_parser.am http_server.am http_client.am"
+NETHTTP_EXTERNAL_FLAGS=""
+for src in $NETHTTP_SOURCES; do
+    NETHTTP_EXTERNAL_FLAGS="$NETHTTP_EXTERNAL_FLAGS --external $src"
+done
+
 # ── Build facade.o once ───────────────────────────────────────────
 echo -e "\n── Building facade.o ──"
-"$AMC" --lib -o "$BUILD_DIR/facade" facade.am 2>&1 | tail -2
+"$AMC" --lib -o "$BUILD_DIR/facade" $NETHTTP_SOURCES 2>&1 | tail -2
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -c "$BUILD_DIR/facade.c" -o "$BUILD_DIR/facade.o" 2>&1 | head -5
 if [ ! -s "$BUILD_DIR/facade.o" ]; then
     echo -e "${RED}FAIL${NC} (facade compile)"
@@ -68,7 +77,7 @@ echo -e "${GREEN}facade.o ready${NC}"
 build_test() {
     local src="$1"
     local out="$2"
-    "$AMC" -o "$out" "$src" --external facade.am 2>&1 | tail -2
+    "$AMC" -o "$out" "$src" $NETHTTP_EXTERNAL_FLAGS 2>&1 | tail -2
     gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$out.c" "$BUILD_DIR/facade.o" \
         -lgc -lm -lcurl -lz -o "$out" 2>&1 | head -5
     [ -x "$out" ]

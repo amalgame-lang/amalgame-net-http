@@ -1,0 +1,138 @@
+// amalgame-net-http — HttpParser (HTTP/1.1 wire parser).
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// HTTP/1.1 wire parser. Public so library users / tests can exercise
+// it directly, and so HttpServer / HttpClient can share one impl.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpParser {
+    // Build the CRLF separator. AM string literals don't escape `\r`
+    // (only `\n` is recognized), so a literal `"\r\n"` lexes as 3
+    // bytes (`\`, `r`, LF) instead of the 2-byte HTTP standard
+    // (CR LF). We assemble CR explicitly from its byte value.
+    public static string Crlf() { return String_FromByte(13) + "\n" }
+
+    public static string DoubleCrlf() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return crlf + crlf
+    }
+
+    // Parse the request-line + header block. Body is NOT read here —
+    // the caller must look at Content-Length / Transfer-Encoding and
+    // fetch the right number of bytes from the socket.
+    //
+    // Returns a partially-populated HttpRequest, or null on parse
+    // error. `headerBlock` is everything up to and including the
+    // empty CRLF that separates headers from body.
+    public static HttpRequest ParseHeaders(string headerBlock) {
+        let crlf: string = HttpParser.Crlf()
+        let lines: List<string> = String_Split(headerBlock, crlf)
+        if (lines.Count() < 1) { return null }
+
+        // First line: "METHOD SP REQUEST-TARGET SP HTTP-VERSION".
+        let first: string = lines.Get(0)
+        let sp1: int = String_IndexOf(first, " ")
+        if (sp1 < 0) { return null }
+        let rest: string = String_Substring(first, sp1 + 1, String_Length(first) - sp1 - 1)
+        let sp2: int = String_IndexOf(rest, " ")
+        if (sp2 < 0) { return null }
+
+        let req = new HttpRequest()
+        req.Method      = String_Substring(first, 0, sp1)
+        req.RawTarget   = String_Substring(rest, 0, sp2)
+        req.HttpVersion = String_Substring(rest, sp2 + 1, String_Length(rest) - sp2 - 1)
+
+        // Split request-target into Path + Query.
+        let qIdx: int = String_IndexOf(req.RawTarget, "?")
+        if (qIdx < 0) {
+            req.Path = req.RawTarget
+        } else {
+            req.Path  = String_Substring(req.RawTarget, 0, qIdx)
+            let q: string = String_Substring(req.RawTarget, qIdx + 1,
+                                              String_Length(req.RawTarget) - qIdx - 1)
+            req.Query = HttpRequest.ParseQuery(q)
+        }
+
+        // Header block — each "Name: Value" until empty line.
+        let ln: int = lines.Count()
+        for i in 1..ln {
+            let line: string = lines.Get(i)
+            if (String_Length(line) == 0) { continue }
+            let colon: int = String_IndexOf(line, ":")
+            if (colon < 0) { continue }
+            let name: string = String_Trim(String_Substring(line, 0, colon))
+            let value: string = String_Trim(
+                String_Substring(line, colon + 1, String_Length(line) - colon - 1))
+            req.Headers.Set(String_ToLower(name), value)
+        }
+        return req
+    }
+
+    // Convenience: parse a complete request including body. Used by
+    // the test suite; production servers stream the body separately
+    // to enforce Content-Length / timeout limits.
+    public static HttpRequest ParseFull(string raw) {
+        let sep: string = HttpParser.DoubleCrlf()
+        let sepLen: int = String_Length(sep)
+        let idx: int = String_IndexOf(raw, sep)
+        if (idx < 0) { return null }
+        let headerBlock: string = String_Substring(raw, 0, idx)
+        let req: HttpRequest = HttpParser.ParseHeaders(headerBlock)
+        if (req == null) { return null }
+        let bodyStart: int = idx + sepLen
+        req.Body = String_Substring(raw, bodyStart, String_Length(raw) - bodyStart)
+        return req
+    }
+
+    // Parse an HTTP response (used by HttpClient). Returns a tuple-ish
+    // via a populated HttpResponse + body string. Same caveat as
+    // ParseFull: full message in memory.
+    public static HttpResponse ParseResponse(string raw) {
+        let sep: string = HttpParser.DoubleCrlf()
+        let sepLen: int = String_Length(sep)
+        let idx: int = String_IndexOf(raw, sep)
+        if (idx < 0) { return null }
+        let headerBlock: string = String_Substring(raw, 0, idx)
+        let lines: List<string> = String_Split(headerBlock, HttpParser.Crlf())
+        if (lines.Count() < 1) { return null }
+
+        // Status line: "HTTP/1.1 SP CODE SP REASON".
+        let first: string = lines.Get(0)
+        let sp1: int = String_IndexOf(first, " ")
+        if (sp1 < 0) { return null }
+        let rest: string = String_Substring(first, sp1 + 1, String_Length(first) - sp1 - 1)
+        let sp2: int = String_IndexOf(rest, " ")
+        let code: int = 0
+        if (sp2 < 0) {
+            code = String_ToInt(rest)
+        } else {
+            code = String_ToInt(String_Substring(rest, 0, sp2))
+        }
+        let resp = HttpResponse.New().Status(code)
+
+        let ln: int = lines.Count()
+        for i in 1..ln {
+            let line: string = lines.Get(i)
+            if (String_Length(line) == 0) { continue }
+            let colon: int = String_IndexOf(line, ":")
+            if (colon < 0) { continue }
+            let name: string = String_Trim(String_Substring(line, 0, colon))
+            let value: string = String_Trim(
+                String_Substring(line, colon + 1, String_Length(line) - colon - 1))
+            resp.Headers.Set(name, value)
+        }
+
+        let bodyStart: int = idx + 4
+        resp.BodyText = String_Substring(raw, bodyStart, String_Length(raw) - bodyStart)
+        return resp
+    }
+}

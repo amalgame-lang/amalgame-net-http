@@ -468,7 +468,7 @@ static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
 
 /* ── H2Server — minimal TCP listener for h2c ───────────── */
 
-static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 port) {
+static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 port, i64 backlog) {
     AmalgameH2Server* s =
         (AmalgameH2Server*)GC_MALLOC(sizeof(AmalgameH2Server));
     s->fd = -1; s->listening = 0; s->port = port;
@@ -484,7 +484,7 @@ static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 64) < 0) {
+        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
         close(fd);
         return s;
     }
@@ -641,7 +641,7 @@ static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
         fprintf(stderr, "Http2.Serve: handler is NULL\n");
         return -1;
     }
-    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port);
+    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port, 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Http2.Serve: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -678,7 +678,7 @@ static inline i64 Amalgame_Net_Http_Http2_ServeWith(
         fprintf(stderr, "Http2.ServeWith: handler is NULL\n");
         return -1;
     }
-    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port);
+    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port, config ? config->listen_backlog : 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Http2.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -766,7 +766,7 @@ static int amalgame_https_alpn_select_cb(SSL* ssl,
 }
 
 static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
-        i64 port, code_string cert_file, code_string key_file) {
+        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
     AmalgameHttpsServer* s =
         (AmalgameHttpsServer*)GC_MALLOC(sizeof(AmalgameHttpsServer));
     memset(s, 0, sizeof(*s));
@@ -783,7 +783,7 @@ static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 64) < 0) {
+        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
         close(fd); return s;
     }
     s->fd = fd;
@@ -891,7 +891,7 @@ static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
     }
 
     AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_Listen(
-        port, cert_file, key_file);
+        port, cert_file, key_file, 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Https.Serve: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -941,7 +941,7 @@ static inline i64 Amalgame_Net_Http_Https_ServeWith(
         ssl_initialised = 1;
     }
     AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_Listen(
-        port, cert_file, key_file);
+        port, cert_file, key_file, config ? config->listen_backlog : 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Https.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -970,7 +970,8 @@ static inline i64 Amalgame_Net_Http_Https_ServeWith(
 typedef struct AmalgameHttpsServer AmalgameHttpsServer;
 
 static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
-        i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
+        i64 p, code_string c, code_string k, i64 b) {
+    (void)p;(void)c;(void)k;(void)b; return NULL; }
 static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
         AmalgameHttpsServer* s) { (void)s; return NULL; }
 static inline void Amalgame_Net_Http_HttpsServer_Close(AmalgameHttpsServer* s) {
@@ -1032,7 +1033,8 @@ static inline void Amalgame_Net_Http_H2Conn_Respond(AmalgameH2Conn* c,
 static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
     (void)c;
 }
-static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 p) {
+static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 p, i64 b) {
+    (void)b;
     (void)p; return NULL;
 }
 static inline code_bool Amalgame_Net_Http_H2Server_IsListening(
@@ -1052,7 +1054,8 @@ static inline i64 Amalgame_Net_Http_Http2_ServeWith(i64 port,
 }
 typedef struct AmalgameHttpsServer AmalgameHttpsServer;
 static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
-        i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
+        i64 p, code_string c, code_string k, i64 b) {
+    (void)p;(void)c;(void)k;(void)b; return NULL; }
 static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
         AmalgameHttpsServer* s) { (void)s; return NULL; }
 static inline void Amalgame_Net_Http_HttpsServer_Close(AmalgameHttpsServer* s) {
@@ -1287,7 +1290,7 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
 
 /* ── H1Server — TCP listener ─────────────────────────────────────*/
 
-static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port) {
+static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port, i64 backlog) {
     AmalgameH1Server* s =
         (AmalgameH1Server*)GC_MALLOC(sizeof(AmalgameH1Server));
     s->fd = -1; s->listening = 0; s->port = port;
@@ -1303,7 +1306,7 @@ static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 64) < 0) {
+        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
         close(fd);
         return s;
     }
@@ -1459,7 +1462,7 @@ static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
         fprintf(stderr, "Http1.Serve: handler is NULL\n");
         return -1;
     }
-    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port);
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port, 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Http1.Serve: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -1497,7 +1500,7 @@ static inline i64 Amalgame_Net_Http_Http1_ServeWith(
         fprintf(stderr, "Http1.ServeWith: handler is NULL\n");
         return -1;
     }
-    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port);
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port, config ? config->listen_backlog : 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Http1.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -1582,7 +1585,7 @@ typedef struct AmalgameWsConn {
 
 /* ── Server lifecycle ──────────────────────────────────────────── */
 
-static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 port) {
+static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 port, i64 backlog) {
     AmalgameWsServer* s = (AmalgameWsServer*)GC_MALLOC(sizeof(*s));
     s->fd = -1; s->listening = 0; s->port = port;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1595,7 +1598,7 @@ static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 64) < 0) {
+        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
         close(fd);
         return s;
     }
@@ -1930,7 +1933,7 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
         fprintf(stderr, "Ws.Serve: handler is NULL\n");
         return -1;
     }
-    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port);
+    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port, 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Ws.Serve: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -1966,7 +1969,7 @@ static inline i64 Amalgame_Net_Http_Ws_ServeWith(
         fprintf(stderr, "Ws.ServeWith: handler is NULL\n");
         return -1;
     }
-    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port);
+    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port, config ? config->listen_backlog : 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Ws.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -2015,7 +2018,7 @@ typedef struct AmalgameWssServer {
 } AmalgameWssServer;
 
 static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
-        i64 port, code_string cert_file, code_string key_file) {
+        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
     AmalgameWssServer* s =
         (AmalgameWssServer*)GC_MALLOC(sizeof(AmalgameWssServer));
     memset(s, 0, sizeof(*s));
@@ -2031,7 +2034,7 @@ static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 64) < 0) {
+        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
         close(fd); return s;
     }
     s->fd = fd;
@@ -2110,7 +2113,7 @@ static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
         ssl_initialised = 1;
     }
     AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_Listen(
-        port, cert_file, key_file);
+        port, cert_file, key_file, 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Wss.Serve: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -2154,7 +2157,7 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(
         ssl_initialised = 1;
     }
     AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_Listen(
-        port, cert_file, key_file);
+        port, cert_file, key_file, config ? config->listen_backlog : 0);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Wss.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -2178,7 +2181,8 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(
 
 typedef struct AmalgameWsServer AmalgameWsServer;
 typedef struct AmalgameWsConn   AmalgameWsConn;
-static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 p) {
+static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 p, i64 b) {
+    (void)b;
     (void)p; return NULL;
 }
 static inline code_bool Amalgame_Net_Http_WsServer_IsListening(
@@ -2211,7 +2215,8 @@ static inline i64 Amalgame_Net_Http_Ws_ServeWith(i64 port,
 }
 typedef struct AmalgameWssServer AmalgameWssServer;
 static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
-        i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
+        i64 p, code_string c, code_string k, i64 b) {
+    (void)p;(void)c;(void)k;(void)b; return NULL; }
 static inline code_bool Amalgame_Net_Http_WssServer_IsListening(
         AmalgameWssServer* s) { (void)s; return 0; }
 static inline AmalgameWsConn* Amalgame_Net_Http_WssServer_Accept(

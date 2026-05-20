@@ -1198,12 +1198,122 @@ static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
     }
 }
 
+/* ── HttpServerConfig — server-side tunables (v0.4.3) ─────────────
+ * Snapshot of the per-server config, applied at accept time.
+ *
+ * Wired today (v0.4.3):
+ *   header_timeout_sec, body_timeout_sec — SO_RCVTIMEO / SO_SNDTIMEO
+ *     on every accepted fd. Slowloris guard.
+ *
+ * Field present, pending v0.4.4 wiring:
+ *   max_body_bytes, max_header_bytes, max_url_bytes — currently the
+ *     parser uses compile-time constants (AMALGAME_H1_MAX_BODY etc.).
+ *     The struct fields are accepted so the [limits] TOML schema is
+ *     stable; switching the parser to read these is a follow-up patch.
+ *   idle_timeout_sec — needs HTTP keep-alive support (today we
+ *     close after one request).
+ *   listen_backlog — needs to be threaded through H1Server_Listen
+ *     (today hardcoded 64). Trivial follow-up.
+ *
+ * Zero on any field = "library default" (current hardcoded value).
+ * The struct is opaque to callers; use the New + With* helpers.
+ */
+typedef struct AmalgameNetHttpServerConfig {
+    int listen_backlog;
+    int header_timeout_sec;
+    int body_timeout_sec;
+    int idle_timeout_sec;
+    i64 max_body_bytes;
+    i64 max_header_bytes;
+    i64 max_url_bytes;
+} AmalgameNetHttpServerConfig;
+
+/* Allocate a zeroed config (so every field defaults to "library
+ * default" via 0). Caller fills in non-zero values via the With*
+ * helpers. */
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_Default(void) {
+    AmalgameNetHttpServerConfig* c =
+        (AmalgameNetHttpServerConfig*)GC_MALLOC(sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    return c;
+}
+
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithHeaderTimeoutSec(
+        AmalgameNetHttpServerConfig* c, i64 s) {
+    if (c) c->header_timeout_sec = (int)s;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithBodyTimeoutSec(
+        AmalgameNetHttpServerConfig* c, i64 s) {
+    if (c) c->body_timeout_sec = (int)s;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithIdleTimeoutSec(
+        AmalgameNetHttpServerConfig* c, i64 s) {
+    if (c) c->idle_timeout_sec = (int)s;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxBodyBytes(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->max_body_bytes = b;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxHeaderBytes(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->max_header_bytes = b;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxUrlBytes(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->max_url_bytes = b;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithListenBacklog(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->listen_backlog = (int)b;
+    return c;
+}
+
+/* Per-field getters — needed so AM-side FromMap can compose a config
+ * by chained With* calls returning the (single) shared instance.
+ * Reading non-zero fields lets callers introspect before they call
+ * ServeWith. */
+static inline i64 Amalgame_Net_Http_HttpServerConfig_HeaderTimeoutSec(AmalgameNetHttpServerConfig* c) { return c ? c->header_timeout_sec : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_BodyTimeoutSec(AmalgameNetHttpServerConfig* c)   { return c ? c->body_timeout_sec   : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_IdleTimeoutSec(AmalgameNetHttpServerConfig* c)   { return c ? c->idle_timeout_sec   : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxBodyBytes(AmalgameNetHttpServerConfig* c)     { return c ? c->max_body_bytes     : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxHeaderBytes(AmalgameNetHttpServerConfig* c)   { return c ? c->max_header_bytes   : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxUrlBytes(AmalgameNetHttpServerConfig* c)      { return c ? c->max_url_bytes      : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_ListenBacklog(AmalgameNetHttpServerConfig* c)    { return c ? c->listen_backlog     : 0; }
+
+/* Apply the wired-today knobs (SO_RCVTIMEO / SO_SNDTIMEO) to a
+ * connected fd. Quiet no-op when `config` is NULL or both timeout
+ * fields are 0 (= no timeout, current default behavior). Uses the
+ * larger of header/body timeouts as a single deadline — v0.4.4 will
+ * switch to a poll-based loop with phase-specific deadlines. */
+static inline void Amalgame_Net_Http_HttpServerConfig_ApplyToFd(
+        int fd, AmalgameNetHttpServerConfig* config) {
+    if (!config || fd < 0) return;
+    int t = config->body_timeout_sec;
+    if (config->header_timeout_sec > t) t = config->header_timeout_sec;
+    if (t > 0) {
+        struct timeval tv;
+        tv.tv_sec  = t;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+}
+
 /* ── Http1.Serve(port, handler) — high-level entry point ─────────
  * Same shape as Http2.Serve: one handler closure called once per
  * request with the H1Conn pointer. Returns:
  *    0  clean shutdown (unreachable currently — loops forever)
  *   -1  handler is NULL
  *   -2  listen() failed (port in use, EACCES, …)
+ *
+ * For tunable behavior (Slowloris timeouts, size limits) see
+ * Http1.ServeWith below.
  */
 static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
                                                 AmalgameClosure* handler) {
@@ -1224,6 +1334,47 @@ static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
     while (srv->listening) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
+        if (amalgame_h1_parse_request(conn) > 0) {
+            AmalgameClosure_call1(handler, (void*)conn);
+        }
+        Amalgame_Net_Http_H1Conn_Close(conn);
+    }
+    Amalgame_Net_Http_H1Server_Close(srv);
+    return 0;
+}
+
+/* ── Http1.ServeWith(port, config, handler) — Http1.Serve + config ─
+ * Same shape as Http1.Serve but applies HttpServerConfig to every
+ * accepted connection. Today that means setting SO_RCVTIMEO /
+ * SO_SNDTIMEO from config.header_timeout_sec / body_timeout_sec —
+ * the Slowloris guard. Size-limit fields are accepted in the
+ * config struct (and TOML schema) but the parser still uses
+ * compile-time constants; switching is a v0.4.4 follow-up.
+ */
+static inline i64 Amalgame_Net_Http_Http1_ServeWith(
+        i64 port,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http1.ServeWith: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http1.ServeWith: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    int t = config ? config->header_timeout_sec : 0;
+    if (config && config->body_timeout_sec > t) t = config->body_timeout_sec;
+    fprintf(stdout, "Http1.ServeWith: listening on :%lld (HTTP/1.1, timeout=%ds)\n",
+            (long long)port, t);
+    fflush(stdout);
+
+    while (srv->listening) {
+        AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
+        if (!conn) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
         if (amalgame_h1_parse_request(conn) > 0) {
             AmalgameClosure_call1(handler, (void*)conn);
         }

@@ -166,7 +166,7 @@ cat > "$BUILD_DIR/h2c_smoke.c" <<EOF
 int main(void) {
     GC_INIT();
     i64 avail = Amalgame_Net_Http_H2_Available();
-    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(0);
+    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(0, 0);
     int listening = Amalgame_Net_Http_H2Server_IsListening(srv);
     Amalgame_Net_Http_H2Server_Close(srv);
     printf("H2_Available: %lld\n", (long long)avail);

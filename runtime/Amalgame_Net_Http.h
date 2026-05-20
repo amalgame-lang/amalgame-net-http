@@ -49,6 +49,23 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+/* v0.6.0: pthread for Http1.ServeMt — one worker thread per accepted
+ * connection. GC_pthread_create wraps pthread_create with the bdwgc
+ * thread-registration dance so locals on the worker stack stay
+ * scannable; without it, GC can free live objects mid-request.
+ *
+ * The bdwgc threading helpers are only declared in <gc.h> when
+ * GC_THREADS is defined BEFORE the first include. _runtime.h pulls
+ * gc.h in transparently without that define, which locks the
+ * prototypes out via the header guard. Forward-declare what we
+ * need so the wrapper compiles cleanly regardless of include
+ * order — same pattern as amalgame-threading. Symbols come from
+ * the system libgc.so at link time. */
+#include <pthread.h>
+extern int GC_pthread_create(pthread_t* new_thread,
+                              const pthread_attr_t* attr,
+                              void* (*start_routine)(void*),
+                              void* arg);
 
 /* nghttp2 header probe — multi-OS, mirrors the OpenSSL pattern in
  * amalgame-tls. macOS gets a Homebrew path fallback. */
@@ -1564,6 +1581,100 @@ static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
         }
         Amalgame_Net_Http_H1Conn_Close(conn);
     }
+    Amalgame_Net_Http_H1Server_Close(srv);
+    return 0;
+}
+
+/* ── Http1.ServeMt(port, handler) — multi-threaded variant ──────
+ * v0.6.0. Same handler signature as Http1.Serve, but each accepted
+ * connection runs in its own worker thread. The accept loop never
+ * blocks on a slow handler — throughput scales with cores + handler
+ * latency, not just with handler latency.
+ *
+ * Threading model: thread-per-connection, fire-and-forget. Each
+ * worker is detached at creation, so we don't pin its TID; when it
+ * returns, pthread cleans up the stack and bdwgc collects any
+ * leftover heap reachable from it.
+ *
+ * GC safety: GC_pthread_create registers the new thread with bdwgc
+ * BEFORE handler-supplied code starts running, so the conn + arg
+ * buffer + any AM heap touched by the handler stay scannable. Don't
+ * swap GC_pthread_create for raw pthread_create — it would race the
+ * collector and produce sporadic free-of-live crashes.
+ *
+ * On pthread_create failure (EAGAIN — out of resources) we fall back
+ * to running the handler inline, so the server keeps serving even
+ * under thread-exhaustion conditions. Slower but stays up.
+ *
+ * Use cases: any request that does I/O (DB, downstream HTTP, file
+ * write) — those are the ones that benefit from not blocking the
+ * accept loop. Pure-compute handlers see little benefit and pay the
+ * pthread_create cost (~20µs on Linux).
+ *
+ * Caveats:
+ *   - Per-thread stack ≈ 8MB on Linux (default pthread). With
+ *     thousands of concurrent connections, RSS climbs. v2 can swap
+ *     to a bounded thread-pool + queue.
+ *   - The handler MUST be thread-safe: any state it touches via
+ *     closure capture is shared across workers. Use a Mutex
+ *     (amalgame-threading v0.1+) around mutable shared state.
+ *   - keep-alive: ResetForReuse + a per-connection request loop
+ *     could be added in a future version; today, each worker
+ *     handles exactly one request then closes.
+ */
+typedef struct {
+    AmalgameH1Conn*  conn;
+    AmalgameClosure* handler;
+} amalgame_h1_mt_arg;
+
+static void* amalgame_h1_mt_worker(void* p) {
+    amalgame_h1_mt_arg* a = (amalgame_h1_mt_arg*) p;
+    if (amalgame_h1_parse_request(a->conn) > 0) {
+        AmalgameClosure_call1(a->handler, (void*)a->conn);
+    }
+    Amalgame_Net_Http_H1Conn_Close(a->conn);
+    return NULL;
+}
+
+static inline i64 Amalgame_Net_Http_Http1_ServeMt(i64 port,
+                                                  AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http1.ServeMt: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http1.ServeMt: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Http1.ServeMt: listening on :%lld (HTTP/1.1, multi-thread)\n",
+            (long long)port);
+    fflush(stdout);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    while (srv->listening) {
+        AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
+        if (!conn) continue;
+        amalgame_h1_mt_arg* a =
+            (amalgame_h1_mt_arg*) GC_MALLOC(sizeof(*a));
+        a->conn    = conn;
+        a->handler = handler;
+        pthread_t t;
+        int rc = GC_pthread_create(&t, &attr, amalgame_h1_mt_worker, a);
+        if (rc != 0) {
+            /* EAGAIN typically — out of thread resources. Degrade
+             * gracefully by running the handler inline rather than
+             * dropping the connection. */
+            fprintf(stderr, "Http1.ServeMt: GC_pthread_create failed (%s), running inline\n",
+                    strerror(rc));
+            amalgame_h1_mt_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
     Amalgame_Net_Http_H1Server_Close(srv);
     return 0;
 }

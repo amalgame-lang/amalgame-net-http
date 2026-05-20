@@ -142,5 +142,55 @@ public class HttpRequest {
         if (c == "f" || c == "F") { return 15 }
         return -1
     }
+
+    // ── v0.7.0: Bridge from H1Conn ─────────────────
+    //
+    // Build a parsed HttpRequest from a live H1Conn (the connection
+    // object passed to handlers by Http1.Serve / ServeMt / ServeWith
+    // / ServeMtWith). Bundles every getter the parser exposes —
+    // Method / Path / RawTarget / Body / RemoteAddr.
+    //
+    // Headers are NOT bulk-iterated here (the H1Conn API exposes
+    // header lookup by name but not bulk enumeration); callers who
+    // need a specific header should use H1Conn.Header(conn, name)
+    // directly or extend this bridge in a future version that adds
+    // enumeration support to the parser.
+    //
+    // RemoteAddr (e.g. "192.0.2.1:54321") populated from the
+    // accepted socket's peer name where the parser tracks it.
+    //
+    // Lives in HttpRequest (not H1Conn) so it can be reached
+    // through --external facade.am — amalgame-web's WebApp.Serve*
+    // entry points use it without having to depend on H1Conn being
+    // exposed in the consumer's namespace.
+    //
+    // The `conn` is passed as `int` (a pointer-as-i64 handle) to
+    // sidestep amc's self-build limitation: when net-http compiles
+    // its own facade, `AmalgameH1Conn` is treated as a Local class
+    // (manifest entry) and mangled into the consumer namespace,
+    // breaking the C-level type match. Passing it as i64 + casting
+    // inside the @c block routes around that. Callers just pass
+    // their H1Conn straight (amc auto-converts the pointer).
+    public static HttpRequest FromH1Conn(conn: int) {
+        let req = new HttpRequest()
+        @c {
+            AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+            if (c) {
+                req->Method      = (code_string) Amalgame_Net_Http_H1Conn_Method(c);
+                req->Path        = (code_string) Amalgame_Net_Http_H1Conn_Path(c);
+                req->RawTarget   = (code_string) Amalgame_Net_Http_H1Conn_RawTarget(c);
+                req->HttpVersion = "HTTP/1.1";
+                req->Body        = (code_string) Amalgame_Net_Http_H1Conn_Body(c);
+                /* RemoteAddr captured at accept time, formatted
+                 * "ip:port". If missing on older builds the field
+                 * stays empty and RateLimit "ip" strategy falls
+                 * back to allow. */
+                if (c->remote_addr[0]) {
+                    req->RemoteAddr = (code_string) c->remote_addr;
+                }
+            }
+        }
+        return req
+    }
 }
 

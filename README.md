@@ -123,6 +123,14 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
   any field = fall back to the library default (current
   `AMALGAME_H1_MAX_BODY` etc.). Over-limit requests close the
   connection with a parse error.
+- ✅ **HTTP/1.1 keep-alive** (v0.5.0): when
+  `HttpServerConfig.idle_timeout_sec > 0`, `Http1.ServeWith` keeps
+  the TCP connection open across requests (HTTP/1.1 default; respects
+  `Connection: close` / `Connection: keep-alive` headers).
+  `SO_RCVTIMEO` is swapped to the `idle_timeout_sec` value between
+  requests so a stale client gets cleaned up after that interval.
+  `Http1.Serve` (no config) keeps the legacy one-request-per-conn
+  behavior — opt-in via `Http1.ServeWith` + non-zero `idle_timeout_sec`.
 
 ## What's NOT in v0.1 (deferred to v0.1.x)
 

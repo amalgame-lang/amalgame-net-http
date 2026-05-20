@@ -83,6 +83,55 @@ else
     exit 1
 fi
 
+# ── HttpServerConfig C smoke (no sockets, no AM) ──────────────────
+# The class is a C-struct backed by stdlib.functions; testing it
+# from AM requires the full `amc package add` flow (the manifest
+# registers the class + functions, which --external doesn't). A
+# direct C smoke against the runtime header is the right scope
+# here — consumers (amalgame-web's RateLimit etc.) exercise the
+# AM-facing surface once installed.
+echo -e "\n── HttpServerConfig C smoke ──"
+cat > "$BUILD_DIR/cfg_smoke.c" <<'EOF'
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+int main(void) {
+    GC_INIT();
+    AmalgameNetHttpServerConfig* c = Amalgame_Net_Http_HttpServerConfig_Default();
+    int ok_default = (Amalgame_Net_Http_HttpServerConfig_HeaderTimeoutSec(c) == 0
+                   && Amalgame_Net_Http_HttpServerConfig_BodyTimeoutSec(c)   == 0
+                   && Amalgame_Net_Http_HttpServerConfig_MaxBodyBytes(c)     == 0);
+    Amalgame_Net_Http_HttpServerConfig_WithHeaderTimeoutSec(c, 5);
+    Amalgame_Net_Http_HttpServerConfig_WithBodyTimeoutSec(c, 30);
+    Amalgame_Net_Http_HttpServerConfig_WithMaxBodyBytes(c, 1048576);
+    Amalgame_Net_Http_HttpServerConfig_WithListenBacklog(c, 128);
+    int ok_set = (Amalgame_Net_Http_HttpServerConfig_HeaderTimeoutSec(c) == 5
+               && Amalgame_Net_Http_HttpServerConfig_BodyTimeoutSec(c)   == 30
+               && Amalgame_Net_Http_HttpServerConfig_MaxBodyBytes(c)     == 1048576
+               && Amalgame_Net_Http_HttpServerConfig_ListenBacklog(c)    == 128);
+    /* ApplyToFd on -1 must be a quiet no-op (defensive null/bad-fd path). */
+    Amalgame_Net_Http_HttpServerConfig_ApplyToFd(-1, c);
+    Amalgame_Net_Http_HttpServerConfig_ApplyToFd(0, NULL);
+    printf("default_zero: %d\n", ok_default);
+    printf("builder_roundtrip: %d\n", ok_set);
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$BUILD_DIR/cfg_smoke.c" \
+    -lgc -o "$BUILD_DIR/cfg_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/cfg_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (HttpServerConfig smoke build)"
+    exit 1
+fi
+CFG_OUT=$("$BUILD_DIR/cfg_smoke")
+echo "$CFG_OUT"
+if echo "$CFG_OUT" | grep -q "default_zero: 1" && \
+   echo "$CFG_OUT" | grep -q "builder_roundtrip: 1"; then
+    echo -e "${GREEN}PASS${NC} (HttpServerConfig default + builders + ApplyToFd no-op)"
+else
+    echo -e "${RED}FAIL${NC} (HttpServerConfig smoke output unexpected)"
+    exit 1
+fi
+
 # ── End-to-end (server + client as separate processes) ────────────
 echo -e "\n── End-to-end test (server + client) ──"
 build_test tests/server_test.am "$BUILD_DIR/server_test" || { echo "server build failed"; exit 1; }

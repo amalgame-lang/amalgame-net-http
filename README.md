@@ -102,6 +102,14 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
   silently drops any value containing `\r` or `\n` (HTTP-response-
   splitting prevention). Power users can bypass with
   `HeaderUnsafe(name, value)` for trusted internal values.
+- ✅ **HttpServerConfig** (v0.4.3): per-server tunables for the
+  HTTP/1.1 server. `Http1.ServeWith(port, config, handler)` applies
+  the configured `SO_RCVTIMEO` / `SO_SNDTIMEO` to every accepted
+  connection (Slowloris guard). Builder + getter pattern (C-struct
+  backed, like `TlsConfig`). The size-limit fields
+  (`MaxBodyBytes` / `MaxHeaderBytes` / `MaxUrlBytes`) +
+  `Http2`/`Https`/`Ws`/`Wss` ServeWith variants are accepted in
+  the contract but wired through in v0.4.4.
 
 ## What's NOT in v0.1 (deferred to v0.1.x)
 

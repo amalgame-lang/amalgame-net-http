@@ -1,0 +1,49 @@
+// amalgame-net-http — Cookie (Set-Cookie helper).
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// Cookie — utility type, parsed from `Cookie:` request header or
+// emitted via `HttpResponse.SetCookie()`.
+// ─────────────────────────────────────────────────────────────────
+
+public class Cookie {
+    public Name:     string
+    public Value:    string
+    public Domain:   string
+    public Path:     string
+    public MaxAgeSec: int
+    public HttpOnly: bool
+    public Secure:   bool
+    public SameSite: string   // "Lax" (default) | "Strict" | "None"
+
+    public Cookie() {
+        this.Name      = ""
+        this.Value     = ""
+        this.Domain    = ""
+        this.Path      = "/"
+        this.MaxAgeSec = 0
+        this.HttpOnly  = true
+        this.Secure    = false
+        this.SameSite  = "Lax"
+    }
+
+    // Serialize the cookie to a `Set-Cookie:` header value.
+    public string ToHeader() {
+        var s: string = this.Name + "=" + this.Value
+        if (String_Length(this.Path) > 0)    { s = s + "; Path=" + this.Path }
+        if (String_Length(this.Domain) > 0)  { s = s + "; Domain=" + this.Domain }
+        if (this.MaxAgeSec > 0)              { s = s + "; Max-Age=" + String_FromInt(this.MaxAgeSec) }
+        if (this.HttpOnly)                   { s = s + "; HttpOnly" }
+        if (this.Secure)                     { s = s + "; Secure" }
+        if (String_Length(this.SameSite) > 0) { s = s + "; SameSite=" + this.SameSite }
+        return s
+    }
+}

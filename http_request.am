@@ -1,0 +1,146 @@
+// amalgame-net-http — HttpRequest (parsed request).
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// HttpRequest — one incoming HTTP request after parsing.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpRequest {
+    public Method:      string                    // "GET" / "POST" / ...
+    public Path:        string                    // "/users/42" (no query)
+    public RawTarget:   string                    // "/users/42?x=1" (with query)
+    public HttpVersion: string                    // "HTTP/1.1" or "HTTP/2"
+    public Headers:     Map<string, string>       // header name lowercased → value
+    public Query:       Map<string, string>       // parsed query string
+    public Body:        string                    // raw body bytes (text-safe)
+    public RemoteAddr:  string                    // client IP:port
+    public IsSecure:    bool                      // true if served over TLS
+
+    public HttpRequest() {
+        this.Method      = ""
+        this.Path        = ""
+        this.RawTarget   = ""
+        this.HttpVersion = ""
+        this.Headers     = new Map<string, string>()
+        this.Query       = new Map<string, string>()
+        this.Body        = ""
+        this.RemoteAddr  = ""
+        this.IsSecure    = false
+    }
+
+    // Get a header value (case-insensitive lookup).
+    public string Header(string name) {
+        let key: string = String_ToLower(name)
+        if (this.Headers.Has(key)) { return this.Headers.Get(key) }
+        return ""
+    }
+
+    // Parse Body as a urlencoded form (Content-Type application/x-www-form-urlencoded).
+    public Map<string, string> Form() {
+        return HttpRequest.ParseQuery(this.Body)
+    }
+
+    // Body as plain text (already a string in v0.1).
+    public string BodyText() { return this.Body }
+
+    // Extract a cookie value by name from the Cookie: header.
+    public string Cookie(string name) {
+        let raw: string = this.Header("cookie")
+        if (String_Length(raw) == 0) { return "" }
+        let parts: List<string> = String_Split(raw, ";")
+        let pn: int = parts.Count()
+        for i in 0..pn {
+            let p: string = String_Trim(parts.Get(i))
+            let eq: int = String_IndexOf(p, "=")
+            if (eq < 0) { continue }
+            let k: string = String_Substring(p, 0, eq)
+            if (k == name) {
+                return String_Substring(p, eq + 1, String_Length(p) - eq - 1)
+            }
+        }
+        return ""
+    }
+
+    // ── Internal parser helpers ────────────────────────────────────
+
+    // Parse a urlencoded key=value&... string into a map.
+    public static Map<string, string> ParseQuery(string s) {
+        let out = new Map<string, string>()
+        if (String_Length(s) == 0) { return out }
+        let pairs: List<string> = String_Split(s, "&")
+        let pn: int = pairs.Count()
+        for i in 0..pn {
+            let p: string = pairs.Get(i)
+            if (String_Length(p) == 0) { continue }
+            let eq: int = String_IndexOf(p, "=")
+            if (eq < 0) {
+                out.Set(HttpRequest.UrlDecode(p), "")
+            } else {
+                let k: string = String_Substring(p, 0, eq)
+                let v: string = String_Substring(p, eq + 1, String_Length(p) - eq - 1)
+                out.Set(HttpRequest.UrlDecode(k), HttpRequest.UrlDecode(v))
+            }
+        }
+        return out
+    }
+
+    // Minimal urldecode: %HH escapes + '+' → space. Invalid sequences
+    // pass through unchanged. Uses String_CharAt1 (returns single-char
+    // string) — the AM convention. Hex digits are compared as strings
+    // since we don't have a string→int codepoint helper at AM level.
+    public static string UrlDecode(string s) {
+        var out: string = ""
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let c: string = String_CharAt1(s, i)
+            if (c == "%" && i + 2 < n) {
+                let h1: int = HttpRequest.HexDigit(String_CharAt1(s, i + 1))
+                let h2: int = HttpRequest.HexDigit(String_CharAt1(s, i + 2))
+                if (h1 >= 0 && h2 >= 0) {
+                    out = out + String_FromByte(h1 * 16 + h2)
+                    i = i + 3
+                    continue
+                }
+            }
+            if (c == "+") {
+                out = out + " "
+            } else {
+                out = out + c
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // Decode a single hex digit char ("0"-"9","a"-"f","A"-"F") → 0-15,
+    // -1 if not a hex digit.
+    private static int HexDigit(string c) {
+        if (c == "0") { return 0 }
+        if (c == "1") { return 1 }
+        if (c == "2") { return 2 }
+        if (c == "3") { return 3 }
+        if (c == "4") { return 4 }
+        if (c == "5") { return 5 }
+        if (c == "6") { return 6 }
+        if (c == "7") { return 7 }
+        if (c == "8") { return 8 }
+        if (c == "9") { return 9 }
+        if (c == "a" || c == "A") { return 10 }
+        if (c == "b" || c == "B") { return 11 }
+        if (c == "c" || c == "C") { return 12 }
+        if (c == "d" || c == "D") { return 13 }
+        if (c == "e" || c == "E") { return 14 }
+        if (c == "f" || c == "F") { return 15 }
+        return -1
+    }
+}
+

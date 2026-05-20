@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.4.5"
+version           = "0.4.6"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.34"
@@ -60,6 +60,20 @@ classes   = [
 header    = "runtime/Amalgame_Net_Http.h"
 namespace = "Amalgame.Net.Http"
 facade    = "facade.am"
+# Multi-file split (v0.4.6). facade.am holds the namespace anchor +
+# package-level docs; each public class lives in its own source.
+# Order matters for cross-file references: cookie before
+# http_response (which calls SetCookie); http_request + http_response
+# before http_parser (which produces them); both before http_server
+# (which uses them); http_client builds on HttpRequest/HttpResponse.
+sources   = [
+    "cookie.am",
+    "http_request.am",
+    "http_response.am",
+    "http_parser.am",
+    "http_server.am",
+    "http_client.am",
+]
 
 libs = ["nghttp2", "ssl", "crypto"]
 

@@ -1,0 +1,62 @@
+// amalgame-net-http — HttpServer (low-level helpers).
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// HttpServer — low-level helpers wrapping the parser + response
+// rendering for use inside a user-written accept loop.
+//
+// v0.1 intentionally does NOT expose a high-level `Serve(handler)`
+// API: AM lambdas are not first-class types yet (no `Function`
+// type that can be stored or passed as a method parameter), and
+// stdlib types like `AmalgameTcpServer*` can't be used as class
+// field types. Both will become workable in v0.1.x.
+//
+// User pattern v0.1:
+//
+//   import Amalgame.Net.Http
+//   import Amalgame.Net
+//
+//   let srv = TcpServer_Listen(3000, 128)
+//   while (TcpServer_IsListening(srv)) {
+//       let conn = TcpServer_Accept(srv)
+//       let raw  = TcpConn_Receive(conn, 65536)
+//       let req  = HttpParser.ParseFull(raw)
+//       if (req != null) {
+//           let resp = HttpResponse.New().Text("Hello " + req.Path)
+//           TcpConn_Send(conn, resp.Render())
+//       }
+//       TcpConn_Close(conn)
+//   }
+//   TcpServer_Close(srv)
+//
+// Everything from this section is also available statically (no
+// HttpServer instance needed). Convenience wrappers below.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpServer {
+    // Format a 400 Bad Request body (for malformed requests).
+    public static string BadRequestResponse() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return "HTTP/1.1 400 Bad Request" + crlf + "Content-Length: 0" + crlf + "Connection: close" + crlf + crlf
+    }
+
+    // Format a 500 Internal Server Error body.
+    public static string InternalErrorResponse() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return "HTTP/1.1 500 Internal Server Error" + crlf + "Content-Length: 0" + crlf + "Connection: close" + crlf + crlf
+    }
+
+    // Format a 404 Not Found body with a one-line plain-text message.
+    public static string NotFoundResponse() {
+        let crlf: string = String_FromByte(13) + "\n"
+        return "HTTP/1.1 404 Not Found" + crlf + "Content-Type: text/plain" + crlf + "Content-Length: 9" + crlf + "Connection: close" + crlf + crlf + "Not found"
+    }
+}

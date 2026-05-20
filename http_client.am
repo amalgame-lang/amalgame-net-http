@@ -1,0 +1,176 @@
+// amalgame-net-http — HttpRequestBuilder + ParsedUrl + HttpClient.
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// HttpClient — small surface for the common GET/POST cases.
+//
+// For complex requests (custom method, headers, body type) use
+// HttpRequestBuilder via `HttpClient.Request(...)`.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpRequestBuilder {
+    public Method:  string
+    public Url:     string
+    public Headers: Map<string, string>
+    public Body:    string
+
+    public HttpRequestBuilder() {
+        this.Method  = "GET"
+        this.Url     = ""
+        this.Headers = new Map<string, string>()
+        this.Body    = ""
+    }
+
+    public HttpRequestBuilder Header(string name, string value) {
+        this.Headers.Set(name, value)
+        return this
+    }
+    public HttpRequestBuilder BodyText(string s) {
+        this.Body = s
+        return this
+    }
+    public HttpRequestBuilder BodyJson(string jsonText) {
+        this.Body = jsonText
+        this.Headers.Set("Content-Type", "application/json")
+        return this
+    }
+    public HttpRequestBuilder BodyForm(Map<string, string> form) {
+        var s: string = ""
+        let keys: List<string> = form.Keys()
+        let kn: int = keys.Count()
+        for i in 0..kn {
+            if (i > 0) { s = s + "&" }
+            s = s + keys.Get(i) + "=" + form.Get(keys.Get(i))
+        }
+        this.Body = s
+        this.Headers.Set("Content-Type", "application/x-www-form-urlencoded")
+        return this
+    }
+
+    public HttpResponse Send() {
+        return HttpClient.Execute(this)
+    }
+}
+
+// Internal helper — parsed URL components. Defined before HttpClient
+// because amc's cgen requires struct field types to be complete at
+// the point of access (forward-decl is fine for typedefs only).
+public class ParsedUrl {
+    public Scheme: string    // "http" / "https"
+    public Host:   string
+    public Port:   int
+    public Path:   string
+
+    public ParsedUrl() {
+        this.Scheme = ""
+        this.Host   = ""
+        this.Port   = 0
+        this.Path   = "/"
+    }
+}
+
+public class HttpClient {
+    // Quick GET — returns the response (or a stub 0 if connect fails).
+    public static HttpResponse Get(string url) {
+        let b = new HttpRequestBuilder()
+        b.Method = "GET"
+        b.Url    = url
+        return HttpClient.Execute(b)
+    }
+    public static HttpResponse Post(string url, string body, string contentType) {
+        let b = new HttpRequestBuilder()
+        b.Method = "POST"
+        b.Url    = url
+        b.Body   = body
+        b.Headers.Set("Content-Type", contentType)
+        return HttpClient.Execute(b)
+    }
+    public static HttpRequestBuilder Request(string method, string url) {
+        let b = new HttpRequestBuilder()
+        b.Method = method
+        b.Url    = url
+        return b
+    }
+
+    // Internal — parse URL, open socket (TCP or TLS), send request,
+    // read response. Plain HTTP only in v0.1 (HTTPS arrives once
+    // we wire amalgame-tls fully — same socket plumbing).
+    public static HttpResponse Execute(HttpRequestBuilder b) {
+        // Parse URL: <scheme>://<host>[:<port>]/<path>
+        let u: ParsedUrl = HttpClient.ParseUrl(b.Url)
+        if (u == null || String_Length(u.Host) == 0) {
+            return HttpResponse.New().Status(0).Text("invalid url")
+        }
+        let isTls: bool = u.Scheme == "https"
+        let port: int = u.Port
+        if (port == 0) { port = isTls ? 443 : 80 }
+
+        // Build request bytes.
+        let crlf: string = String_FromByte(13) + "\n"
+        let cl: int = String_Length(b.Body)
+        var s: string = b.Method + " " + u.Path + " HTTP/1.1" + crlf
+        s = s + "Host: " + u.Host + crlf
+        s = s + "Content-Length: " + String_FromInt(cl) + crlf
+        s = s + "Connection: close" + crlf
+        let hk: List<string> = b.Headers.Keys()
+        let hn: int = hk.Count()
+        for i in 0..hn {
+            let k: string = hk.Get(i)
+            s = s + k + ": " + b.Headers.Get(k) + crlf
+        }
+        s = s + crlf + b.Body
+
+        // Plain TCP path — HTTPS path lands in v0.1.x.
+        let conn = TcpClient_Connect(u.Host, port)
+        if (!TcpClient_IsConnected(conn)) {
+            return HttpResponse.New().Status(0).Text("connect failed")
+        }
+        TcpClient_Send(conn, s)
+        let raw: string = TcpClient_Receive(conn, 1048576)   // 1 MB cap
+        TcpClient_Close(conn)
+        if (raw == null) {
+            return HttpResponse.New().Status(0).Text("read failed")
+        }
+        let resp: HttpResponse = HttpParser.ParseResponse(raw)
+        if (resp == null) {
+            return HttpResponse.New().Status(0).Text("invalid response")
+        }
+        return resp
+    }
+
+    private static ParsedUrl ParseUrl(string url) {
+        let p = new ParsedUrl()
+        let schemeSep: int = String_IndexOf(url, "://")
+        if (schemeSep < 0) { return null }
+        p.Scheme = String_Substring(url, 0, schemeSep)
+        let rest: string = String_Substring(url, schemeSep + 3, String_Length(url) - schemeSep - 3)
+        let slashIdx: int = String_IndexOf(rest, "/")
+        var hostPort: string = rest
+        if (slashIdx < 0) {
+            p.Path = "/"
+        } else {
+            hostPort = String_Substring(rest, 0, slashIdx)
+            p.Path   = String_Substring(rest, slashIdx, String_Length(rest) - slashIdx)
+        }
+        let colonIdx: int = String_IndexOf(hostPort, ":")
+        if (colonIdx < 0) {
+            p.Host = hostPort
+            p.Port = 0
+        } else {
+            p.Host = String_Substring(hostPort, 0, colonIdx)
+            p.Port = String_ToInt(
+                String_Substring(hostPort, colonIdx + 1,
+                                  String_Length(hostPort) - colonIdx - 1))
+        }
+        return p
+    }
+}
+

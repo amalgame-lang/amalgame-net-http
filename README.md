@@ -98,6 +98,10 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
 - ✅ Cookie parsing + serialization
 - ✅ Server: listen, accept, single-request-per-connection
 - ✅ Client: GET, POST, fluent builder
+- ✅ **CRLF injection guard** (v0.4.2): `HttpResponse.Header(name, value)`
+  silently drops any value containing `\r` or `\n` (HTTP-response-
+  splitting prevention). Power users can bypass with
+  `HeaderUnsafe(name, value)` for trusted internal values.
 
 ## What's NOT in v0.1 (deferred to v0.1.x)
 

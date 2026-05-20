@@ -515,6 +515,118 @@ static inline void Amalgame_Net_Http_H2Server_Close(AmalgameH2Server* s) {
     s->fd = -1; s->listening = 0;
 }
 
+/* ── HttpServerConfig — server-side tunables (v0.4.3+) ────────────
+ * Snapshot of the per-server config, applied at accept time.
+ *
+ * Wired today:
+ *   header_timeout_sec, body_timeout_sec — SO_RCVTIMEO / SO_SNDTIMEO
+ *     on every accepted fd. Slowloris guard. v0.4.3 wired Http1; v0.4.4
+ *     extends to Http2 / Https / Ws / Wss via the *.ServeWith variants.
+ *
+ * Field present, pending v0.4.5 wiring:
+ *   max_body_bytes, max_header_bytes, max_url_bytes — currently the
+ *     parser uses compile-time constants (AMALGAME_H1_MAX_BODY etc.).
+ *     The struct fields are accepted so the [limits] TOML schema is
+ *     stable; switching the parser to read these is a follow-up patch.
+ *   idle_timeout_sec — needs HTTP keep-alive support (today we
+ *     close after one request).
+ *   listen_backlog — needs to be threaded through *Server_Listen
+ *     (today hardcoded 64). Trivial follow-up.
+ *
+ * Zero on any field = "library default" (current hardcoded value).
+ * The struct is opaque to callers; use the New + With* helpers.
+ *
+ * Declared early in the file so every Serve variant can reference
+ * it (the actual parser-side wiring still lives in the H1 block
+ * below).
+ */
+typedef struct AmalgameNetHttpServerConfig {
+    int listen_backlog;
+    int header_timeout_sec;
+    int body_timeout_sec;
+    int idle_timeout_sec;
+    i64 max_body_bytes;
+    i64 max_header_bytes;
+    i64 max_url_bytes;
+} AmalgameNetHttpServerConfig;
+
+/* Allocate a zeroed config (so every field defaults to "library
+ * default" via 0). Caller fills in non-zero values via the With*
+ * helpers. */
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_Default(void) {
+    AmalgameNetHttpServerConfig* c =
+        (AmalgameNetHttpServerConfig*)GC_MALLOC(sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    return c;
+}
+
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithHeaderTimeoutSec(
+        AmalgameNetHttpServerConfig* c, i64 s) {
+    if (c) c->header_timeout_sec = (int)s;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithBodyTimeoutSec(
+        AmalgameNetHttpServerConfig* c, i64 s) {
+    if (c) c->body_timeout_sec = (int)s;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithIdleTimeoutSec(
+        AmalgameNetHttpServerConfig* c, i64 s) {
+    if (c) c->idle_timeout_sec = (int)s;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxBodyBytes(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->max_body_bytes = b;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxHeaderBytes(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->max_header_bytes = b;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxUrlBytes(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->max_url_bytes = b;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithListenBacklog(
+        AmalgameNetHttpServerConfig* c, i64 b) {
+    if (c) c->listen_backlog = (int)b;
+    return c;
+}
+
+/* Per-field getters — needed so AM-side FromMap can compose a config
+ * by chained With* calls returning the (single) shared instance.
+ * Reading non-zero fields lets callers introspect before they call
+ * ServeWith. */
+static inline i64 Amalgame_Net_Http_HttpServerConfig_HeaderTimeoutSec(AmalgameNetHttpServerConfig* c) { return c ? c->header_timeout_sec : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_BodyTimeoutSec(AmalgameNetHttpServerConfig* c)   { return c ? c->body_timeout_sec   : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_IdleTimeoutSec(AmalgameNetHttpServerConfig* c)   { return c ? c->idle_timeout_sec   : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxBodyBytes(AmalgameNetHttpServerConfig* c)     { return c ? c->max_body_bytes     : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxHeaderBytes(AmalgameNetHttpServerConfig* c)   { return c ? c->max_header_bytes   : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxUrlBytes(AmalgameNetHttpServerConfig* c)      { return c ? c->max_url_bytes      : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_ListenBacklog(AmalgameNetHttpServerConfig* c)    { return c ? c->listen_backlog     : 0; }
+
+/* Apply the wired-today knobs (SO_RCVTIMEO / SO_SNDTIMEO) to a
+ * connected fd. Quiet no-op when `config` is NULL or both timeout
+ * fields are 0 (= no timeout, current default behavior). Uses the
+ * larger of header/body timeouts as a single deadline — v0.4.5 will
+ * switch to a poll-based loop with phase-specific deadlines. */
+static inline void Amalgame_Net_Http_HttpServerConfig_ApplyToFd(
+        int fd, AmalgameNetHttpServerConfig* config) {
+    if (!config || fd < 0) return;
+    int t = config->body_timeout_sec;
+    if (config->header_timeout_sec > t) t = config->header_timeout_sec;
+    if (t > 0) {
+        struct timeval tv;
+        tv.tv_sec  = t;
+        tv.tv_usec = 0;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+}
+
 /* ── High-level entry point: Http2.Serve(port, handler) ──────────
  * Listens on `port`, accepts connections, drives the H2 protocol,
  * and invokes `handler(conn)` once per request. The handler is
@@ -540,6 +652,45 @@ static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
     while (srv->listening) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
         if (!conn) continue;
+        for (;;) {
+            i64 sid = Amalgame_Net_Http_H2Conn_NextRequest(conn);
+            if (sid <= 0) break;
+            AmalgameClosure_call1(handler, (void*)conn);
+        }
+        Amalgame_Net_Http_H2Conn_Close(conn);
+    }
+    Amalgame_Net_Http_H2Server_Close(srv);
+    return 0;
+}
+
+/* ── Http2.ServeWith(port, config, handler) — Http2.Serve + config ─
+ * Same as Http2.Serve plus HttpServerConfig applied to every
+ * accepted connection (SO_RCVTIMEO / SO_SNDTIMEO from
+ * header_timeout_sec / body_timeout_sec). H2 multiplexes many
+ * streams over one connection, so a single deadline applies to
+ * the whole conn — for finer control wait for v0.4.5's per-frame
+ * deadlines. */
+static inline i64 Amalgame_Net_Http_Http2_ServeWith(
+        i64 port,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http2.ServeWith: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH2Server* srv = Amalgame_Net_Http_H2Server_Listen(port);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http2.ServeWith: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Http2.ServeWith: listening on :%lld (h2c, config-aware)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening) {
+        AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
+        if (!conn) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
         for (;;) {
             i64 sid = Amalgame_Net_Http_H2Conn_NextRequest(conn);
             if (sid <= 0) break;
@@ -764,6 +915,56 @@ static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
     return 0;
 }
 
+/* ── Https.ServeWith(port, cert, key, config, handler) ─────────────
+ * Https.Serve + HttpServerConfig applied post-accept. Same single-
+ * deadline-per-conn caveat as Http2.ServeWith (H2 stream multiplexing).
+ */
+static inline i64 Amalgame_Net_Http_Https_ServeWith(
+        i64 port,
+        code_string cert_file,
+        code_string key_file,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Https.ServeWith: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Https.ServeWith: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_Listen(
+        port, cert_file, key_file);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Https.ServeWith: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Https.ServeWith: listening on :%lld (HTTPS+ALPN, config-aware)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening) {
+        AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
+        if (!conn) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
+        for (;;) {
+            i64 sid = Amalgame_Net_Http_H2Conn_NextRequest(conn);
+            if (sid <= 0) break;
+            AmalgameClosure_call1(handler, (void*)conn);
+        }
+        Amalgame_Net_Http_H2Conn_Close(conn);
+    }
+    Amalgame_Net_Http_HttpsServer_Close(srv);
+    return 0;
+}
+
 #else  /* !AMALGAME_HAS_OPENSSL — HTTPS stubs */
 
 typedef struct AmalgameHttpsServer AmalgameHttpsServer;
@@ -784,6 +985,13 @@ static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
         "Https.Serve: built without OpenSSL — install libssl-dev "
         "and rebuild this package (rm -rf the cache for net-http "
         "before re-running mosaic build).\n");
+    return -3;
+}
+static inline i64 Amalgame_Net_Http_Https_ServeWith(i64 port,
+        code_string cert, code_string key,
+        AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)cfg; (void)h;
+    fprintf(stderr, "Https.ServeWith: built without OpenSSL.\n");
     return -3;
 }
 
@@ -838,6 +1046,10 @@ static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
                                                  AmalgameClosure* handler) {
     (void)port; (void)handler; return -1;
 }
+static inline i64 Amalgame_Net_Http_Http2_ServeWith(i64 port,
+        AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
+    (void)port; (void)cfg; (void)h; return -1;
+}
 typedef struct AmalgameHttpsServer AmalgameHttpsServer;
 static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
         i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
@@ -851,6 +1063,12 @@ static inline code_bool Amalgame_Net_Http_HttpsServer_IsListening(
 static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
         code_string cert, code_string key, AmalgameClosure* h) {
     (void)port; (void)cert; (void)key; (void)h;
+    return -1;
+}
+static inline i64 Amalgame_Net_Http_Https_ServeWith(i64 port,
+        code_string cert, code_string key,
+        AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)cfg; (void)h;
     return -1;
 }
 
@@ -1195,113 +1413,6 @@ static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
-    }
-}
-
-/* ── HttpServerConfig — server-side tunables (v0.4.3) ─────────────
- * Snapshot of the per-server config, applied at accept time.
- *
- * Wired today (v0.4.3):
- *   header_timeout_sec, body_timeout_sec — SO_RCVTIMEO / SO_SNDTIMEO
- *     on every accepted fd. Slowloris guard.
- *
- * Field present, pending v0.4.4 wiring:
- *   max_body_bytes, max_header_bytes, max_url_bytes — currently the
- *     parser uses compile-time constants (AMALGAME_H1_MAX_BODY etc.).
- *     The struct fields are accepted so the [limits] TOML schema is
- *     stable; switching the parser to read these is a follow-up patch.
- *   idle_timeout_sec — needs HTTP keep-alive support (today we
- *     close after one request).
- *   listen_backlog — needs to be threaded through H1Server_Listen
- *     (today hardcoded 64). Trivial follow-up.
- *
- * Zero on any field = "library default" (current hardcoded value).
- * The struct is opaque to callers; use the New + With* helpers.
- */
-typedef struct AmalgameNetHttpServerConfig {
-    int listen_backlog;
-    int header_timeout_sec;
-    int body_timeout_sec;
-    int idle_timeout_sec;
-    i64 max_body_bytes;
-    i64 max_header_bytes;
-    i64 max_url_bytes;
-} AmalgameNetHttpServerConfig;
-
-/* Allocate a zeroed config (so every field defaults to "library
- * default" via 0). Caller fills in non-zero values via the With*
- * helpers. */
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_Default(void) {
-    AmalgameNetHttpServerConfig* c =
-        (AmalgameNetHttpServerConfig*)GC_MALLOC(sizeof(*c));
-    memset(c, 0, sizeof(*c));
-    return c;
-}
-
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithHeaderTimeoutSec(
-        AmalgameNetHttpServerConfig* c, i64 s) {
-    if (c) c->header_timeout_sec = (int)s;
-    return c;
-}
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithBodyTimeoutSec(
-        AmalgameNetHttpServerConfig* c, i64 s) {
-    if (c) c->body_timeout_sec = (int)s;
-    return c;
-}
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithIdleTimeoutSec(
-        AmalgameNetHttpServerConfig* c, i64 s) {
-    if (c) c->idle_timeout_sec = (int)s;
-    return c;
-}
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxBodyBytes(
-        AmalgameNetHttpServerConfig* c, i64 b) {
-    if (c) c->max_body_bytes = b;
-    return c;
-}
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxHeaderBytes(
-        AmalgameNetHttpServerConfig* c, i64 b) {
-    if (c) c->max_header_bytes = b;
-    return c;
-}
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithMaxUrlBytes(
-        AmalgameNetHttpServerConfig* c, i64 b) {
-    if (c) c->max_url_bytes = b;
-    return c;
-}
-static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithListenBacklog(
-        AmalgameNetHttpServerConfig* c, i64 b) {
-    if (c) c->listen_backlog = (int)b;
-    return c;
-}
-
-/* Per-field getters — needed so AM-side FromMap can compose a config
- * by chained With* calls returning the (single) shared instance.
- * Reading non-zero fields lets callers introspect before they call
- * ServeWith. */
-static inline i64 Amalgame_Net_Http_HttpServerConfig_HeaderTimeoutSec(AmalgameNetHttpServerConfig* c) { return c ? c->header_timeout_sec : 0; }
-static inline i64 Amalgame_Net_Http_HttpServerConfig_BodyTimeoutSec(AmalgameNetHttpServerConfig* c)   { return c ? c->body_timeout_sec   : 0; }
-static inline i64 Amalgame_Net_Http_HttpServerConfig_IdleTimeoutSec(AmalgameNetHttpServerConfig* c)   { return c ? c->idle_timeout_sec   : 0; }
-static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxBodyBytes(AmalgameNetHttpServerConfig* c)     { return c ? c->max_body_bytes     : 0; }
-static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxHeaderBytes(AmalgameNetHttpServerConfig* c)   { return c ? c->max_header_bytes   : 0; }
-static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxUrlBytes(AmalgameNetHttpServerConfig* c)      { return c ? c->max_url_bytes      : 0; }
-static inline i64 Amalgame_Net_Http_HttpServerConfig_ListenBacklog(AmalgameNetHttpServerConfig* c)    { return c ? c->listen_backlog     : 0; }
-
-/* Apply the wired-today knobs (SO_RCVTIMEO / SO_SNDTIMEO) to a
- * connected fd. Quiet no-op when `config` is NULL or both timeout
- * fields are 0 (= no timeout, current default behavior). Uses the
- * larger of header/body timeouts as a single deadline — v0.4.4 will
- * switch to a poll-based loop with phase-specific deadlines. */
-static inline void Amalgame_Net_Http_HttpServerConfig_ApplyToFd(
-        int fd, AmalgameNetHttpServerConfig* config) {
-    if (!config || fd < 0) return;
-    int t = config->body_timeout_sec;
-    if (config->header_timeout_sec > t) t = config->header_timeout_sec;
-    if (t > 0) {
-        struct timeval tv;
-        tv.tv_sec  = t;
-        tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     }
 }
 
@@ -1806,6 +1917,43 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
     return 0;
 }
 
+/* ── Ws.ServeWith(port, config, handler) ──────────────────────────
+ * Ws.Serve + HttpServerConfig applied to the underlying fd right
+ * after the upgrade handshake completes — gates a slow client
+ * from holding the upgrade open forever. NOTE: SO_RCVTIMEO sticks
+ * for the connection lifetime, which is wrong for long-lived
+ * WebSocket frame loops. Handlers that intend long idle waits
+ * should clear/raise the timeout themselves (or use a poll-based
+ * loop). v0.4.5 plans to clear the timeout post-upgrade
+ * automatically. */
+static inline i64 Amalgame_Net_Http_Ws_ServeWith(
+        i64 port,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Ws.ServeWith: handler is NULL\n");
+        return -1;
+    }
+    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Ws.ServeWith: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Ws.ServeWith: listening on :%lld (WebSocket, config-aware)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening) {
+        AmalgameWsConn* conn = Amalgame_Net_Http_WsServer_Accept(srv);
+        if (!conn) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
+        AmalgameClosure_call1(handler, (void*)conn);
+        Amalgame_Net_Http_WsConn_Close(conn);
+    }
+    Amalgame_Net_Http_WsServer_Close(srv);
+    return 0;
+}
+
 /* ────────────────────────────────────────────────────────────────
  * WssServer — wss:// (TLS-wrapped WebSocket), v0.4.1+
  *
@@ -1949,6 +2097,51 @@ static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
     return 0;
 }
 
+/* ── Wss.ServeWith(port, cert, key, config, handler) ──────────────
+ * Wss.Serve + HttpServerConfig. Same caveat as Ws.ServeWith re:
+ * long-lived connection vs. server-side SO_RCVTIMEO. */
+static inline i64 Amalgame_Net_Http_Wss_ServeWith(
+        i64 port,
+        code_string cert_file,
+        code_string key_file,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Wss.ServeWith: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Wss.ServeWith: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_Listen(
+        port, cert_file, key_file);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Wss.ServeWith: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Wss.ServeWith: listening on :%lld (wss://, config-aware)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening) {
+        AmalgameWsConn* conn = Amalgame_Net_Http_WssServer_Accept(srv);
+        if (!conn) continue;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
+        AmalgameClosure_call1(handler, (void*)conn);
+        Amalgame_Net_Http_WsConn_Close(conn);
+    }
+    Amalgame_Net_Http_WssServer_Close(srv);
+    return 0;
+}
+
 #else  /* !AMALGAME_HAS_OPENSSL — WebSocket needs SHA1+base64 */
 
 typedef struct AmalgameWsServer AmalgameWsServer;
@@ -1978,6 +2171,12 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
     fprintf(stderr, "Ws.Serve: built without OpenSSL — SHA1+base64 needed for the upgrade handshake.\n");
     return -3;
 }
+static inline i64 Amalgame_Net_Http_Ws_ServeWith(i64 port,
+        AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
+    (void)port; (void)cfg; (void)h;
+    fprintf(stderr, "Ws.ServeWith: built without OpenSSL.\n");
+    return -3;
+}
 typedef struct AmalgameWssServer AmalgameWssServer;
 static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
         i64 p, code_string c, code_string k) { (void)p;(void)c;(void)k; return NULL; }
@@ -1992,6 +2191,13 @@ static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
         code_string cert, code_string key, AmalgameClosure* h) {
     (void)port; (void)cert; (void)key; (void)h;
     fprintf(stderr, "Wss.Serve: built without OpenSSL.\n");
+    return -3;
+}
+static inline i64 Amalgame_Net_Http_Wss_ServeWith(i64 port,
+        code_string cert, code_string key,
+        AmalgameNetHttpServerConfig* cfg, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)cfg; (void)h;
+    fprintf(stderr, "Wss.ServeWith: built without OpenSSL.\n");
     return -3;
 }
 

@@ -106,10 +106,21 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
   HTTP/1.1 server. `Http1.ServeWith(port, config, handler)` applies
   the configured `SO_RCVTIMEO` / `SO_SNDTIMEO` to every accepted
   connection (Slowloris guard). Builder + getter pattern (C-struct
-  backed, like `TlsConfig`). The size-limit fields
-  (`MaxBodyBytes` / `MaxHeaderBytes` / `MaxUrlBytes`) +
-  `Http2`/`Https`/`Ws`/`Wss` ServeWith variants are accepted in
-  the contract but wired through in v0.4.4.
+  backed, like `TlsConfig`).
+- ✅ **All four ServeWith variants** (v0.4.4):
+  `Http2.ServeWith(port, config, handler)`,
+  `Https.ServeWith(port, cert, key, config, handler)`,
+  `Ws.ServeWith(port, config, handler)`,
+  `Wss.ServeWith(port, cert, key, config, handler)`. Same socket-
+  timeout wiring per accepted connection. **Caveat for Ws/Wss**:
+  `SO_RCVTIMEO` persists for the connection lifetime — fine for the
+  upgrade handshake, wrong for long-lived frame loops. Handlers
+  that intend long idle waits should clear/raise the timeout
+  themselves (or wait for v0.4.5's post-upgrade clearing).
+- The size-limit fields (`MaxBodyBytes` / `MaxHeaderBytes` /
+  `MaxUrlBytes`) are accepted in HttpServerConfig but the H1 parser
+  still uses compile-time `AMALGAME_H1_MAX_BODY` etc. constants.
+  Wiring through the parser lands in v0.4.5.
 
 ## What's NOT in v0.1 (deferred to v0.1.x)
 

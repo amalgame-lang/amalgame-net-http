@@ -169,6 +169,10 @@ int main(void) {
     if (0) {
         Amalgame_Net_Http_Http1_ServeMt(0, NULL);
         Amalgame_Net_Http_Http1_ServeMtWith(0, NULL, NULL);
+        Amalgame_Net_Http_Http2_ServeMt(0, NULL);
+        Amalgame_Net_Http_Https_ServeMt(0, "", "", NULL);
+        Amalgame_Net_Http_Ws_ServeMt(0, NULL);
+        Amalgame_Net_Http_Wss_ServeMt(0, "", "", NULL);
         amalgame_h1_mt_arg dummy = {0};
         amalgame_h1_mt_with_arg dummy2 = {0};
         (void) dummy; (void) dummy2;

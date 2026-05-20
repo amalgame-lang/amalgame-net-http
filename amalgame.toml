@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.6.1"
+version           = "0.7.0"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.34"
@@ -112,6 +112,11 @@ Http1_ServeMt                = { returns = "i64" }
 # ServeMt's accept fan-out with ServeWith's per-connection request
 # loop + HttpServerConfig (timeouts + size limits + idle_timeout).
 Http1_ServeMtWith            = { returns = "i64" }
+# v0.7.0: multi-thread variants for the other 3 servers.
+Http2_ServeMt                = { returns = "i64" }
+Https_ServeMt                = { returns = "i64" }
+Ws_ServeMt                   = { returns = "i64" }
+Wss_ServeMt                  = { returns = "i64" }
 Http2_ServeWith              = { returns = "i64" }
 Https_ServeWith              = { returns = "i64" }
 Ws_ServeWith                 = { returns = "i64" }

@@ -79,7 +79,7 @@ build_test() {
     local out="$2"
     "$AMC" -o "$out" "$src" $NETHTTP_EXTERNAL_FLAGS 2>&1 | tail -2
     gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$out.c" "$BUILD_DIR/facade.o" \
-        -lgc -lm -lcurl -lz -o "$out" 2>&1 | head -5
+        -lgc -lm -lcurl -lz -lpthread -o "$out" 2>&1 | head -5
     [ -x "$out" ]
 }
 
@@ -152,6 +152,43 @@ sleep 0.3
 "$BUILD_DIR/client_test"
 wait $SERVER_PID 2>/dev/null || true
 SERVER_PID=""
+
+# ── Http1.ServeMt smoke (v0.6.0) ─────────────────────────────────
+# AM-level test would need `amc package add` (chicken-and-egg —
+# same as the h2c smoke below). A direct C smoke verifies the new
+# symbol resolves + the pthread / GC_pthread_create link path
+# compiles cleanly. We don't actually call ServeMt (blocks forever).
+echo -e "\n── Http1.ServeMt smoke (link path) ──"
+cat > "$BUILD_DIR/mt_smoke.c" <<'EOF'
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+int main(void) {
+    GC_INIT();
+    /* Reference ServeMt + the helper struct so the linker pulls
+     * them in. Never executed at runtime. */
+    if (0) {
+        Amalgame_Net_Http_Http1_ServeMt(0, NULL);
+        amalgame_h1_mt_arg dummy = {0};
+        (void) dummy;
+    }
+    printf("mt_smoke_linked: 1\n");
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$BUILD_DIR/mt_smoke.c" \
+    -lgc -lpthread -o "$BUILD_DIR/mt_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/mt_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (Http1.ServeMt smoke build)"
+    exit 1
+fi
+MT_OUT=$("$BUILD_DIR/mt_smoke")
+echo "$MT_OUT"
+if echo "$MT_OUT" | grep -q "mt_smoke_linked: 1"; then
+    echo -e "${GREEN}PASS${NC} (Http1.ServeMt + pthread link path)"
+else
+    echo -e "${RED}FAIL${NC} (Http1.ServeMt smoke output unexpected)"
+    exit 1
+fi
 
 # ── h2c smoke (HTTP/2 cleartext via nghttp2, v0.2+) ──────────────
 # Mirrors amalgame-tls's smoke pattern: the AM-level e2e would need

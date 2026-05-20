@@ -1,0 +1,160 @@
+// amalgame-net-http — HttpResponse (response builder + render).
+//
+// Lives in its own file since v0.4.6 split (was in facade.am
+// v0.4.5 and earlier). No behavior change vs the previous combined
+// file — just locality.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// ─────────────────────────────────────────────────────────────────
+// HttpResponse — one outgoing HTTP response, built via fluent API.
+// Wire serialization is internal (in `Render()`); user code never
+// touches the bytes.
+// ─────────────────────────────────────────────────────────────────
+
+public class HttpResponse {
+    public StatusCode:  int                       // default 200
+    public Headers:     Map<string, string>
+    public BodyText:    string
+
+    public HttpResponse() {
+        this.StatusCode = 200
+        this.Headers    = new Map<string, string>()
+        this.BodyText   = ""
+    }
+
+    public static HttpResponse New() { return new HttpResponse() }
+
+    public HttpResponse Status(int code) {
+        this.StatusCode = code
+        return this
+    }
+
+    // Set a response header. The value is checked for CR/LF (`\r` or
+    // `\n`) — if present, the header is silently dropped and a warning
+    // is logged to stderr-equivalent. This blocks HTTP-response-
+    // splitting attacks where a user-controlled value contains a
+    // newline and turns into "Header1: x\r\nInjected: y" on the wire.
+    //
+    // For the (rare) legitimate case of needing to pass a value
+    // verbatim — e.g. test fixtures that exercise raw bytes — use
+    // HeaderUnsafe(name, value), which bypasses the guard.
+    //
+    // The guard is always on; there is no opt-out config because no
+    // legitimate header value contains CR/LF and the cost of leaving
+    // the door open is HTTP-response-splitting (CVE-class).
+    public HttpResponse Header(string name, string value) {
+        if (HttpResponse.HeaderValueHasControl(value)) {
+            Console.WriteLine("warning: HttpResponse.Header dropped \"" + name + "\" — CR/LF in value (use HeaderUnsafe to bypass)")
+            return this
+        }
+        this.Headers.Set(name, value)
+        return this
+    }
+
+    // Set a header without the CR/LF guard. Caller takes full
+    // responsibility for value sanity. Used by internal code that
+    // builds values from trusted sources (e.g. Cookie.ToHeader)
+    // and by tests that exercise edge cases.
+    public HttpResponse HeaderUnsafe(string name, string value) {
+        this.Headers.Set(name, value)
+        return this
+    }
+
+    // True if `s` contains a CR or LF byte. Bytes-as-string traversal
+    // — String_CharAt1 yields a 1-char string. CR isn't an escape in
+    // AM string literals, so build it from byte 13 explicitly.
+    private static bool HeaderValueHasControl(string s) {
+        let cr: string = String_FromByte(13)
+        let lf: string = String_FromByte(10)
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let c: string = String_CharAt1(s, i)
+            if (c == cr) { return true }
+            if (c == lf) { return true }
+            i = i + 1
+        }
+        return false
+    }
+
+    public HttpResponse Text(string s) {
+        this.BodyText = s
+        if (!this.Headers.Has("Content-Type")) {
+            this.Headers.Set("Content-Type", "text/plain; charset=utf-8")
+        }
+        return this
+    }
+
+    public HttpResponse Html(string s) {
+        this.BodyText = s
+        this.Headers.Set("Content-Type", "text/html; charset=utf-8")
+        return this
+    }
+
+    public HttpResponse Json(string jsonText) {
+        this.BodyText = jsonText
+        this.Headers.Set("Content-Type", "application/json")
+        return this
+    }
+
+    public HttpResponse Redirect(string url, bool permanent) {
+        if (permanent) {
+            this.StatusCode = 308
+        } else {
+            this.StatusCode = 302
+        }
+        this.Headers.Set("Location", url)
+        return this
+    }
+
+    public HttpResponse SetCookie(Cookie c) {
+        this.Headers.Set("Set-Cookie", c.ToHeader())
+        return this
+    }
+
+    // Serialize to wire bytes — used by HttpServer.
+    public string Render() {
+        let crlf: string = String_FromByte(13) + "\n"
+        let phrase: string = HttpResponse.ReasonPhrase(this.StatusCode)
+        var s: string = "HTTP/1.1 " + String_FromInt(this.StatusCode) + " " + phrase + crlf
+        // Content-Length is mandatory in HTTP/1.1 unless chunked.
+        this.Headers.Set("Content-Length", String_FromInt(String_Length(this.BodyText)))
+        let keys: List<string> = this.Headers.Keys()
+        let kn: int = keys.Count()
+        for i in 0..kn {
+            let k: string = keys.Get(i)
+            s = s + k + ": " + this.Headers.Get(k) + crlf
+        }
+        s = s + crlf + this.BodyText
+        return s
+    }
+
+    // Standard reason phrases for common codes. Unknown → "Status".
+    private static string ReasonPhrase(int code) {
+        if (code == 200) { return "OK" }
+        if (code == 201) { return "Created" }
+        if (code == 204) { return "No Content" }
+        if (code == 301) { return "Moved Permanently" }
+        if (code == 302) { return "Found" }
+        if (code == 304) { return "Not Modified" }
+        if (code == 308) { return "Permanent Redirect" }
+        if (code == 400) { return "Bad Request" }
+        if (code == 401) { return "Unauthorized" }
+        if (code == 403) { return "Forbidden" }
+        if (code == 404) { return "Not Found" }
+        if (code == 405) { return "Method Not Allowed" }
+        if (code == 409) { return "Conflict" }
+        if (code == 413) { return "Payload Too Large" }
+        if (code == 415) { return "Unsupported Media Type" }
+        if (code == 429) { return "Too Many Requests" }
+        if (code == 500) { return "Internal Server Error" }
+        if (code == 502) { return "Bad Gateway" }
+        if (code == 503) { return "Service Unavailable" }
+        return "Status"
+    }
+}
+

@@ -227,9 +227,52 @@ public class HttpResponse {
         return this
     }
 
+    // Set a response header. The value is checked for CR/LF (`\r` or
+    // `\n`) — if present, the header is silently dropped and a warning
+    // is logged to stderr-equivalent. This blocks HTTP-response-
+    // splitting attacks where a user-controlled value contains a
+    // newline and turns into "Header1: x\r\nInjected: y" on the wire.
+    //
+    // For the (rare) legitimate case of needing to pass a value
+    // verbatim — e.g. test fixtures that exercise raw bytes — use
+    // HeaderUnsafe(name, value), which bypasses the guard.
+    //
+    // The guard is always on; there is no opt-out config because no
+    // legitimate header value contains CR/LF and the cost of leaving
+    // the door open is HTTP-response-splitting (CVE-class).
     public HttpResponse Header(string name, string value) {
+        if (HttpResponse.HeaderValueHasControl(value)) {
+            Console.WriteLine("warning: HttpResponse.Header dropped \"" + name + "\" — CR/LF in value (use HeaderUnsafe to bypass)")
+            return this
+        }
         this.Headers.Set(name, value)
         return this
+    }
+
+    // Set a header without the CR/LF guard. Caller takes full
+    // responsibility for value sanity. Used by internal code that
+    // builds values from trusted sources (e.g. Cookie.ToHeader)
+    // and by tests that exercise edge cases.
+    public HttpResponse HeaderUnsafe(string name, string value) {
+        this.Headers.Set(name, value)
+        return this
+    }
+
+    // True if `s` contains a CR or LF byte. Bytes-as-string traversal
+    // — String_CharAt1 yields a 1-char string. CR isn't an escape in
+    // AM string literals, so build it from byte 13 explicitly.
+    private static bool HeaderValueHasControl(string s) {
+        let cr: string = String_FromByte(13)
+        let lf: string = String_FromByte(10)
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let c: string = String_CharAt1(s, i)
+            if (c == cr) { return true }
+            if (c == lf) { return true }
+            i = i + 1
+        }
+        return false
     }
 
     public HttpResponse Text(string s) {

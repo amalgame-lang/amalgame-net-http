@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.5.0"
+version           = "0.6.0"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.34"
@@ -102,6 +102,11 @@ Http1_Serve                  = { returns = "i64" }
 # Companion variants added in v0.4.4 for Http2/Https/Ws/Wss. Size-
 # limit wiring through the H1 parser still pending v0.4.5.
 Http1_ServeWith              = { returns = "i64" }
+# Http1.ServeMt(port, handler) — multi-threaded variant (v0.6.0).
+# Thread-per-accept; the accept loop never blocks on a slow handler.
+# Handler must be thread-safe (use amalgame-threading's Mutex around
+# any mutable shared state).
+Http1_ServeMt                = { returns = "i64" }
 Http2_ServeWith              = { returns = "i64" }
 Https_ServeWith              = { returns = "i64" }
 Ws_ServeWith                 = { returns = "i64" }

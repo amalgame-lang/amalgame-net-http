@@ -49,6 +49,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+#include <signal.h>     /* v0.8.0: graceful SIGTERM/SIGINT shutdown */
+#include <fcntl.h>
 /* v0.6.0: pthread for Http1.ServeMt — one worker thread per accepted
  * connection. GC_pthread_create wraps pthread_create with the bdwgc
  * thread-registration dance so locals on the worker stack stay
@@ -94,6 +96,141 @@ extern int GC_pthread_create(pthread_t* new_thread,
 #    include "/opt/homebrew/opt/openssl@3/include/openssl/err.h"
 #  endif
 #endif
+
+/* ────────────────────────────────────────────────────────────────
+ * Graceful shutdown (v0.8.0).
+ *
+ * Pre-v0.8.0 every Serve* path looped on accept() forever — the
+ * only way out was SIGKILL, which dropped in-flight HTTP requests
+ * and (worse) every connected WebSocket.  The Mosaic v0.5+ worker
+ * supervisor needs SIGTERM to mean "stop accepting new conns but
+ * keep serving the in-flight ones until they close or a grace
+ * timeout fires", so the supervisor can fade an old worker out
+ * after spawning a fresh one.
+ *
+ * Mechanism:
+ *   - A global `volatile sig_atomic_t` flag flipped by the SIGTERM /
+ *     SIGINT signal handler.
+ *   - A small static registry (`amalgame_listen_fds`) of every
+ *     listening fd currently held by Serve*.  The signal handler
+ *     shutdown(2)'s each one — accept() then returns -1 with
+ *     EINVAL and the loop bails out.
+ *   - Each Serve* checks the flag before each iteration so a
+ *     SIGTERM arriving between accept()s exits the loop without
+ *     waiting for one more connection.
+ *
+ * The handler stays installed for the lifetime of the process —
+ * idempotent install (`InstallShutdownSignals`) lets multiple
+ * Serve* calls share the same flag without re-installing.
+ *
+ * SO_REUSEPORT (linked feature): every listener now sets
+ * SO_REUSEPORT alongside SO_REUSEADDR so the supervisor can
+ * spawn a fresh worker on the same port BEFORE the old one
+ * stops accepting.  Both workers' listeners are valid for an
+ * overlap window; the kernel load-balances incoming SYNs across
+ * them.  On platforms without SO_REUSEPORT (rare these days —
+ * Linux ≥ 3.9, all BSDs, macOS 10.7+) the setsockopt is a
+ * silent no-op via the #ifdef.
+ * ──────────────────────────────────────────────────────────────── */
+
+static volatile sig_atomic_t amalgame_net_http_stopping = 0;
+
+#define AMALGAME_NH_MAX_LISTEN_FDS 8
+static int amalgame_net_http_listen_fds[AMALGAME_NH_MAX_LISTEN_FDS];
+static int amalgame_net_http_listen_fd_count = 0;
+
+static void amalgame_net_http_sig_handler(int sig) {
+    (void) sig;
+    amalgame_net_http_stopping = 1;
+    /* Unblock every blocking accept() by shutting down the listen
+     * sockets.  shutdown(SHUT_RD) is the canonical way — close()
+     * inside a signal handler is technically allowed but races with
+     * the accept loop's bookkeeping.  shutdown is signal-safe and
+     * causes accept() to return -1 with EINVAL or EBADF. */
+    for (int i = 0; i < amalgame_net_http_listen_fd_count; i++) {
+        int fd = amalgame_net_http_listen_fds[i];
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+        }
+    }
+}
+
+static void amalgame_net_http_register_listen_fd(int fd) {
+    if (fd < 0) return;
+    if (amalgame_net_http_listen_fd_count >= AMALGAME_NH_MAX_LISTEN_FDS) {
+        /* Quietly drop excess registrations — eight concurrent
+         * listeners is more than any realistic app needs. */
+        return;
+    }
+    amalgame_net_http_listen_fds[amalgame_net_http_listen_fd_count++] = fd;
+}
+
+static void amalgame_net_http_unregister_listen_fd(int fd) {
+    if (fd < 0) return;
+    for (int i = 0; i < amalgame_net_http_listen_fd_count; i++) {
+        if (amalgame_net_http_listen_fds[i] == fd) {
+            amalgame_net_http_listen_fds[i] =
+                amalgame_net_http_listen_fds[--amalgame_net_http_listen_fd_count];
+            return;
+        }
+    }
+}
+
+/* Install the SIGTERM + SIGINT handler.  Idempotent — calling
+ * this from every Serve* entry point is cheap and means the
+ * application doesn't have to remember to opt in. */
+static inline void Amalgame_Net_Http_InstallShutdownSignals(void) {
+    static int installed = 0;
+    if (installed) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = amalgame_net_http_sig_handler;
+    sa.sa_flags   = SA_RESTART;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+    /* SIGPIPE: writes to a half-closed socket would otherwise kill
+     * the worker mid-handler.  We want EPIPE from write() instead. */
+    signal(SIGPIPE, SIG_IGN);
+    installed = 1;
+}
+
+/* Returns true (1) once a SIGTERM/SIGINT has been observed.  Serve*
+ * loops poll this before each accept() iteration. */
+static inline code_bool Amalgame_Net_Http_IsStopping(void) {
+    return amalgame_net_http_stopping ? 1 : 0;
+}
+
+/* Programmatic shutdown — flips the same flag as the signal
+ * handler.  Useful for tests + apps that drive their own lifecycle. */
+static inline void Amalgame_Net_Http_RequestShutdown(void) {
+    amalgame_net_http_sig_handler(0);
+}
+
+/* AM-facing aliases under Http1.{InstallShutdownSignals, IsStopping,
+ * RequestShutdown}.  All Serve* paths share the same signal handler +
+ * stopping flag, so the choice of Http1 as the namespace is arbitrary
+ * — it's just the most idiomatic place for `mosaic dev`-style apps. */
+static inline void Amalgame_Net_Http_Http1_InstallShutdownSignals(void) {
+    Amalgame_Net_Http_InstallShutdownSignals();
+}
+static inline code_bool Amalgame_Net_Http_Http1_IsStopping(void) {
+    return Amalgame_Net_Http_IsStopping();
+}
+static inline void Amalgame_Net_Http_Http1_RequestShutdown(void) {
+    Amalgame_Net_Http_RequestShutdown();
+}
+
+/* SO_REUSEPORT helper — silent no-op on platforms that don't
+ * have it (which is essentially nothing built in the last
+ * decade).  Called next to every SO_REUSEADDR. */
+static inline void amalgame_net_http_set_reuseport(int fd) {
+#ifdef SO_REUSEPORT
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#else
+    (void) fd;
+#endif
+}
 
 /* ────────────────────────────────────────────────────────────────
  * AmalgameH2Conn — one h2c connection.
@@ -494,6 +631,7 @@ static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 port, i64 
     if (fd < 0) return s;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -507,6 +645,8 @@ static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 port, i64 
     }
     s->fd = fd;
     s->listening = 1;
+    Amalgame_Net_Http_InstallShutdownSignals();
+    amalgame_net_http_register_listen_fd(s->fd);
     return s;
 }
 
@@ -528,6 +668,7 @@ static inline AmalgameH2Conn* Amalgame_Net_Http_H2Server_Accept(
 
 static inline void Amalgame_Net_Http_H2Server_Close(AmalgameH2Server* s) {
     if (!s) return;
+    amalgame_net_http_unregister_listen_fd(s->fd);
     if (s->fd >= 0) close(s->fd);
     s->fd = -1; s->listening = 0;
 }
@@ -701,7 +842,7 @@ static inline i64 Amalgame_Net_Http_Http2_Serve(i64 port,
     }
     fprintf(stdout, "Http2.Serve: listening on :%lld (h2c)\n", (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
         if (!conn) continue;
         for (;;) {
@@ -754,7 +895,7 @@ static inline i64 Amalgame_Net_Http_Http2_ServeMt(i64 port,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
         if (!conn) continue;
         amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) GC_MALLOC(sizeof(*a));
@@ -796,7 +937,7 @@ static inline i64 Amalgame_Net_Http_Http2_ServeWith(
     fprintf(stdout, "Http2.ServeWith: listening on :%lld (h2c, config-aware)\n",
             (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
         if (!conn) continue;
         Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
@@ -891,6 +1032,7 @@ static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_ListenEx(
     if (fd < 0) return s;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -942,6 +1084,8 @@ static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_ListenEx(
 
     s->ssl_ctx = ctx;
     s->listening = 1;
+    Amalgame_Net_Http_InstallShutdownSignals();
+    amalgame_net_http_register_listen_fd(s->fd);
     return s;
 }
 
@@ -998,6 +1142,7 @@ static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
 
 static inline void Amalgame_Net_Http_HttpsServer_Close(AmalgameHttpsServer* s) {
     if (!s) return;
+    amalgame_net_http_unregister_listen_fd(s->fd);
     if (s->fd >= 0) close(s->fd);
     if (s->ssl_ctx) SSL_CTX_free(s->ssl_ctx);
     s->fd = -1; s->ssl_ctx = NULL; s->listening = 0;
@@ -1042,7 +1187,7 @@ static inline i64 Amalgame_Net_Http_Https_Serve(i64 port,
             (long long)port);
     fflush(stdout);
 
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
         if (!conn) continue;
         for (;;) {
@@ -1090,7 +1235,7 @@ static inline i64 Amalgame_Net_Http_Https_ServeMt(i64 port,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
         if (!conn) continue;
         amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) GC_MALLOC(sizeof(*a));
@@ -1144,7 +1289,7 @@ static inline i64 Amalgame_Net_Http_Https_ServeWith(
     fprintf(stdout, "Https.ServeWith: listening on :%lld (HTTPS+ALPN, config-aware)\n",
             (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
         if (!conn) continue;
         Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, config);
@@ -1512,6 +1657,7 @@ static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port, i64 
     if (fd < 0) return s;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1525,6 +1671,8 @@ static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port, i64 
     }
     s->fd = fd;
     s->listening = 1;
+    Amalgame_Net_Http_InstallShutdownSignals();
+    amalgame_net_http_register_listen_fd(s->fd);
     return s;
 }
 
@@ -1555,6 +1703,7 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_H1Server_Accept(
 
 static inline void Amalgame_Net_Http_H1Server_Close(AmalgameH1Server* s) {
     if (!s) return;
+    amalgame_net_http_unregister_listen_fd(s->fd);
     if (s->fd >= 0) close(s->fd);
     s->fd = -1; s->listening = 0;
 }
@@ -1753,19 +1902,31 @@ static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
                 (long long)port, strerror(errno));
         return -2;
     }
+    /* v0.8.0: H1Server_Listen already installed SIGTERM/SIGINT
+     * handlers + registered srv->fd with the listen-fd registry.
+     * The accept loop below polls amalgame_net_http_stopping so
+     * SIGTERM unblocks accept() via shutdown(2). */
     fprintf(stdout, "Http1.Serve: listening on :%lld (HTTP/1.1)\n",
             (long long)port);
     fflush(stdout);
 
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
-        if (!conn) continue;
+        if (!conn) {
+            if (amalgame_net_http_stopping) break;
+            continue;
+        }
         if (amalgame_h1_parse_request(conn) > 0) {
             AmalgameClosure_call1(handler, (void*)conn);
         }
         Amalgame_Net_Http_H1Conn_Close(conn);
     }
+    amalgame_net_http_unregister_listen_fd(srv->fd);
     Amalgame_Net_Http_H1Server_Close(srv);
+    if (amalgame_net_http_stopping) {
+        fprintf(stdout, "Http1.Serve: graceful shutdown — stopped accepting\n");
+        fflush(stdout);
+    }
     return 0;
 }
 
@@ -1840,7 +2001,7 @@ static inline i64 Amalgame_Net_Http_Http1_ServeMt(i64 port,
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
         amalgame_h1_mt_arg* a =
@@ -1938,7 +2099,7 @@ static inline i64 Amalgame_Net_Http_Http1_ServeMtWith(i64 port,
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
         amalgame_h1_mt_with_arg* a =
@@ -1987,7 +2148,7 @@ static inline i64 Amalgame_Net_Http_Http1_ServeWith(
             (long long)port, t);
     fflush(stdout);
 
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
         /* Stash the config on the conn so the parser can honor
@@ -2094,6 +2255,7 @@ static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 port, i64 
     if (fd < 0) return s;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -2105,6 +2267,8 @@ static inline AmalgameWsServer* Amalgame_Net_Http_WsServer_Listen(i64 port, i64 
         return s;
     }
     s->fd = fd; s->listening = 1;
+    Amalgame_Net_Http_InstallShutdownSignals();
+    amalgame_net_http_register_listen_fd(s->fd);
     return s;
 }
 
@@ -2115,6 +2279,7 @@ static inline code_bool Amalgame_Net_Http_WsServer_IsListening(
 
 static inline void Amalgame_Net_Http_WsServer_Close(AmalgameWsServer* s) {
     if (!s) return;
+    amalgame_net_http_unregister_listen_fd(s->fd);
     if (s->fd >= 0) close(s->fd);
     s->fd = -1; s->listening = 0;
 }
@@ -2444,7 +2609,7 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
     fprintf(stdout, "Ws.Serve: listening on :%lld (WebSocket)\n",
             (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameWsConn* conn = Amalgame_Net_Http_WsServer_Accept(srv);
         if (!conn) continue;
         AmalgameClosure_call1(handler, (void*)conn);
@@ -2491,7 +2656,7 @@ static inline i64 Amalgame_Net_Http_Ws_ServeMt(i64 port,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameWsConn* conn = Amalgame_Net_Http_WsServer_Accept(srv);
         if (!conn) continue;
         amalgame_ws_mt_arg* a = (amalgame_ws_mt_arg*) GC_MALLOC(sizeof(*a));
@@ -2541,7 +2706,7 @@ static inline i64 Amalgame_Net_Http_Ws_ServeWith(
     fprintf(stdout, "Ws.ServeWith: listening on :%lld (WebSocket, timeout-protected upgrade)\n",
             (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         /* Manual accept-then-upgrade so we can bracket the upgrade
          * with timeout-apply / timeout-clear. */
         struct sockaddr_in addr; socklen_t alen = sizeof(addr);
@@ -2600,6 +2765,7 @@ static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_ListenEx(
     if (fd < 0) return s;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -2634,6 +2800,8 @@ static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_ListenEx(
     }
     s->ssl_ctx = ctx;
     s->listening = 1;
+    Amalgame_Net_Http_InstallShutdownSignals();
+    amalgame_net_http_register_listen_fd(s->fd);
     return s;
 }
 
@@ -2672,6 +2840,7 @@ static inline AmalgameWsConn* Amalgame_Net_Http_WssServer_Accept(
 
 static inline void Amalgame_Net_Http_WssServer_Close(AmalgameWssServer* s) {
     if (!s) return;
+    amalgame_net_http_unregister_listen_fd(s->fd);
     if (s->fd >= 0) close(s->fd);
     if (s->ssl_ctx) SSL_CTX_free(s->ssl_ctx);
     s->fd = -1; s->ssl_ctx = NULL; s->listening = 0;
@@ -2706,7 +2875,7 @@ static inline i64 Amalgame_Net_Http_Wss_Serve(i64 port,
     fprintf(stdout, "Wss.Serve: listening on :%lld (wss://)\n",
             (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameWsConn* conn = Amalgame_Net_Http_WssServer_Accept(srv);
         if (!conn) continue;
         AmalgameClosure_call1(handler, (void*)conn);
@@ -2748,7 +2917,7 @@ static inline i64 Amalgame_Net_Http_Wss_ServeMt(i64 port,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameWsConn* conn = Amalgame_Net_Http_WssServer_Accept(srv);
         if (!conn) continue;
         amalgame_ws_mt_arg* a = (amalgame_ws_mt_arg*) GC_MALLOC(sizeof(*a));
@@ -2802,7 +2971,7 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(
     fprintf(stdout, "Wss.ServeWith: listening on :%lld (wss://, timeout-protected upgrade)\n",
             (long long)port);
     fflush(stdout);
-    while (srv->listening) {
+    while (srv->listening && !amalgame_net_http_stopping) {
         /* Manual accept → SSL_accept → upgrade → clear-timeout
          * sequence so the timeout brackets the slow phases (raw
          * accept, TLS handshake, HTTP upgrade) but doesn't bleed

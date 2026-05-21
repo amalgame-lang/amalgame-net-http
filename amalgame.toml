@@ -24,10 +24,10 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.7.1"
+version           = "0.8.0"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
-required-amalgame = ">=0.8.34"
+required-amalgame = ">=0.8.39"
 schema-version    = 1
 
 [stdlib]
@@ -144,6 +144,16 @@ HttpServerConfig_TlsMinVersion          = { returns = "i64" }
 HttpServerConfig_TlsAlpn                = { returns = "code_string" }
 HttpServerConfig_ApplyToFd              = { returns = "void" }
 HttpServerConfig_ClearTimeoutsOnFd      = { returns = "void" }
+
+# ── Graceful shutdown (v0.8.0) ──────────────────────────────────
+# Idempotent SIGTERM/SIGINT handler + a process-wide stopping flag
+# that every Serve* loop polls. Apps don't need to call these
+# explicitly — Serve* installs the handlers automatically — but
+# `Http1.IsStopping` + `Http1.RequestShutdown` are exposed for
+# tests + custom supervisors.
+Http1_InstallShutdownSignals = { returns = "void" }
+Http1_IsStopping             = { returns = "code_bool" }
+Http1_RequestShutdown        = { returns = "void" }
 
 # ── H2Server — h2c listening socket (v0.2) ───────────────────────
 H2Server_Listen              = { returns = "AmalgameH2Server*" }

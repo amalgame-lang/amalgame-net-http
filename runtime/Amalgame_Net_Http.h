@@ -565,6 +565,10 @@ typedef struct AmalgameNetHttpServerConfig {
     i64 max_body_bytes;
     i64 max_header_bytes;
     i64 max_url_bytes;
+    /* v0.7.1 — TLS knobs honored by Https.*, Wss.*, Http2.Serve (HTTPS path).
+     * Zero/empty = library default (TLS 1.2+, ALPN "h2"). */
+    int tls_min_version;   /* 12 = TLS 1.2 (default), 13 = TLS 1.3 */
+    code_string tls_alpn;  /* comma-separated, e.g. "h2,http/1.1". NULL = "h2" only. */
 } AmalgameNetHttpServerConfig;
 
 /* Allocate a zeroed config (so every field defaults to "library
@@ -612,6 +616,22 @@ static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_Wi
     if (c) c->listen_backlog = (int)b;
     return c;
 }
+/* v0.7.1 — TLS knobs. Honored by HttpsServer_Listen (Https.Serve*,
+ * Wss.Serve*, Http2.Serve when HTTPS-mode).
+ * min_version: 12 = TLS 1.2 (default), 13 = TLS 1.3. Any other value
+ * resets to the library default.
+ * alpn: comma-separated wire-format string ("h2,http/1.1"). NULL/""
+ * reverts to "h2" only (legacy default). */
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithTlsMinVersion(
+        AmalgameNetHttpServerConfig* c, i64 v) {
+    if (c) c->tls_min_version = (int)v;
+    return c;
+}
+static inline AmalgameNetHttpServerConfig* Amalgame_Net_Http_HttpServerConfig_WithTlsAlpn(
+        AmalgameNetHttpServerConfig* c, code_string a) {
+    if (c) c->tls_alpn = a;
+    return c;
+}
 
 /* Per-field getters — needed so AM-side FromMap can compose a config
  * by chained With* calls returning the (single) shared instance.
@@ -624,6 +644,8 @@ static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxBodyBytes(AmalgameNetHtt
 static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxHeaderBytes(AmalgameNetHttpServerConfig* c)   { return c ? c->max_header_bytes   : 0; }
 static inline i64 Amalgame_Net_Http_HttpServerConfig_MaxUrlBytes(AmalgameNetHttpServerConfig* c)      { return c ? c->max_url_bytes      : 0; }
 static inline i64 Amalgame_Net_Http_HttpServerConfig_ListenBacklog(AmalgameNetHttpServerConfig* c)    { return c ? c->listen_backlog     : 0; }
+static inline i64 Amalgame_Net_Http_HttpServerConfig_TlsMinVersion(AmalgameNetHttpServerConfig* c)    { return c ? c->tls_min_version    : 0; }
+static inline code_string Amalgame_Net_Http_HttpServerConfig_TlsAlpn(AmalgameNetHttpServerConfig* c)  { return (c && c->tls_alpn) ? c->tls_alpn : ""; }
 
 /* Apply the wired-today knobs (SO_RCVTIMEO / SO_SNDTIMEO) to a
  * connected fd. Quiet no-op when `config` is NULL or both timeout
@@ -852,8 +874,13 @@ static int amalgame_https_alpn_select_cb(SSL* ssl,
     return SSL_TLSEXT_ERR_ALERT_FATAL;
 }
 
-static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
-        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
+/* v0.7.1 — variant that honors HttpServerConfig.tls_min_version
+ * (and accepts tls_alpn but stores-only — http/1.1 fallback is a
+ * v0.7.2+ change). The legacy 4-arg signature delegates here with
+ * cfg=NULL. */
+static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_ListenEx(
+        i64 port, code_string cert_file, code_string key_file, i64 backlog,
+        AmalgameNetHttpServerConfig* cfg) {
     AmalgameHttpsServer* s =
         (AmalgameHttpsServer*)GC_MALLOC(sizeof(AmalgameHttpsServer));
     memset(s, 0, sizeof(*s));
@@ -878,7 +905,14 @@ static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
     /* SSL_CTX with cert + key. */
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) { close(fd); s->fd = -1; return s; }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    /* TLS min version. cfg = NULL or tls_min_version not in {12,13}
+     * → keep the v0.7.0 default (TLS 1.2+). 12 = TLS 1.2, 13 = TLS 1.3. */
+    int min_ver = TLS1_2_VERSION;
+    if (cfg) {
+        if (cfg->tls_min_version == 13) min_ver = TLS1_3_VERSION;
+        else if (cfg->tls_min_version == 12) min_ver = TLS1_2_VERSION;
+    }
+    SSL_CTX_set_min_proto_version(ctx, min_ver);
     if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
@@ -892,11 +926,31 @@ static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
         close(fd); s->fd = -1;
         return s;
     }
+    /* ALPN: today h2 only is implemented end-to-end. The cfg->tls_alpn
+     * field is honored at the parse level (stored in the config and
+     * passed through) but the select callback hardcodes h2 — when
+     * cfg->tls_alpn says something else, log a one-line warning so
+     * users notice the config knob isn't fully wired yet. Removing
+     * the warning is the deliverable for v0.7.2's http/1.1 fallback. */
+    if (cfg && cfg->tls_alpn && cfg->tls_alpn[0]
+        && strcmp(cfg->tls_alpn, "h2") != 0) {
+        fprintf(stderr,
+            "Https.Listen: tls_alpn = %s requested, but only \"h2\" is "
+            "wired end-to-end in v0.7.x; using h2.\n", cfg->tls_alpn);
+    }
     SSL_CTX_set_alpn_select_cb(ctx, amalgame_https_alpn_select_cb, NULL);
 
     s->ssl_ctx = ctx;
     s->listening = 1;
     return s;
+}
+
+/* Legacy 4-arg signature — kept for v0.7.0 callers. Delegates to
+ * the Ex variant with cfg = NULL, so TLS 1.2+ / "h2" defaults stand. */
+static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_Listen(
+        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
+    return Amalgame_Net_Http_HttpsServer_ListenEx(
+        port, cert_file, key_file, backlog, NULL);
 }
 
 static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
@@ -1079,8 +1133,9 @@ static inline i64 Amalgame_Net_Http_Https_ServeWith(
         OpenSSL_add_all_algorithms();
         ssl_initialised = 1;
     }
-    AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_Listen(
-        port, cert_file, key_file, config ? config->listen_backlog : 0);
+    AmalgameHttpsServer* srv = Amalgame_Net_Http_HttpsServer_ListenEx(
+        port, cert_file, key_file,
+        config ? config->listen_backlog : 0, config);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Https.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));
@@ -2531,8 +2586,11 @@ typedef struct AmalgameWssServer {
     SSL_CTX*  ssl_ctx;
 } AmalgameWssServer;
 
-static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
-        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
+/* v0.7.1 — variant that honors HttpServerConfig.tls_min_version.
+ * Legacy 4-arg signature delegates to this with cfg=NULL. */
+static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_ListenEx(
+        i64 port, code_string cert_file, code_string key_file, i64 backlog,
+        AmalgameNetHttpServerConfig* cfg) {
     AmalgameWssServer* s =
         (AmalgameWssServer*)GC_MALLOC(sizeof(AmalgameWssServer));
     memset(s, 0, sizeof(*s));
@@ -2555,7 +2613,12 @@ static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) { close(fd); s->fd = -1; return s; }
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    int min_ver = TLS1_2_VERSION;
+    if (cfg) {
+        if (cfg->tls_min_version == 13) min_ver = TLS1_3_VERSION;
+        else if (cfg->tls_min_version == 12) min_ver = TLS1_2_VERSION;
+    }
+    SSL_CTX_set_min_proto_version(ctx, min_ver);
     if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
@@ -2572,6 +2635,13 @@ static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
     s->ssl_ctx = ctx;
     s->listening = 1;
     return s;
+}
+
+/* Legacy 4-arg signature. */
+static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_Listen(
+        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
+    return Amalgame_Net_Http_WssServer_ListenEx(port, cert_file, key_file,
+                                                 backlog, NULL);
 }
 
 static inline code_bool Amalgame_Net_Http_WssServer_IsListening(
@@ -2721,8 +2791,9 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(
         OpenSSL_add_all_algorithms();
         ssl_initialised = 1;
     }
-    AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_Listen(
-        port, cert_file, key_file, config ? config->listen_backlog : 0);
+    AmalgameWssServer* srv = Amalgame_Net_Http_WssServer_ListenEx(
+        port, cert_file, key_file,
+        config ? config->listen_backlog : 0, config);
     if (!srv || !srv->listening) {
         fprintf(stderr, "Wss.ServeWith: failed to listen on :%lld (%s)\n",
                 (long long)port, strerror(errno));

@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.7.0"
+version           = "0.7.1"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.34"
@@ -131,6 +131,8 @@ HttpServerConfig_WithMaxBodyBytes       = { returns = "AmalgameNetHttpServerConf
 HttpServerConfig_WithMaxHeaderBytes     = { returns = "AmalgameNetHttpServerConfig*" }
 HttpServerConfig_WithMaxUrlBytes        = { returns = "AmalgameNetHttpServerConfig*" }
 HttpServerConfig_WithListenBacklog      = { returns = "AmalgameNetHttpServerConfig*" }
+HttpServerConfig_WithTlsMinVersion      = { returns = "AmalgameNetHttpServerConfig*" }
+HttpServerConfig_WithTlsAlpn            = { returns = "AmalgameNetHttpServerConfig*" }
 HttpServerConfig_HeaderTimeoutSec       = { returns = "i64" }
 HttpServerConfig_BodyTimeoutSec         = { returns = "i64" }
 HttpServerConfig_IdleTimeoutSec         = { returns = "i64" }
@@ -138,6 +140,8 @@ HttpServerConfig_MaxBodyBytes           = { returns = "i64" }
 HttpServerConfig_MaxHeaderBytes         = { returns = "i64" }
 HttpServerConfig_MaxUrlBytes            = { returns = "i64" }
 HttpServerConfig_ListenBacklog          = { returns = "i64" }
+HttpServerConfig_TlsMinVersion          = { returns = "i64" }
+HttpServerConfig_TlsAlpn                = { returns = "code_string" }
 HttpServerConfig_ApplyToFd              = { returns = "void" }
 HttpServerConfig_ClearTimeoutsOnFd      = { returns = "void" }
 

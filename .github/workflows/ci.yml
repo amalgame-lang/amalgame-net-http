@@ -24,6 +24,21 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y libgc-dev libssl-dev libcurl4-openssl-dev libnghttp2-dev
 
+      # v0.9.1: Http1.ServeAsync requires amalgame-async's runtime
+      # header (epoll-driven fiber I/O). The version pin matches
+      # the [dependencies] entry in amalgame.toml.
+      - name: Checkout amalgame-async (peer dep)
+        uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-async
+          ref: v0.2.0
+          path: amalgame-async-sibling
+      - name: Stage amalgame-async at sibling path
+        run: |
+          mkdir -p ../amalgame-async
+          cp -r amalgame-async-sibling/* ../amalgame-async/
+          ls ../amalgame-async/runtime/
+
       - name: Download amc ${{ matrix.amc-tag }}
         run: |
           set -e

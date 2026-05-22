@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.8.0"
+version           = "0.9.0"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
 required-amalgame = ">=0.8.39"
@@ -83,6 +83,9 @@ H1Server_Listen              = { returns = "AmalgameH1Server*" }
 H1Server_IsListening         = { returns = "code_bool" }
 H1Server_Accept              = { returns = "AmalgameH1Conn*" }
 H1Server_Close               = { returns = "void" }
+# v0.9.0 — raw fd accessor for async-aware user code
+# (pair with amalgame-async ≥ v0.2.0: WaitFdReadable + accept4).
+H1Server_RawFd               = { returns = "i64" }
 # ── H1Conn — HTTP/1.1 server connection (v0.2.1) ─────────────────
 H1Conn_Method                = { returns = "code_string" }
 H1Conn_Path                  = { returns = "code_string" }
@@ -92,6 +95,10 @@ H1Conn_Body                  = { returns = "code_string" }
 H1Conn_BodyLen               = { returns = "i64" }
 H1Conn_Respond               = { returns = "void" }
 H1Conn_Close                 = { returns = "void" }
+# v0.9.0 — raw connection fd for async I/O parking.
+# Pair with amalgame-async ≥ v0.2.0: MakeNonBlocking +
+# WaitFdReadable / WaitFdWritable around non-blocking recv / send.
+H1Conn_RawFd                 = { returns = "i64" }
 # v0.5.0: keep-alive helpers. ResetForReuse clears per-request state
 # (keeps fd / config / keep_alive intact) so the parser can reuse the
 # struct for the next request on the same connection.

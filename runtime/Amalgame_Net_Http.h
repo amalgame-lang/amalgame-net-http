@@ -1708,6 +1708,14 @@ static inline void Amalgame_Net_Http_H1Server_Close(AmalgameH1Server* s) {
     s->fd = -1; s->listening = 0;
 }
 
+/* ── Async-friendly accessor (v0.9.0) ───────────────────────────
+ * Returns the underlying listen socket fd. Lets user code drive an
+ * async-aware accept loop with `Amalgame.Async.WaitFdReadable +
+ * accept4(O_NONBLOCK)`. -1 when the server failed to bind. */
+static inline i64 Amalgame_Net_Http_H1Server_RawFd(AmalgameH1Server* s) {
+    return s ? (i64) s->fd : -1;
+}
+
 /* ── H1Conn — request accessors + response writer ────────────────*/
 
 static inline code_string Amalgame_Net_Http_H1Conn_Method(AmalgameH1Conn* c) {
@@ -1818,6 +1826,15 @@ static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
         close(c->fd);
         c->fd = -1;
     }
+}
+
+/* ── Async-friendly accessor (v0.9.0) ───────────────────────────
+ * Returns the underlying connection socket fd. Lets user code
+ * park the fiber via `Amalgame.Async.WaitFdReadable(fd, ms)` /
+ * `WaitFdWritable(...)` between non-blocking `recv` / `send`
+ * iterations. -1 if the connection has been closed. */
+static inline i64 Amalgame_Net_Http_H1Conn_RawFd(AmalgameH1Conn* c) {
+    return c ? (i64) c->fd : -1;
 }
 
 /* ── Keep-alive helpers (v0.5.0) ─────────────────────────────────

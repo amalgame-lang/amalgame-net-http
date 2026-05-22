@@ -51,6 +51,10 @@
 #include <stdio.h>
 #include <signal.h>     /* v0.8.0: graceful SIGTERM/SIGINT shutdown */
 #include <fcntl.h>
+/* v0.9.1: Http1.ServeAsync uses amalgame-async for I/O parking.
+ * Declared as a [dependencies] entry in amalgame.toml so users
+ * of net-http v0.9.1+ automatically pick up async v0.2.0+. */
+#include "Amalgame_Async.h"
 /* v0.6.0: pthread for Http1.ServeMt — one worker thread per accepted
  * connection. GC_pthread_create wraps pthread_create with the bdwgc
  * thread-registration dance so locals on the worker stack stay
@@ -1493,6 +1497,12 @@ typedef struct AmalgameH1Conn {
      * the accept call failed to capture it. Read by middlewares that
      * key off the client IP — primarily RateLimit "ip" strategy. */
     char      remote_addr[64];
+    /* v0.9.1: when set, recv/send loops MSG_DONTWAIT and park the
+     * fiber via Amalgame_Async_WaitFd* on EAGAIN. Set by
+     * Http1.ServeAsync after accept; zero in every other code path
+     * so the synchronous Serve/ServeWith/ServeMt variants stay
+     * blocking exactly like before. */
+    int32_t   async_io;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -1500,6 +1510,54 @@ typedef struct AmalgameH1Server {
     int32_t   listening;
     i64       port;
 } AmalgameH1Server;
+
+/* ── async-aware recv / send helpers (v0.9.1) ───────────────────
+ * Branch on c->async_io: synchronous path uses blocking recv/send
+ * exactly like before; async path uses MSG_DONTWAIT and parks the
+ * fiber via Amalgame_Async_WaitFd* on EAGAIN. EINTR is retried
+ * silently in both modes. Read timeout is 30s; write timeout 10s
+ * — values picked to match typical reverse-proxy defaults. */
+#define AMALGAME_H1_ASYNC_READ_TIMEOUT_MS  30000
+#define AMALGAME_H1_ASYNC_WRITE_TIMEOUT_MS 10000
+
+static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n) {
+    int flags = c->async_io ? MSG_DONTWAIT : 0;
+    while (1) {
+        ssize_t r = recv(c->fd, buf, n, flags);
+        if (r >= 0) return r;
+        if (errno == EINTR) continue;
+        if (c->async_io && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            code_bool ok = Amalgame_Async_WaitFdReadable(
+                (i64) c->fd, AMALGAME_H1_ASYNC_READ_TIMEOUT_MS);
+            if (!ok) { errno = ETIMEDOUT; return -1; }
+            continue;
+        }
+        return -1;
+    }
+}
+
+static int amalgame_h1_send_all(AmalgameH1Conn* c, const void* buf, size_t n) {
+    const char* p = (const char*) buf;
+    size_t left = n;
+    int flags = c->async_io ? MSG_DONTWAIT : 0;
+    while (left > 0) {
+        ssize_t w = send(c->fd, p, left, flags);
+        if (w > 0) {
+            p += w;
+            left -= (size_t) w;
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        if (c->async_io && w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            code_bool ok = Amalgame_Async_WaitFdWritable(
+                (i64) c->fd, AMALGAME_H1_ASYNC_WRITE_TIMEOUT_MS);
+            if (!ok) { errno = ETIMEDOUT; return -1; }
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
 
 /* ── parse one HTTP/1.1 request off the wire ─────────────────────
  * Returns 1 on success, 0 on clean peer close, -1 on parse error.
@@ -1509,11 +1567,9 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     int total = 0;
     char* eoh = NULL;
     while (total < AMALGAME_H1_RECV_BUF) {
-        ssize_t n = recv(c->fd, buf + total, AMALGAME_H1_RECV_BUF - total, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
+        ssize_t n = amalgame_h1_recv_into(c, buf + total,
+                                          AMALGAME_H1_RECV_BUF - total);
+        if (n < 0) return -1;
         if (n == 0) {
             if (total == 0) return 0;
             return -1;  /* connection closed mid-request */
@@ -1630,12 +1686,9 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
             c->body_len = copy;
         }
         while (c->body_len < content_length) {
-            ssize_t n = recv(c->fd, c->body + c->body_len,
-                             content_length - c->body_len, 0);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR) continue;
-                return -1;
-            }
+            ssize_t n = amalgame_h1_recv_into(c, c->body + c->body_len,
+                                              content_length - c->body_len);
+            if (n <= 0) return -1;
             c->body_len += (int32_t)n;
         }
         c->body[c->body_len] = 0;
@@ -1810,11 +1863,12 @@ static inline void Amalgame_Net_Http_H1Conn_Respond(AmalgameH1Conn* c,
         (long long)status, reason, ctype, blen, conn_hdr);
 
     if (header_len > 0) {
-        ssize_t w = send(c->fd, header, (size_t)header_len, 0);
-        (void)w;
-        if (blen > 0) {
-            w = send(c->fd, body, blen, 0);
-            (void)w;
+        /* v0.9.1: send_all loops on partial writes and parks the
+         * fiber via WaitFdWritable on EAGAIN when c->async_io. The
+         * synchronous path collapses to a plain blocking send(). */
+        if (amalgame_h1_send_all(c, header, (size_t)header_len) == 0
+            && blen > 0) {
+            amalgame_h1_send_all(c, body, blen);
         }
     }
     c->response_sent = 1;
@@ -1942,6 +1996,150 @@ static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
     Amalgame_Net_Http_H1Server_Close(srv);
     if (amalgame_net_http_stopping) {
         fprintf(stdout, "Http1.Serve: graceful shutdown — stopped accepting\n");
+        fflush(stdout);
+    }
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  Http1.ServeAsync(port, handler) — fiber-driven HTTP/1.1 server
+ * ══════════════════════════════════════════════════════════════════
+ * v0.9.1. Same handler shape as Http1.Serve but runs every connection
+ * inside an `amalgame-async` fiber. The OS thread is never blocked on
+ * recv / send — when those syscalls return EAGAIN, the fiber parks
+ * on epoll and the scheduler advances another fiber meanwhile. Each
+ * connection costs a 64 KB fiber stack (vs an 8 MB pthread stack in
+ * ServeMt), so several thousand concurrent slow connections fit
+ * comfortably in one process.
+ *
+ * Caller MUST be on Linux (epoll-only in amalgame-async v0.2). On
+ * other platforms the WaitFd* calls fall back to "always 0" and the
+ * loop spins — guard with `#ifdef __linux__` in user code if you
+ * care about portability today (kqueue/IOCP backends planned for
+ * v0.3 of amalgame-async).
+ *
+ * Per-connection lifecycle:
+ *   1. Accept loop fiber WaitFdReadable's on the listen fd
+ *   2. accept4(... SOCK_NONBLOCK) yields a fresh non-blocking conn fd
+ *   3. A new fiber is spawned with the conn — it parses the request
+ *      (parse_request now checks c->async_io and parks on EAGAIN),
+ *      dispatches the user handler, sends the response via
+ *      send_all (also async-aware), and closes the socket.
+ *   4. Scheduler pumps until amalgame_net_http_stopping flips
+ *      (SIGTERM/SIGINT) or the listen socket dies.
+ *
+ * Not yet supported:
+ *   - HTTP/1.1 keep-alive across multiple requests (close per-conn,
+ *     same as Serve/ServeMt today). Wait for v0.9.2.
+ *   - HttpServerConfig knobs (timeouts / size limits). v0.9.2 adds
+ *     ServeAsyncWith.
+ *   - Multi-thread × scheduler (M:N). amalgame-async v0.4 needed.
+ */
+
+typedef struct {
+    AmalgameH1Server* srv;
+    AmalgameClosure*  handler;
+} amalgame_h1_async_ctx;
+
+static void* amalgame_h1_async_conn_fn(void* env, void* arg) {
+    amalgame_h1_async_ctx* ctx = (amalgame_h1_async_ctx*) env;
+    AmalgameH1Conn* conn = (AmalgameH1Conn*) arg;
+    if (amalgame_h1_parse_request(conn) > 0) {
+        AmalgameClosure_call1(ctx->handler, (void*) conn);
+    }
+    Amalgame_Net_Http_H1Conn_Close(conn);
+    return NULL;
+}
+
+static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
+    (void) arg;
+    amalgame_h1_async_ctx* ctx = (amalgame_h1_async_ctx*) env;
+    AmalgameClosure* per_conn = AmalgameClosure_new(
+        (void*) amalgame_h1_async_conn_fn, ctx);
+
+    while (ctx->srv->listening && !amalgame_net_http_stopping) {
+        /* 1s poll so we re-check the stopping flag without needing
+         * a separate wakeup channel. WaitFdReadable returns 0 on
+         * timeout — that's fine, the outer loop re-evaluates. */
+        code_bool ready = Amalgame_Async_WaitFdReadable(
+            (i64) ctx->srv->fd, 1000);
+        if (!ready) continue;
+
+        struct sockaddr_in addr;
+        socklen_t alen = sizeof(addr);
+        /* accept4 needs _GNU_SOURCE; we plain-accept + fcntl-after
+         * so the build doesn't depend on per-file feature macros.
+         * The two syscalls are cheap; the bench cost is in the
+         * handler, not in the accept setup. */
+        int cfd = accept(ctx->srv->fd, (struct sockaddr*)&addr, &alen);
+        if (cfd >= 0) {
+            int fl = fcntl(cfd, F_GETFL, 0);
+            if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+            /* Best-effort O_CLOEXEC — descriptors leaking into
+             * accidental fork+exec is a portability nit, not a
+             * correctness bug. */
+            int fdfl = fcntl(cfd, F_GETFD, 0);
+            if (fdfl >= 0) fcntl(cfd, F_SETFD, fdfl | FD_CLOEXEC);
+        }
+        if (cfd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            if (amalgame_net_http_stopping) break;
+            continue;
+        }
+
+        AmalgameH1Conn* c =
+            (AmalgameH1Conn*) GC_MALLOC(sizeof(AmalgameH1Conn));
+        memset(c, 0, sizeof(*c));
+        c->fd = cfd;
+        c->async_io = 1;
+        snprintf(c->remote_addr, sizeof(c->remote_addr),
+                 "%s:%u", inet_ntoa(addr.sin_addr),
+                 (unsigned) ntohs(addr.sin_port));
+
+        /* FiberSpawn passes arg as i64 — round-trip the conn pointer
+         * through (i64)(intptr_t) to preserve all bits. */
+        Amalgame_Async_FiberSpawn(per_conn, (i64)(intptr_t) c);
+    }
+    return NULL;
+}
+
+static inline i64 Amalgame_Net_Http_Http1_ServeAsync(i64 port,
+                                                     AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Http1.ServeAsync: handler is NULL\n");
+        return -1;
+    }
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http1.ServeAsync: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    if (!Amalgame_Async_MakeNonBlocking((i64) srv->fd)) {
+        fprintf(stderr, "Http1.ServeAsync: MakeNonBlocking on listen fd failed\n");
+        amalgame_net_http_unregister_listen_fd(srv->fd);
+        Amalgame_Net_Http_H1Server_Close(srv);
+        return -3;
+    }
+
+    fprintf(stdout, "Http1.ServeAsync: listening on :%lld (HTTP/1.1, fibers)\n",
+            (long long)port);
+    fflush(stdout);
+
+    amalgame_h1_async_ctx* ctx =
+        (amalgame_h1_async_ctx*) GC_MALLOC(sizeof(amalgame_h1_async_ctx));
+    ctx->srv = srv;
+    ctx->handler = handler;
+
+    AmalgameClosure* accept_loop = AmalgameClosure_new(
+        (void*) amalgame_h1_async_accept_fn, ctx);
+    Amalgame_Async_FiberSpawn(accept_loop, 0);
+    Amalgame_Async_SchedulerRun();
+
+    amalgame_net_http_unregister_listen_fd(srv->fd);
+    Amalgame_Net_Http_H1Server_Close(srv);
+    if (amalgame_net_http_stopping) {
+        fprintf(stdout, "Http1.ServeAsync: graceful shutdown\n");
         fflush(stdout);
     }
     return 0;

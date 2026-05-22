@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.9.0"
+version           = "0.9.1"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://)."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://). Fiber-driven Http1.ServeAsync via amalgame-async."
 required-amalgame = ">=0.8.39"
 schema-version    = 1
 
@@ -114,6 +114,12 @@ Http1_ServeWith              = { returns = "i64" }
 # Handler must be thread-safe (use amalgame-threading's Mutex around
 # any mutable shared state).
 Http1_ServeMt                = { returns = "i64" }
+# Http1.ServeAsync(port, handler) — fiber-driven variant (v0.9.1).
+# Runs every connection in an amalgame-async fiber; recv / send park
+# the fiber on EAGAIN via WaitFdReadable / WaitFdWritable. One OS
+# thread, thousands of concurrent slow connections. Linux only (epoll
+# backend in amalgame-async v0.2; kqueue/IOCP planned).
+Http1_ServeAsync             = { returns = "i64" }
 # Http1.ServeMtWith(port, config, handler) — multi-thread + keep-alive
 # + per-conn config (v0.6.1). Production-grade entry point: combines
 # ServeMt's accept fan-out with ServeWith's per-connection request
@@ -206,3 +212,12 @@ WssServer_IsListening        = { returns = "code_bool" }
 WssServer_Accept             = { returns = "AmalgameWsConn*" }
 WssServer_Close              = { returns = "void" }
 Wss_Serve                    = { returns = "i64" }
+
+# ─── Dependencies ────────────────────────────────────────────────
+# v0.9.1: Http1.ServeAsync uses amalgame-async for fiber I/O parking
+# (epoll on Linux; kqueue/IOCP backends planned). Users who only
+# touch the synchronous Http1.Serve / ServeMt path still pull async
+# in transitively — the static-inline bodies in Amalgame_Async.h
+# don't add link-time overhead for symbols they don't reference.
+[dependencies]
+amalgame-async = ">=0.2.0"

@@ -48,6 +48,24 @@ if [ -z "$RUNTIME_DIR" ]; then
     exit 2
 fi
 
+# v0.9.1: amalgame-async runtime is required because
+# Amalgame_Net_Http.h now #includes "Amalgame_Async.h" for the
+# Http1.ServeAsync path. Look in the sibling repo first (CI +
+# local dev), then in the package cache.
+ASYNC_RUNTIME_DIR=""
+if [ -d "$PKG_DIR/../amalgame-async/runtime" ]; then
+    ASYNC_RUNTIME_DIR="$PKG_DIR/../amalgame-async/runtime"
+elif compgen -G "$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-async/*/runtime" > /dev/null 2>&1; then
+    ASYNC_RUNTIME_DIR="$(ls -d $HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-async/*/runtime | tail -n1)"
+fi
+if [ -z "$ASYNC_RUNTIME_DIR" ]; then
+    echo "error: amalgame-async runtime/ not found."
+    echo "  Expected sibling: $PKG_DIR/../amalgame-async/runtime"
+    echo "  Or installed via: amc package add async@v0.2.0"
+    exit 2
+fi
+echo "Using amalgame-async runtime: $ASYNC_RUNTIME_DIR"
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 NC='\033[0m'
@@ -66,7 +84,7 @@ done
 # ── Build facade.o once ───────────────────────────────────────────
 echo -e "\n── Building facade.o ──"
 "$AMC" --lib -o "$BUILD_DIR/facade" $NETHTTP_SOURCES 2>&1 | tail -2
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -c "$BUILD_DIR/facade.c" -o "$BUILD_DIR/facade.o" 2>&1 | head -5
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -c "$BUILD_DIR/facade.c" -o "$BUILD_DIR/facade.o" 2>&1 | head -5
 if [ ! -s "$BUILD_DIR/facade.o" ]; then
     echo -e "${RED}FAIL${NC} (facade compile)"
     exit 1
@@ -78,7 +96,8 @@ build_test() {
     local src="$1"
     local out="$2"
     "$AMC" -o "$out" "$src" $NETHTTP_EXTERNAL_FLAGS 2>&1 | tail -2
-    gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$out.c" "$BUILD_DIR/facade.o" \
+    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+        "$out.c" "$BUILD_DIR/facade.o" \
         -lgc -lm -lcurl -lz -lpthread -o "$out" 2>&1 | head -5
     [ -x "$out" ]
 }
@@ -125,7 +144,7 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$BUILD_DIR/cfg_smoke.c" \
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" "$BUILD_DIR/cfg_smoke.c" \
     -lgc -o "$BUILD_DIR/cfg_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/cfg_smoke" ]; then
     echo -e "${RED}FAIL${NC} (HttpServerConfig smoke build)"
@@ -181,7 +200,7 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$BUILD_DIR/mt_smoke.c" \
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" "$BUILD_DIR/mt_smoke.c" \
     -lgc -lpthread -o "$BUILD_DIR/mt_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/mt_smoke" ]; then
     echo -e "${RED}FAIL${NC} (Http1.ServeMt smoke build)"
@@ -217,7 +236,7 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" "$BUILD_DIR/h2c_smoke.c" \
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" "$BUILD_DIR/h2c_smoke.c" \
     -lnghttp2 -lgc -o "$BUILD_DIR/h2c_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/h2c_smoke" ]; then
     echo -e "${RED}FAIL${NC} (h2c smoke build)"
@@ -230,6 +249,103 @@ if echo "$SMOKE_OUT" | grep -q "H2_Available: 1" && \
     echo -e "${GREEN}PASS${NC} (nghttp2 detected + linked, H2Server listens)"
 else
     echo -e "${RED}FAIL${NC} (nghttp2 not detected at compile time)"
+    exit 1
+fi
+
+
+# ── Http1.ServeAsync smoke (v0.9.1, Linux epoll) ──────────────────
+# Verifies:
+#   1. Link path — Amalgame_Net_Http.h #includes Amalgame_Async.h,
+#      and the static-inline body of Http1_ServeAsync compiles +
+#      links cleanly (pulls in epoll + ucontext refs from libc).
+#   2. End-to-end — spawns the server in a pthread, fires 3 parallel
+#      curl requests, asserts all 3 get 200 OK, then signals shutdown
+#      via the existing graceful-stop flag. ~1s total.
+echo -e "\n── Http1.ServeAsync e2e (link + fibers + epoll) ──"
+SERVE_ASYNC_PORT=18091
+cat > "$BUILD_DIR/serve_async_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+
+/* Handler closure trampoline — writes a fixed response. */
+static void* handler_fn(void* env, void* arg) {
+    (void) env;
+    AmalgameH1Conn* c = (AmalgameH1Conn*) arg;
+    Amalgame_Net_Http_H1Conn_Respond(
+        c, 200, "text/plain", "ok-from-fiber");
+    return NULL;
+}
+
+static void* server_thread(void* unused) {
+    (void) unused;
+    AmalgameClosure* h =
+        AmalgameClosure_new((void*) handler_fn, NULL);
+    Amalgame_Net_Http_Http1_ServeAsync($SERVE_ASYNC_PORT, h);
+    return NULL;
+}
+
+/* nanosleep loop — robust against EINTR from libgc stop-the-world
+ * signals (PWR/USR1) which would otherwise short-circuit usleep
+ * in the main thread while the server thread allocates fiber
+ * stacks. */
+static void sleep_ms(long ms) {
+    struct timespec rem;
+    rem.tv_sec  = ms / 1000;
+    rem.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&rem, &rem) == -1) {
+        /* loop until time fully consumed */
+    }
+}
+
+int main(void) {
+    GC_INIT();
+    pthread_t t;
+    if (GC_pthread_create(&t, NULL, server_thread, NULL) != 0) {
+        fprintf(stderr, "pthread_create failed\n");
+        return 1;
+    }
+    /* Give the server time to bind + spawn the accept fiber. */
+    sleep_ms(300);
+    printf("server-up: 1\n");
+    fflush(stdout);
+    /* Stay up long enough for the 3 curl probes below. */
+    sleep_ms(1500);
+    Amalgame_Net_Http_Http1_RequestShutdown();
+    GC_pthread_join(t, NULL);
+    printf("server-down: 1\n");
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+    "$BUILD_DIR/serve_async_smoke.c" \
+    -lgc -lpthread -o "$BUILD_DIR/serve_async_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/serve_async_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (ServeAsync smoke build)"
+    exit 1
+fi
+"$BUILD_DIR/serve_async_smoke" &
+SERVER_PID=$!
+sleep 0.4
+
+# Fire 3 concurrent curl requests. The fiber-driven server should
+# accept all 3 and respond on the same OS thread.
+ASYNC_OK=0
+for i in 1 2 3; do
+    body=$(curl -fsS --max-time 2 "http://127.0.0.1:$SERVE_ASYNC_PORT/" 2>/dev/null || true)
+    if [ "$body" = "ok-from-fiber" ]; then
+        ASYNC_OK=$((ASYNC_OK + 1))
+    fi
+done
+
+wait $SERVER_PID 2>/dev/null || true
+SERVER_PID=""
+
+if [ "$ASYNC_OK" -eq 3 ]; then
+    echo -e "${GREEN}PASS${NC} (ServeAsync served $ASYNC_OK requests via fibers)"
+else
+    echo -e "${RED}FAIL${NC} (ServeAsync ok=$ASYNC_OK / 3)"
     exit 1
 fi
 

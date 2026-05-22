@@ -132,7 +132,49 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
   `Http1.Serve` (no config) keeps the legacy one-request-per-conn
   behavior — opt-in via `Http1.ServeWith` + non-zero `idle_timeout_sec`.
 
-## Async I/O — drive H1 with `amalgame-async` fibers (v0.9.0)
+## Fiber-driven HTTP/1.1 server — `Http1.ServeAsync` (v0.9.1)
+
+One OS thread, thousands of concurrent slow connections. Each
+accepted connection runs in an [`amalgame-async`](https://github.com/amalgame-lang/amalgame-async)
+fiber; `recv` / `send` park the fiber on `EAGAIN` via epoll instead
+of blocking the OS thread. The handler signature is identical to
+`Http1.Serve` — drop-in replacement for the I/O-bound case.
+
+```amalgame
+import Amalgame.Net.Http
+
+let handler = (conn: H1Conn) => {
+    if (conn.Path == "/slow") {
+        // Pretend this is a downstream HTTP / DB / file
+        // operation. With ServeAsync this fiber parks and the
+        // scheduler advances another concurrent connection;
+        // with Serve / ServeMt the OS thread blocks.
+        Async.FiberSleep(2000)
+    }
+    conn.Respond(200, "text/plain", "hello")
+    return 0
+}
+Http1.ServeAsync(8080, handler)
+```
+
+| | `Http1.Serve` | `Http1.ServeMt` | `Http1.ServeAsync` |
+|---|---|---|---|
+| Concurrency | serial | 1 thread / conn | 1 thread, N fibers |
+| Memory per conn | n/a | ~8 MB pthread stack | ~64 KB fiber stack |
+| Best for | dev / smoke | CPU-bound handlers | **I/O-bound handlers** |
+| Platform | all | all | **Linux only (epoll)** |
+
+`kqueue` (BSD + macOS) backend is planned for `amalgame-async`
+v0.2.1, then `Http1.ServeAsync` will work cross-platform.
+Windows IOCP after `amalgame-async` v0.3.
+
+**Not yet in v0.9.1:**
+- HTTP/1.1 keep-alive across requests (each connection closes
+  after one request — same as `Serve` / `ServeMt` today) → v0.9.2
+- `HttpServerConfig` knobs (per-conn timeouts, body limits) →
+  `Http1.ServeAsyncWith` in v0.9.2
+
+## Low-level async I/O — drive H1 manually (v0.9.0)
 
 `H1Server_RawFd(srv)` and `H1Conn_RawFd(conn)` expose the
 underlying socket fds so user code can park fibers on them

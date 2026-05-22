@@ -132,6 +132,53 @@ let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
   `Http1.Serve` (no config) keeps the legacy one-request-per-conn
   behavior — opt-in via `Http1.ServeWith` + non-zero `idle_timeout_sec`.
 
+## Async I/O — drive H1 with `amalgame-async` fibers (v0.9.0)
+
+`H1Server_RawFd(srv)` and `H1Conn_RawFd(conn)` expose the
+underlying socket fds so user code can park fibers on them
+with [`amalgame-async`](https://github.com/amalgame-lang/amalgame-async)
+≥ v0.2.0 (Linux epoll backend). This lets a single OS thread
+handle thousands of concurrent connections without
+thread-per-connection overhead — the sweet spot for I/O-bound
+handlers (downstream HTTP, DB queries, file writes).
+
+```amalgame
+import Amalgame.Net.Http
+import Amalgame.Async
+
+let srv = Http1.H1Server_Listen(8080, 0)
+let listenFd: int = Http1.H1Server_RawFd(srv)
+Async.MakeNonBlocking(listenFd)
+
+let acceptLoop = (_x: int) => {
+    while (true) {
+        // park until a connection arrives
+        let ok: bool = Async.WaitFdReadable(listenFd, -1)
+        if (!ok) { break }
+        let conn = Http1.H1Server_Accept(srv)
+        if (conn == null) { continue }
+        let connFd: int = Http1.H1Conn_RawFd(conn)
+        Async.MakeNonBlocking(connFd)
+        // spawn a fiber to handle this connection
+        Async.FiberSpawn((fd: int) => {
+            // ... non-blocking recv + WaitFdReadable loop here,
+            // then parse, dispatch handler, write response
+            return 0
+        }, connFd)
+    }
+    return 0
+}
+Async.FiberSpawn(acceptLoop, 0)
+Async.SchedulerRun()
+```
+
+**A first-class `Http1.ServeAsync(port, handler)`** that does
+this dance internally — accept loop + non-blocking parse +
+async-aware respond, all running inside the scheduler — is
+planned for v0.9.1. v0.9.0 ships the **enablers only** so user
+code can experiment with the API surface before we lock in the
+high-level entry point.
+
 ## What's NOT in v0.1 (deferred to v0.1.x)
 
 - HTTP/2 via nghttp2 (the runtime header stub is in place for the binding)

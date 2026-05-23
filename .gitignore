@@ -4,3 +4,4 @@ examples/*/server.c
 examples/*/server.log
 examples/*/_routes.am
 examples/*/amalgame.lock
+v0.*_*

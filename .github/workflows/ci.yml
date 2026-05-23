@@ -31,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: amalgame-lang/amalgame-async
-          ref: v0.2.0
+          ref: v0.2.2
           path: amalgame-async-sibling
       - name: Stage amalgame-async at sibling path
         run: |

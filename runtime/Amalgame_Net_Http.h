@@ -1503,6 +1503,14 @@ typedef struct AmalgameH1Conn {
      * so the synchronous Serve/ServeWith/ServeMt variants stay
      * blocking exactly like before. */
     int32_t   async_io;
+    /* v0.9.5: live-fiber tracking for graceful shutdown. The accept
+     * loop owns a doubly-linked list of in-flight conns; on SIGTERM
+     * it walks the list and FiberCancel's each fiber so parked
+     * handlers wake promptly instead of blocking on their configured
+     * read/idle timeouts. NULL outside the async path. */
+    AmalgameFiber*           async_fiber;
+    struct AmalgameH1Conn*   async_next;
+    struct AmalgameH1Conn*   async_prev;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -2067,12 +2075,45 @@ typedef struct {
      * conn->config; keep-alive on the async path follows the
      * sync ServeWith convention (idle_timeout_sec > 0 enables). */
     AmalgameNetHttpServerConfig* config;
+    /* v0.9.5: head of a doubly-linked list of in-flight conns. The
+     * accept loop walks this on SIGTERM-driven exit and calls
+     * Amalgame_Async_FiberCancel on each conn's fiber so handlers
+     * parked on recv/send wake immediately rather than waiting out
+     * their (potentially long) read timeout. */
+    AmalgameH1Conn*              live_head;
 } amalgame_h1_async_ctx;
+
+/* v0.9.5: doubly-linked-list helpers for the live-conn registry.
+ * Single-threaded by construction — only ever touched from inside
+ * the accept loop fiber's stack (spawn, accept-loop sweep) and the
+ * per-conn fiber's stack (entry registration, exit splice-out).
+ * Both run on the same OS thread under the cooperative scheduler,
+ * so no locking is needed. */
+static inline void amalgame_h1_async_track(amalgame_h1_async_ctx* ctx,
+                                           AmalgameH1Conn* c) {
+    c->async_next = ctx->live_head;
+    c->async_prev = NULL;
+    if (ctx->live_head) ctx->live_head->async_prev = c;
+    ctx->live_head = c;
+}
+static inline void amalgame_h1_async_untrack(amalgame_h1_async_ctx* ctx,
+                                             AmalgameH1Conn* c) {
+    if (c->async_prev) c->async_prev->async_next = c->async_next;
+    if (c->async_next) c->async_next->async_prev = c->async_prev;
+    if (ctx->live_head == c) ctx->live_head = c->async_next;
+    c->async_next = c->async_prev = NULL;
+}
 
 static void* amalgame_h1_async_conn_fn(void* env, void* arg) {
     amalgame_h1_async_ctx* ctx = (amalgame_h1_async_ctx*) env;
     AmalgameH1Conn* conn = (AmalgameH1Conn*) arg;
     conn->config = ctx->config;
+    /* v0.9.5: register the current fiber + splice the conn into the
+     * live list. _amasync_sched.current is set by amalgame-async to
+     * the per-conn fiber AmalgameFiber* — the accept loop's
+     * shutdown sweep calls FiberCancel on it. */
+    conn->async_fiber = _amasync_sched.current;
+    amalgame_h1_async_track(ctx, conn);
     /* Keep-alive policy:
      *   - ServeAsync (config == NULL): always on (RFC 7230 default).
      *   - ServeAsyncWith: only if idle_timeout_sec > 0, mirroring
@@ -2095,6 +2136,11 @@ static void* amalgame_h1_async_conn_fn(void* env, void* arg) {
          * limits apply to every request on the connection. */
         Amalgame_Net_Http_H1Conn_ResetForReuse(conn);
     }
+    /* v0.9.5: splice this conn out of the live registry BEFORE we
+     * close the socket. After this point the shutdown sweep won't
+     * try to cancel us. */
+    amalgame_h1_async_untrack(ctx, conn);
+    conn->async_fiber = NULL;
     Amalgame_Net_Http_H1Conn_Close(conn);
     return NULL;
 }
@@ -2147,6 +2193,28 @@ static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
         /* FiberSpawn passes arg as i64 — round-trip the conn pointer
          * through (i64)(intptr_t) to preserve all bits. */
         Amalgame_Async_FiberSpawn(per_conn, (i64)(intptr_t) c);
+    }
+
+    /* v0.9.5: graceful shutdown sweep. The accept loop is exiting
+     * (typically because amalgame_net_http_stopping just flipped via
+     * SIGTERM/SIGINT or Http1.RequestShutdown). Walk the live-conn
+     * list and FiberCancel each so handlers parked on recv/send wake
+     * promptly, return their sentinel error, and let SchedulerRun
+     * drain to completion without waiting out the configured
+     * header/body/idle timeouts.
+     *
+     * Per-conn fibers self-untrack on exit, so by the time
+     * SchedulerRun returns, live_head is NULL again. The list mutates
+     * during this walk (cancellation eventually runs the fiber's
+     * cleanup which calls amalgame_h1_async_untrack) but it's safe:
+     * we save `next` before calling FiberCancel, and the cancelled
+     * fiber doesn't actually run until after this accept fiber yields. */
+    for (AmalgameH1Conn* c = ctx->live_head; c; ) {
+        AmalgameH1Conn* next = c->async_next;
+        if (c->async_fiber) {
+            Amalgame_Async_FiberCancel(c->async_fiber);
+        }
+        c = next;
     }
     return NULL;
 }

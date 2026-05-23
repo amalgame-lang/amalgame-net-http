@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.9.4"
+version           = "0.9.5"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://). Fiber-driven Http1.ServeAsync via amalgame-async."
 required-amalgame = ">=0.8.39"
@@ -226,4 +226,4 @@ Wss_Serve                    = { returns = "i64" }
 # in transitively — the static-inline bodies in Amalgame_Async.h
 # don't add link-time overhead for symbols they don't reference.
 [dependencies]
-amalgame-async = ">=0.2.0"
+amalgame-async = ">=0.2.2"

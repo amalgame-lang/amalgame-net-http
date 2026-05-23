@@ -195,6 +195,30 @@ Windows IOCP after `amalgame-async` v0.3.
 - Async H2 / Https / Ws / Wss variants (gated on amalgame-tls
   fiber-aware I/O)
 
+### v0.9.5 — graceful shutdown cancels in-flight fibers
+
+`Http1.ServeAsync` (and `ServeAsyncWith`) now tracks every accepted
+connection's fiber in a doubly-linked list rooted on the accept-loop
+context. When `amalgame_net_http_stopping` flips (SIGTERM / SIGINT
+/ `Http1.RequestShutdown`), the accept loop walks that list and
+calls `Async.FiberCancel` on each fiber so handlers parked on
+`recv` / `send` / `FiberSleep` wake immediately rather than waiting
+out the configured timeouts.
+
+```
+shutdown_to_serve_return=0ms     // v0.9.5
+                       =4800ms   // v0.9.4 (waits for FiberSleep 5000)
+```
+
+A live regression test in `tests/run_tests.sh` (`Http1.ServeAsync
+graceful shutdown`) spawns a server, fires one /slow request whose
+handler calls `Async.FiberSleep(5000)`, then calls
+`Http1.RequestShutdown` 200 ms later. With v0.9.5 + amalgame-async
+v0.2.2 the server returns in **0-1 ms** (5/5 runs). Without
+cancellation, it would block for the full 5 s.
+
+Requires `amalgame-async >= 0.2.2`.
+
 ### v0.9.4 — per-phase async timeouts
 
 `header_timeout_sec` and `body_timeout_sec` are now threaded into

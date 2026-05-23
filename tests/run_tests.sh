@@ -367,4 +367,104 @@ fi
 wait $SERVER_PID 2>/dev/null || true
 SERVER_PID=""
 
+# ── Http1.ServeAsyncWith smoke (v0.9.3) ───────────────────────────
+# Builds the same server pattern as ServeAsync but with a
+# HttpServerConfig that disables keep-alive (idle_timeout_sec=0) and
+# caps the body size. Asserts: link + 3 concurrent requests succeed
+# + a body that exceeds max_body_bytes gets a parse error (curl
+# observes connection close mid-response = empty body). Linux only,
+# same backend constraints as ServeAsync.
+echo -e "\n── Http1.ServeAsyncWith e2e (config + fibers) ──"
+SAW_PORT=18092
+cat > "$BUILD_DIR/serve_async_with_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+
+static void* handler_fn(void* env, void* arg) {
+    (void) env;
+    AmalgameH1Conn* c = (AmalgameH1Conn*) arg;
+    Amalgame_Net_Http_H1Conn_Respond(c, 200, "text/plain", "with-config");
+    return NULL;
+}
+
+static void* server_thread(void* u) {
+    (void) u;
+    AmalgameNetHttpServerConfig* cfg =
+        Amalgame_Net_Http_HttpServerConfig_Default();
+    Amalgame_Net_Http_HttpServerConfig_WithMaxBodyBytes(cfg, 128);
+    Amalgame_Net_Http_HttpServerConfig_WithListenBacklog(cfg, 64);
+    /* idle_timeout_sec stays 0 → keep-alive OFF, matches sync ServeWith */
+    AmalgameClosure* h =
+        AmalgameClosure_new((void*) handler_fn, NULL);
+    Amalgame_Net_Http_Http1_ServeAsyncWith($SAW_PORT, cfg, h);
+    return NULL;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec rem = { ms / 1000, (ms % 1000) * 1000000L };
+    while (nanosleep(&rem, &rem) == -1) { }
+}
+
+int main(void) {
+    GC_INIT();
+    pthread_t t;
+    if (GC_pthread_create(&t, NULL, server_thread, NULL) != 0) {
+        fprintf(stderr, "pthread_create failed\n");
+        return 1;
+    }
+    sleep_ms(300);
+    printf("server-up: 1\n");
+    fflush(stdout);
+    sleep_ms(1500);
+    Amalgame_Net_Http_Http1_RequestShutdown();
+    GC_pthread_join(t, NULL);
+    printf("server-down: 1\n");
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+    "$BUILD_DIR/serve_async_with_smoke.c" \
+    -lgc -lpthread -o "$BUILD_DIR/serve_async_with_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/serve_async_with_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (ServeAsyncWith smoke build)"
+    exit 1
+fi
+"$BUILD_DIR/serve_async_with_smoke" &
+SERVER_PID=$!
+sleep 0.4
+
+# 3 small GETs → all 200 with body "with-config"
+SAW_OK=0
+for i in 1 2 3; do
+    body=$(curl -fsS --max-time 2 "http://127.0.0.1:$SAW_PORT/" 2>/dev/null || true)
+    if [ "$body" = "with-config" ]; then
+        SAW_OK=$((SAW_OK + 1))
+    fi
+done
+if [ "$SAW_OK" -eq 3 ]; then
+    echo -e "${GREEN}PASS${NC} (ServeAsyncWith served $SAW_OK requests via fibers)"
+else
+    echo -e "${RED}FAIL${NC} (ServeAsyncWith ok=$SAW_OK / 3)"
+    kill -TERM $SERVER_PID 2>/dev/null
+    exit 1
+fi
+
+# max_body_bytes=128 → a 512-byte body must be rejected (parse error).
+# curl observes connection-close → -fS exits non-zero → we capture the
+# exit code. Pass = curl FAILED to complete the request.
+BIG=$(head -c 512 /dev/urandom | base64 | head -c 512)
+if curl -fsS --max-time 2 -X POST -d "$BIG" \
+       "http://127.0.0.1:$SAW_PORT/" > /dev/null 2>&1; then
+    echo -e "${RED}FAIL${NC} (ServeAsyncWith: max_body=128 should reject 512-byte body)"
+    kill -TERM $SERVER_PID 2>/dev/null
+    exit 1
+else
+    echo -e "${GREEN}PASS${NC} (ServeAsyncWith max_body=128 rejects 512-byte body)"
+fi
+
+wait $SERVER_PID 2>/dev/null || true
+SERVER_PID=""
+
 echo -e "\n${GREEN}All tests completed${NC}"

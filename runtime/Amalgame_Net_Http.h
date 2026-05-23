@@ -2037,24 +2037,39 @@ static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
  */
 
 typedef struct {
-    AmalgameH1Server* srv;
-    AmalgameClosure*  handler;
+    AmalgameH1Server*            srv;
+    AmalgameClosure*             handler;
+    /* v0.9.3: optional per-conn config — NULL for ServeAsync, set
+     * by ServeAsyncWith. The parser honors max_*_bytes via
+     * conn->config; keep-alive on the async path follows the
+     * sync ServeWith convention (idle_timeout_sec > 0 enables). */
+    AmalgameNetHttpServerConfig* config;
 } amalgame_h1_async_ctx;
 
 static void* amalgame_h1_async_conn_fn(void* env, void* arg) {
     amalgame_h1_async_ctx* ctx = (amalgame_h1_async_ctx*) env;
     AmalgameH1Conn* conn = (AmalgameH1Conn*) arg;
-    /* v0.9.2: keep-alive loop. Parse → handler → if the request
-     * allowed keep-alive AND the response was sent successfully,
-     * reset per-request state and parse the next request on the
-     * same socket. parse_request returns 0 on clean peer-close
-     * (which is how we exit the loop without a parse error). */
+    conn->config = ctx->config;
+    /* Keep-alive policy:
+     *   - ServeAsync (config == NULL): always on (RFC 7230 default).
+     *   - ServeAsyncWith: only if idle_timeout_sec > 0, mirroring
+     *     ServeWith's sync-path semantics so configurations are
+     *     portable between Serve / ServeWith / ServeAsync /
+     *     ServeAsyncWith.
+     * No SO_RCVTIMEO/SO_SNDTIMEO setup — the async helpers
+     * (amalgame_h1_recv_into / send_all) drive their own
+     * WaitFd timeouts. */
+    int keep_alive_enabled =
+        ctx->config ? (ctx->config->idle_timeout_sec > 0) : 1;
     while (1) {
         int p = amalgame_h1_parse_request(conn);
         if (p <= 0) break;
-        conn->keep_alive = amalgame_h1_request_keep_alive(conn);
+        conn->keep_alive =
+            keep_alive_enabled ? amalgame_h1_request_keep_alive(conn) : 0;
         AmalgameClosure_call1(ctx->handler, (void*) conn);
         if (!conn->keep_alive) break;
+        /* ResetForReuse preserves fd + config + keep_alive — size
+         * limits apply to every request on the connection. */
         Amalgame_Net_Http_H1Conn_ResetForReuse(conn);
     }
     Amalgame_Net_Http_H1Conn_Close(conn);
@@ -2113,33 +2128,47 @@ static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
     return NULL;
 }
 
-static inline i64 Amalgame_Net_Http_Http1_ServeAsync(i64 port,
-                                                     AmalgameClosure* handler) {
+/* Internal worker used by both Http1.ServeAsync and
+ * Http1.ServeAsyncWith. `name` only affects log lines. */
+static inline i64 amalgame_h1_serve_async_impl(
+        const char* name,
+        i64 port,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
     if (!handler) {
-        fprintf(stderr, "Http1.ServeAsync: handler is NULL\n");
+        fprintf(stderr, "%s: handler is NULL\n", name);
         return -1;
     }
-    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(port, 0);
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(
+        port, config ? config->listen_backlog : 0);
     if (!srv || !srv->listening) {
-        fprintf(stderr, "Http1.ServeAsync: failed to listen on :%lld (%s)\n",
-                (long long)port, strerror(errno));
+        fprintf(stderr, "%s: failed to listen on :%lld (%s)\n",
+                name, (long long) port, strerror(errno));
         return -2;
     }
     if (!Amalgame_Async_MakeNonBlocking((i64) srv->fd)) {
-        fprintf(stderr, "Http1.ServeAsync: MakeNonBlocking on listen fd failed\n");
+        fprintf(stderr, "%s: MakeNonBlocking on listen fd failed\n", name);
         amalgame_net_http_unregister_listen_fd(srv->fd);
         Amalgame_Net_Http_H1Server_Close(srv);
         return -3;
     }
 
-    fprintf(stdout, "Http1.ServeAsync: listening on :%lld (HTTP/1.1, fibers)\n",
-            (long long)port);
+    if (config) {
+        fprintf(stdout, "%s: listening on :%lld (HTTP/1.1, fibers, max_body=%lld, idle_timeout=%lds)\n",
+                name, (long long) port,
+                (long long) config->max_body_bytes,
+                (long) config->idle_timeout_sec);
+    } else {
+        fprintf(stdout, "%s: listening on :%lld (HTTP/1.1, fibers)\n",
+                name, (long long) port);
+    }
     fflush(stdout);
 
     amalgame_h1_async_ctx* ctx =
         (amalgame_h1_async_ctx*) GC_MALLOC(sizeof(amalgame_h1_async_ctx));
-    ctx->srv = srv;
+    ctx->srv     = srv;
     ctx->handler = handler;
+    ctx->config  = config;
 
     AmalgameClosure* accept_loop = AmalgameClosure_new(
         (void*) amalgame_h1_async_accept_fn, ctx);
@@ -2149,10 +2178,42 @@ static inline i64 Amalgame_Net_Http_Http1_ServeAsync(i64 port,
     amalgame_net_http_unregister_listen_fd(srv->fd);
     Amalgame_Net_Http_H1Server_Close(srv);
     if (amalgame_net_http_stopping) {
-        fprintf(stdout, "Http1.ServeAsync: graceful shutdown\n");
+        fprintf(stdout, "%s: graceful shutdown\n", name);
         fflush(stdout);
     }
     return 0;
+}
+
+static inline i64 Amalgame_Net_Http_Http1_ServeAsync(i64 port,
+                                                     AmalgameClosure* handler) {
+    return amalgame_h1_serve_async_impl("Http1.ServeAsync", port, NULL, handler);
+}
+
+/* Http1.ServeAsyncWith(port, config, handler) — fiber-driven HTTP/1.1
+ * server with per-conn `HttpServerConfig`. Same handler shape as
+ * ServeAsync. The config drives:
+ *   - listen_backlog (default 64 if 0)
+ *   - max_body_bytes / max_header_bytes / max_url_bytes (parser caps;
+ *     0 = library default)
+ *   - idle_timeout_sec — non-zero enables HTTP/1.1 keep-alive
+ *     across requests on the same connection. 0 = close per request
+ *     (matches Serve / ServeMt). The async path manages its own
+ *     EAGAIN-driven WaitFd timeouts so SO_RCVTIMEO is *not* applied
+ *     (that flag would compete with the fiber's WaitFd).
+ *
+ * v0.9.3 caveat: header_timeout_sec / body_timeout_sec are NOT yet
+ * threaded through the async recv helpers — they still use the
+ * compile-time AMALGAME_H1_ASYNC_READ_TIMEOUT_MS default (30s). A
+ * future version will pipe the per-phase timeouts to
+ * amalgame_h1_recv_into so slow-client mitigation matches the sync
+ * path exactly.
+ */
+static inline i64 Amalgame_Net_Http_Http1_ServeAsyncWith(
+        i64 port,
+        AmalgameNetHttpServerConfig* config,
+        AmalgameClosure* handler) {
+    return amalgame_h1_serve_async_impl(
+        "Http1.ServeAsyncWith", port, config, handler);
 }
 
 /* ── Http1.ServeMt(port, handler) — multi-threaded variant ──────

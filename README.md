@@ -191,11 +191,26 @@ Bench script available at `bench/` for reproduction.
 v0.2.1, then `Http1.ServeAsync` will work cross-platform.
 Windows IOCP after `amalgame-async` v0.3.
 
-**Not yet in v0.9.2:**
-- `HttpServerConfig` knobs (per-conn timeouts, body limits) →
-  `Http1.ServeAsyncWith` in v0.9.3
+**Not yet in v0.9.3:**
+- Per-phase `header_timeout_sec` / `body_timeout_sec` wiring into
+  the async recv helpers (today uses a fixed 30 s default). The
+  rest of `HttpServerConfig` is honored — `max_*_bytes`,
+  `listen_backlog`, `idle_timeout_sec`-driven keep-alive.
 - Async H2 / Https / Ws / Wss variants (gated on amalgame-tls
   fiber-aware I/O)
+
+### ServeAsyncWith (v0.9.3) — fiber I/O + HttpServerConfig
+
+```amalgame
+let cfg = HttpServerConfig.Default()
+    .WithMaxBodyBytes(2 * 1024 * 1024)   // 2 MB
+    .WithIdleTimeoutSec(15)              // HTTP/1.1 keep-alive on
+    .WithListenBacklog(256)
+
+Http1.ServeAsyncWith(8080, cfg, handler)
+```
+
+Drop-in replacement for `Http1.ServeAsync` with a per-conn config. Keep-alive policy mirrors the sync `ServeWith`: enabled iff `idle_timeout_sec > 0`, off otherwise (close per-request). The async path manages its own EAGAIN-driven WaitFd timeouts, so `SO_RCVTIMEO` / `SO_SNDTIMEO` are **not** applied — sub-30 s slow-client mitigation lands in v0.9.4 as proper per-phase WaitFd timeouts.
 
 ### Keep-alive (v0.9.2)
 

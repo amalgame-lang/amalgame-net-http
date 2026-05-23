@@ -1515,12 +1515,31 @@ typedef struct AmalgameH1Server {
  * Branch on c->async_io: synchronous path uses blocking recv/send
  * exactly like before; async path uses MSG_DONTWAIT and parks the
  * fiber via Amalgame_Async_WaitFd* on EAGAIN. EINTR is retried
- * silently in both modes. Read timeout is 30s; write timeout 10s
- * — values picked to match typical reverse-proxy defaults. */
+ * silently in both modes. Default timeouts mirror typical
+ * reverse-proxy values (30 s read, 10 s write). v0.9.4 lets the
+ * caller override the per-phase read timeout via
+ * `amalgame_h1_recv_into(..., timeout_ms)`; the parser uses
+ * config->header_timeout_sec for the header loop and
+ * config->body_timeout_sec for the body loop (both in seconds,
+ * 0 = library default). */
 #define AMALGAME_H1_ASYNC_READ_TIMEOUT_MS  30000
 #define AMALGAME_H1_ASYNC_WRITE_TIMEOUT_MS 10000
 
-static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n) {
+/* Pick the per-phase WaitFd timeout. Returns ms. Config in seconds;
+ * 0 = use the library default. */
+static inline i64 amalgame_h1_async_header_timeout_ms(AmalgameH1Conn* c) {
+    if (c->config && c->config->header_timeout_sec > 0)
+        return (i64) c->config->header_timeout_sec * 1000;
+    return AMALGAME_H1_ASYNC_READ_TIMEOUT_MS;
+}
+static inline i64 amalgame_h1_async_body_timeout_ms(AmalgameH1Conn* c) {
+    if (c->config && c->config->body_timeout_sec > 0)
+        return (i64) c->config->body_timeout_sec * 1000;
+    return AMALGAME_H1_ASYNC_READ_TIMEOUT_MS;
+}
+
+static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n,
+                                     i64 timeout_ms) {
     int flags = c->async_io ? MSG_DONTWAIT : 0;
     while (1) {
         ssize_t r = recv(c->fd, buf, n, flags);
@@ -1528,7 +1547,7 @@ static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n) {
         if (errno == EINTR) continue;
         if (c->async_io && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             code_bool ok = Amalgame_Async_WaitFdReadable(
-                (i64) c->fd, AMALGAME_H1_ASYNC_READ_TIMEOUT_MS);
+                (i64) c->fd, timeout_ms);
             if (!ok) { errno = ETIMEDOUT; return -1; }
             continue;
         }
@@ -1566,9 +1585,11 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     char* buf = (char*)GC_MALLOC_ATOMIC(AMALGAME_H1_RECV_BUF + 1);
     int total = 0;
     char* eoh = NULL;
+    i64 hdr_to_ms = amalgame_h1_async_header_timeout_ms(c);
     while (total < AMALGAME_H1_RECV_BUF) {
         ssize_t n = amalgame_h1_recv_into(c, buf + total,
-                                          AMALGAME_H1_RECV_BUF - total);
+                                          AMALGAME_H1_RECV_BUF - total,
+                                          hdr_to_ms);
         if (n < 0) return -1;
         if (n == 0) {
             if (total == 0) return 0;
@@ -1685,9 +1706,11 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
             memcpy(c->body, eoh + 4, copy);
             c->body_len = copy;
         }
+        i64 body_to_ms = amalgame_h1_async_body_timeout_ms(c);
         while (c->body_len < content_length) {
             ssize_t n = amalgame_h1_recv_into(c, c->body + c->body_len,
-                                              content_length - c->body_len);
+                                              content_length - c->body_len,
+                                              body_to_ms);
             if (n <= 0) return -1;
             c->body_len += (int32_t)n;
         }

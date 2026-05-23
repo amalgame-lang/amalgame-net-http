@@ -467,4 +467,99 @@ fi
 wait $SERVER_PID 2>/dev/null || true
 SERVER_PID=""
 
+# ── Http1.ServeAsyncWith header_timeout_sec (v0.9.4) ──────────────
+# Boots a server with header_timeout_sec=1. Opens a raw TCP socket
+# from python, sends a partial request (no CRLF CRLF), keeps it
+# open for 2.5s without sending more. Server must time out and
+# close the conn, NOT hang forever waiting for headers. We assert
+# the client-side recv returns 0 (clean close) within ~1.5s.
+echo -e "\n── Http1.ServeAsyncWith header_timeout_sec (slow-client) ──"
+HTO_PORT=18093
+cat > "$BUILD_DIR/header_timeout_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+
+static void* handler_fn(void* env, void* arg) {
+    (void) env;
+    AmalgameH1Conn* c = (AmalgameH1Conn*) arg;
+    Amalgame_Net_Http_H1Conn_Respond(c, 200, "text/plain", "ok");
+    return NULL;
+}
+
+static void* server_thread(void* u) {
+    (void) u;
+    AmalgameNetHttpServerConfig* cfg =
+        Amalgame_Net_Http_HttpServerConfig_Default();
+    /* 1-second header timeout — slow-client mitigation. */
+    Amalgame_Net_Http_HttpServerConfig_WithHeaderTimeoutSec(cfg, 1);
+    AmalgameClosure* h =
+        AmalgameClosure_new((void*) handler_fn, NULL);
+    Amalgame_Net_Http_Http1_ServeAsyncWith($HTO_PORT, cfg, h);
+    return NULL;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec rem = { ms / 1000, (ms % 1000) * 1000000L };
+    while (nanosleep(&rem, &rem) == -1) { }
+}
+
+int main(void) {
+    GC_INIT();
+    pthread_t t;
+    if (GC_pthread_create(&t, NULL, server_thread, NULL) != 0) return 1;
+    sleep_ms(300);
+    printf("server-up: 1\n"); fflush(stdout);
+    sleep_ms(2500);
+    Amalgame_Net_Http_Http1_RequestShutdown();
+    GC_pthread_join(t, NULL);
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+    "$BUILD_DIR/header_timeout_smoke.c" \
+    -lgc -lpthread -o "$BUILD_DIR/header_timeout_smoke" 2>&1 | head -3
+if [ ! -x "$BUILD_DIR/header_timeout_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (header-timeout smoke build)"
+    exit 1
+fi
+"$BUILD_DIR/header_timeout_smoke" &
+SERVER_PID=$!
+sleep 0.5
+
+# Python: open TCP socket, send 23 bytes (well under header limit),
+# wait. After ~1s the server should close us. Measure elapsed.
+HTO_RESULT=$(python3 - <<'PYEOF'
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3.0)
+t0 = time.time()
+s.connect(("127.0.0.1", 18093))
+s.sendall(b"GET /slow HTTP/1.1\r\nHo")   # missing rest of headers + CRLFCRLF
+try:
+    # blocking recv: server closing the conn returns b"" promptly
+    data = s.recv(64)
+    elapsed = time.time() - t0
+    print(f"closed_after={elapsed*1000:.0f}ms bytes={len(data)}")
+except socket.timeout:
+    print("client_timeout")
+finally:
+    s.close()
+PYEOF
+)
+echo "  $HTO_RESULT"
+
+wait $SERVER_PID 2>/dev/null || true
+SERVER_PID=""
+
+# Server's header_timeout_sec=1 → close within ~1100ms. Allow margin.
+CLOSED_MS=$(echo "$HTO_RESULT" | sed -nE 's/.*closed_after=([0-9]+)ms.*/\1/p')
+if [ -n "$CLOSED_MS" ] && [ "$CLOSED_MS" -ge 900 ] && [ "$CLOSED_MS" -le 1600 ]; then
+    echo -e "${GREEN}PASS${NC} (header_timeout=1s fired in ${CLOSED_MS}ms)"
+else
+    echo -e "${RED}FAIL${NC} (expected close in 900-1600ms, got '$HTO_RESULT')"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

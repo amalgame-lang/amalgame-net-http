@@ -191,13 +191,29 @@ Bench script available at `bench/` for reproduction.
 v0.2.1, then `Http1.ServeAsync` will work cross-platform.
 Windows IOCP after `amalgame-async` v0.3.
 
-**Not yet in v0.9.3:**
-- Per-phase `header_timeout_sec` / `body_timeout_sec` wiring into
-  the async recv helpers (today uses a fixed 30 s default). The
-  rest of `HttpServerConfig` is honored — `max_*_bytes`,
-  `listen_backlog`, `idle_timeout_sec`-driven keep-alive.
+**Not yet in v0.9.4:**
 - Async H2 / Https / Ws / Wss variants (gated on amalgame-tls
   fiber-aware I/O)
+
+### v0.9.4 — per-phase async timeouts
+
+`header_timeout_sec` and `body_timeout_sec` are now threaded into
+the fiber-driven recv loops. Slow-client mitigation works the
+same way as on sync `ServeWith`:
+
+```amalgame
+let cfg = HttpServerConfig.Default()
+    .WithHeaderTimeoutSec(5)   // 5s to finish request line + headers
+    .WithBodyTimeoutSec(30)    // 30s to finish the body once Content-Length is known
+    .WithIdleTimeoutSec(15)    // 15s idle between keep-alive requests
+Http1.ServeAsyncWith(8080, cfg, handler)
+```
+
+When the WaitFd timeout fires, `recv` returns `-1` with
+`errno = ETIMEDOUT`, the parser returns `-1`, and the per-conn
+fiber closes the socket. No SO_RCVTIMEO is applied (that would
+conflict with the fiber's own WaitFd). 0 = library default
+(currently 30 s).
 
 ### ServeAsyncWith (v0.9.3) — fiber I/O + HttpServerConfig
 

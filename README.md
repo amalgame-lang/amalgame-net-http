@@ -164,15 +164,48 @@ Http1.ServeAsync(8080, handler)
 | Best for | dev / smoke | CPU-bound handlers | **I/O-bound handlers** |
 | Platform | all | all | **Linux only (epoll)** |
 
+### Benchmark — 100 ms I/O-bound handler
+
+asyncio HTTP client opening N concurrent connections against a
+server whose handler sleeps 100 ms (simulating downstream DB /
+HTTP / file I/O). Linux x86_64, 2 cores, 4 GB RAM, gcc -O2, default
+listen backlog. RSS sampled every 10 ms during the burst; peak
+captured.
+
+| N    | ServeMt           | ServeAsync       |
+|------|-------------------|------------------|
+| 100  | 1152 ms · 100/100 · 2.5 MB | **123 ms** · 100/100 · 9.8 MB |
+| 500  | 2071 ms · 500/500 · 3.7 MB | **1374 ms** · 500/500 · 37 MB |
+| 1000 | 2932 ms · 1000/1000 · 6.2 MB | **1628 ms** · 1000/1000 · 71 MB |
+| 2000 | 31220 ms · **1665/2000** ⚠ | **1453 ms** · **2000/2000** ✅ |
+
+Takeaways:
+- **Throughput:** ServeAsync is 1.5× to 9× faster across the range, single-threaded.
+- **Reliability under load:** At N=2000 ServeMt drops 16% of requests and the survivors take 31 s; ServeAsync handles 100% in 1.45 s.
+- **Memory shape:** ServeMt's pthread stacks are 8 MB but lazy-mapped — RSS stays small as long as handlers don't touch much stack. ServeAsync's GC-allocated 64 KB stacks are eagerly resident, so RSS scales with concurrency (~70 KB / connection) but is bounded and predictable.
+- **Crossover** where ServeMt collapses: somewhere between 1000 and 2000 concurrent connections on this hardware. Limit is pthread setup + kernel scheduler contention, not memory.
+
+Bench script available at `bench/` for reproduction.
+
 `kqueue` (BSD + macOS) backend is planned for `amalgame-async`
 v0.2.1, then `Http1.ServeAsync` will work cross-platform.
 Windows IOCP after `amalgame-async` v0.3.
 
-**Not yet in v0.9.1:**
-- HTTP/1.1 keep-alive across requests (each connection closes
-  after one request — same as `Serve` / `ServeMt` today) → v0.9.2
+**Not yet in v0.9.2:**
 - `HttpServerConfig` knobs (per-conn timeouts, body limits) →
-  `Http1.ServeAsyncWith` in v0.9.2
+  `Http1.ServeAsyncWith` in v0.9.3
+- Async H2 / Https / Ws / Wss variants (gated on amalgame-tls
+  fiber-aware I/O)
+
+### Keep-alive (v0.9.2)
+
+Each `ServeAsync` fiber now loops: `parse_request → handler →
+ResetForReuse → parse next` while the request's `Connection`
+header allows it (RFC 7230 defaults: HTTP/1.1 keep-alive unless
+`Connection: close`, HTTP/1.0 close unless `Connection: keep-alive`).
+The next parse re-uses the existing fiber + socket, so a 100-request
+benchmark with `--http1.1` keep-alive amortises the TCP setup +
+fiber spawn across all 100 requests.
 
 ## Low-level async I/O — drive H1 manually (v0.9.0)
 

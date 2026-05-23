@@ -2044,8 +2044,18 @@ typedef struct {
 static void* amalgame_h1_async_conn_fn(void* env, void* arg) {
     amalgame_h1_async_ctx* ctx = (amalgame_h1_async_ctx*) env;
     AmalgameH1Conn* conn = (AmalgameH1Conn*) arg;
-    if (amalgame_h1_parse_request(conn) > 0) {
+    /* v0.9.2: keep-alive loop. Parse → handler → if the request
+     * allowed keep-alive AND the response was sent successfully,
+     * reset per-request state and parse the next request on the
+     * same socket. parse_request returns 0 on clean peer-close
+     * (which is how we exit the loop without a parse error). */
+    while (1) {
+        int p = amalgame_h1_parse_request(conn);
+        if (p <= 0) break;
+        conn->keep_alive = amalgame_h1_request_keep_alive(conn);
         AmalgameClosure_call1(ctx->handler, (void*) conn);
+        if (!conn->keep_alive) break;
+        Amalgame_Net_Http_H1Conn_ResetForReuse(conn);
     }
     Amalgame_Net_Http_H1Conn_Close(conn);
     return NULL;

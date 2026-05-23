@@ -310,8 +310,8 @@ int main(void) {
     sleep_ms(300);
     printf("server-up: 1\n");
     fflush(stdout);
-    /* Stay up long enough for the 3 curl probes below. */
-    sleep_ms(1500);
+    /* Stay up long enough for the 3 + 3 curl probes below. */
+    sleep_ms(3500);
     Amalgame_Net_Http_Http1_RequestShutdown();
     GC_pthread_join(t, NULL);
     printf("server-down: 1\n");
@@ -339,14 +339,32 @@ for i in 1 2 3; do
     fi
 done
 
-wait $SERVER_PID 2>/dev/null || true
-SERVER_PID=""
-
 if [ "$ASYNC_OK" -eq 3 ]; then
     echo -e "${GREEN}PASS${NC} (ServeAsync served $ASYNC_OK requests via fibers)"
 else
     echo -e "${RED}FAIL${NC} (ServeAsync ok=$ASYNC_OK / 3)"
+    kill -TERM $SERVER_PID 2>/dev/null
     exit 1
 fi
+
+# v0.9.2: keep-alive smoke — same socket carries 3 sequential
+# requests. curl with no Connection: close + --http1.1 reuses
+# the TCP connection. Server must ResetForReuse + re-parse.
+KEEPALIVE_OUT=$(curl -sS --http1.1 --max-time 3 \
+    "http://127.0.0.1:$SERVE_ASYNC_PORT/k1" \
+    "http://127.0.0.1:$SERVE_ASYNC_PORT/k2" \
+    "http://127.0.0.1:$SERVE_ASYNC_PORT/k3" 2>/dev/null || true)
+# Each response body is "ok-from-fiber" (no newline). Concatenation
+# of 3 responses = "ok-from-fiberok-from-fiberok-from-fiber".
+if echo "$KEEPALIVE_OUT" | grep -qF "ok-from-fiberok-from-fiberok-from-fiber"; then
+    echo -e "${GREEN}PASS${NC} (ServeAsync keep-alive: 3 reqs on one socket)"
+else
+    echo -e "${RED}FAIL${NC} (ServeAsync keep-alive: '$KEEPALIVE_OUT')"
+    kill -TERM $SERVER_PID 2>/dev/null
+    exit 1
+fi
+
+wait $SERVER_PID 2>/dev/null || true
+SERVER_PID=""
 
 echo -e "\n${GREEN}All tests completed${NC}"

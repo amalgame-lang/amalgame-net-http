@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.9.2"
+version           = "0.9.3"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://). Fiber-driven Http1.ServeAsync via amalgame-async."
 required-amalgame = ">=0.8.39"
@@ -120,6 +120,10 @@ Http1_ServeMt                = { returns = "i64" }
 # thread, thousands of concurrent slow connections. Linux only (epoll
 # backend in amalgame-async v0.2; kqueue/IOCP planned).
 Http1_ServeAsync             = { returns = "i64" }
+# Http1.ServeAsyncWith(port, cfg, handler) — fiber-driven variant +
+# per-conn HttpServerConfig (v0.9.3). Wires listen_backlog,
+# max_*_bytes, idle_timeout_sec; header/body timeouts pending v0.9.4.
+Http1_ServeAsyncWith         = { returns = "i64" }
 # Http1.ServeMtWith(port, config, handler) — multi-thread + keep-alive
 # + per-conn config (v0.6.1). Production-grade entry point: combines
 # ServeMt's accept fan-out with ServeWith's per-connection request

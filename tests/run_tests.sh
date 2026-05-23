@@ -562,4 +562,104 @@ else
     exit 1
 fi
 
+# ── Http1.ServeAsync graceful shutdown (v0.9.5) ───────────────────
+# Spawns a server, fires a /slow request that does FiberSleep(5000),
+# then calls Http1.RequestShutdown 200ms in. With v0.9.5 the accept
+# loop walks live_head and FiberCancel's the in-flight handler; the
+# FiberSleep returns early and the handler exits. Total ServeAsync
+# return should be well under the 5s sleep — we assert < 2s.
+echo -e "\n── Http1.ServeAsync graceful shutdown (cancellation) ──"
+GS_PORT=18094
+cat > "$BUILD_DIR/graceful_shutdown_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
+
+static i64 now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (i64) tv.tv_sec * 1000 + (i64) (tv.tv_usec / 1000);
+}
+
+static void sleep_ms(long ms) {
+    struct timespec rem = { ms / 1000, (ms % 1000) * 1000000L };
+    while (nanosleep(&rem, &rem) == -1) { }
+}
+
+static void* slow_handler(void* env, void* arg) {
+    (void) env;
+    AmalgameH1Conn* c = (AmalgameH1Conn*) arg;
+    /* Park the fiber for 5s. With v0.9.5 the shutdown sweep cancels
+     * us, FiberSleep returns early, the handler exits. Without it,
+     * ServeAsync waits the full 5s. */
+    Amalgame_Async_FiberSleep(5000);
+    Amalgame_Net_Http_H1Conn_Respond(c, 200, "text/plain", "slow-done");
+    return NULL;
+}
+
+static volatile i64 g_serve_returned_at = 0;
+static void* server_thread(void* u) {
+    (void) u;
+    AmalgameClosure* h = AmalgameClosure_new((void*) slow_handler, NULL);
+    Amalgame_Net_Http_Http1_ServeAsync($GS_PORT, h);
+    g_serve_returned_at = now_ms();
+    return NULL;
+}
+
+static void* client_thread(void* u) {
+    (void) u;
+    char buf[1024];
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons($GS_PORT);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (connect(s, (struct sockaddr*) &addr, sizeof(addr)) == 0) {
+        const char* req = "GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        send(s, req, strlen(req), 0);
+        recv(s, buf, sizeof(buf), 0);   /* may return on close */
+    }
+    close(s);
+    return NULL;
+}
+
+int main(void) {
+    GC_INIT();
+    pthread_t srv_t, cli_t;
+    if (GC_pthread_create(&srv_t, NULL, server_thread, NULL) != 0) return 1;
+    sleep_ms(300);
+    pthread_create(&cli_t, NULL, client_thread, NULL);
+    sleep_ms(200);   /* let the client request reach the handler */
+    i64 t_shutdown = now_ms();
+    Amalgame_Net_Http_Http1_RequestShutdown();
+    GC_pthread_join(srv_t, NULL);
+    pthread_join(cli_t, NULL);
+    i64 elapsed = g_serve_returned_at - t_shutdown;
+    printf("shutdown_to_serve_return=%lldms\n", (long long) elapsed);
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+    "$BUILD_DIR/graceful_shutdown_smoke.c" \
+    -lgc -lpthread -o "$BUILD_DIR/graceful_shutdown_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/graceful_shutdown_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (graceful-shutdown smoke build)"
+    exit 1
+fi
+GS_OUT=$("$BUILD_DIR/graceful_shutdown_smoke")
+echo "  $GS_OUT"
+GS_MS=$(echo "$GS_OUT" | sed -nE 's/.*shutdown_to_serve_return=([0-9]+)ms.*/\1/p')
+# Without v0.9.5 cancel: ~4800ms (waits for the 5000ms FiberSleep
+# minus the 200ms we slept before shutdown).
+# With v0.9.5 cancel: well under 500ms.
+if [ -n "$GS_MS" ] && [ "$GS_MS" -lt 1500 ]; then
+    echo -e "${GREEN}PASS${NC} (graceful shutdown returned in ${GS_MS}ms, 5s sleep cancelled)"
+else
+    echo -e "${RED}FAIL${NC} (expected < 1500ms, got '$GS_OUT' — FiberCancel not wiring through?)"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

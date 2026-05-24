@@ -24,10 +24,10 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.9.5"
+version           = "0.9.6"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://). Fiber-driven Http1.ServeAsync via amalgame-async."
-required-amalgame = ">=0.8.39"
+required-amalgame = ">=0.8.48"
 schema-version    = 1
 
 [stdlib]
@@ -94,6 +94,12 @@ H1Conn_Header                = { returns = "code_string" }
 H1Conn_Body                  = { returns = "code_string" }
 H1Conn_BodyLen               = { returns = "i64" }
 H1Conn_Respond               = { returns = "void" }
+# v0.9.6 — binary-safe response variants. Both carry Content-Length
+# explicitly instead of strlen(body), so PNG / JPEG / PDF / WASM
+# survive NUL bytes intact. RespondFile fopens path in "rb" mode +
+# GC_MALLOC + send; returns 0 on success, -1 on open/read failure.
+H1Conn_RespondBytes          = { returns = "void" }
+H1Conn_RespondFile           = { returns = "i64" }
 H1Conn_Close                 = { returns = "void" }
 # v0.9.0 — raw connection fd for async I/O parking.
 # Pair with amalgame-async ≥ v0.2.0: MakeNonBlocking +

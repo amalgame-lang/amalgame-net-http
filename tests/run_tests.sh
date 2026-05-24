@@ -160,6 +160,107 @@ else
     exit 1
 fi
 
+# ── H1Conn_RespondFile binary-safe smoke (v0.9.6) ────────────────
+# Critical: PNG / JPEG / PDF / WASM contain NUL bytes that the
+# legacy H1Conn_Respond path strlen-truncates. The new entry point
+# carries Content-Length explicitly. We verify by:
+#   1. building a 64-byte payload that contains a NUL at byte 5
+#   2. piping it through a socketpair'd H1Conn
+#   3. reading the wire bytes back and asserting the body half
+#      matches the original payload byte-for-byte (with the NUL).
+echo -e "\n── H1Conn_RespondFile binary-safe smoke ──"
+PAYLOAD_PATH="$BUILD_DIR/payload.bin"
+python3 -c "
+import sys
+data = b'hello' + b'\x00' + b'world' + bytes(range(256)) + b'TAIL'
+open('$PAYLOAD_PATH','wb').write(data)
+sys.stdout.write(str(len(data)))
+" > "$BUILD_DIR/payload.len"
+PAYLOAD_LEN=$(cat "$BUILD_DIR/payload.len")
+cat > "$BUILD_DIR/respondfile_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {
+    GC_INIT();
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { perror("socketpair"); return 1; }
+
+    /* Build an AmalgameH1Conn that writes to sv[0] (server side). */
+    AmalgameH1Conn* c = (AmalgameH1Conn*) GC_MALLOC(sizeof(AmalgameH1Conn));
+    memset(c, 0, sizeof(*c));
+    c->fd = sv[0];
+    c->keep_alive = 0;
+
+    /* Send the payload via the binary-safe entry. */
+    i64 rc = Amalgame_Net_Http_H1Conn_RespondFile(c, 200,
+        (code_string) "application/octet-stream",
+        (code_string) "$PAYLOAD_PATH");
+
+    /* Half-close server end so client sees EOF after final byte. */
+    shutdown(sv[0], SHUT_WR);
+
+    /* Drain wire bytes on the client end. */
+    char buf[8192];
+    ssize_t got = 0, n;
+    while ((n = read(sv[1], buf + got, sizeof(buf) - got - 1)) > 0) got += n;
+    buf[got] = 0;
+    close(sv[0]); close(sv[1]);
+
+    /* Split header / body at the CRLFCRLF. */
+    const char* sep = "\r\n\r\n";
+    char* hdr_end = NULL;
+    for (ssize_t i = 0; i + 3 < got; i++) {
+        if (memcmp(buf + i, sep, 4) == 0) { hdr_end = buf + i + 4; break; }
+    }
+    if (!hdr_end) { printf("FAIL: no CRLFCRLF in %zd wire bytes\n", got); return 1; }
+    ssize_t body_len = got - (hdr_end - buf);
+    ssize_t expected = $PAYLOAD_LEN;
+
+    /* Read the original file for byte-for-byte comparison. */
+    FILE* f = fopen("$PAYLOAD_PATH", "rb");
+    if (!f) { perror("fopen payload"); return 1; }
+    char orig[8192];
+    ssize_t orig_len = fread(orig, 1, sizeof(orig), f);
+    fclose(f);
+
+    printf("rc=%lld\n", (long long) rc);
+    printf("body_len=%zd expected=%zd orig_len=%zd\n", body_len, expected, orig_len);
+    printf("content_length_header=%s\n",
+        strstr(buf, "Content-Length: ") ? strstr(buf, "Content-Length: ") + 16 : "MISSING");
+
+    if (body_len != expected) { printf("FAIL: length mismatch\n"); return 1; }
+    if (memcmp(hdr_end, orig, body_len) != 0) {
+        for (ssize_t i = 0; i < body_len; i++) {
+            if (hdr_end[i] != orig[i]) {
+                printf("FAIL: byte %zd diff (got=0x%02x expected=0x%02x)\n",
+                    i, (unsigned)(unsigned char)hdr_end[i],
+                    (unsigned)(unsigned char)orig[i]);
+                return 1;
+            }
+        }
+    }
+    printf("PASS\n");
+    return 0;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+    "$BUILD_DIR/respondfile_smoke.c" -lgc -o "$BUILD_DIR/respondfile_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/respondfile_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (RespondFile smoke build)"
+    exit 1
+fi
+RF_OUT=$("$BUILD_DIR/respondfile_smoke")
+echo "$RF_OUT"
+if echo "$RF_OUT" | grep -q "^PASS$" && echo "$RF_OUT" | grep -q "rc=0"; then
+    echo -e "${GREEN}PASS${NC} (RespondFile sends $PAYLOAD_LEN bytes including NULs byte-for-byte)"
+else
+    echo -e "${RED}FAIL${NC} (RespondFile binary-safe pipeline broken)"
+    exit 1
+fi
+
 # ── End-to-end (server + client as separate processes) ────────────
 echo -e "\n── End-to-end test (server + client) ──"
 build_test tests/server_test.am "$BUILD_DIR/server_test" || { echo "server build failed"; exit 1; }

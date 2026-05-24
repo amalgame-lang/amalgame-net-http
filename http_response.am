@@ -19,11 +19,21 @@ public class HttpResponse {
     public StatusCode:  int                       // default 200
     public Headers:     Map<string, string>
     public BodyText:    string
+    // v0.9.6 — binary-safe body alternative.
+    //
+    // When FilePath != "", the wire-out (WriteToH1Conn) reads
+    // bytes from disk via H1Conn_RespondFile and ignores BodyText.
+    // Render() (sync legacy path) does NOT support FilePath mode —
+    // it returns a code_string which is strlen-truncated at the
+    // first NUL byte; binary file responses MUST go through the
+    // H1Conn path. Set via .File(path) builder.
+    public FilePath:    string
 
     public HttpResponse() {
         this.StatusCode = 200
         this.Headers    = new Map<string, string>()
         this.BodyText   = ""
+        this.FilePath   = ""
     }
 
     public static HttpResponse New() { return new HttpResponse() }
@@ -116,6 +126,26 @@ public class HttpResponse {
         return this
     }
 
+    // v0.9.6 — set the body to the binary contents of a file. The
+    // wire-out path reads it with fopen("rb") + explicit
+    // Content-Length, so PNG / JPEG / PDF / WASM survive NUL bytes
+    // intact (unlike .Text / .Html / .Json which strlen() the body).
+    //
+    // Caller is responsible for Content-Type — set it with
+    // .Header("Content-Type", "image/png") or let the static-file
+    // middleware pick from the file extension.
+    //
+    // The path is NOT validated here (existence, regularness,
+    // permission); the runtime returns -1 on open/read failure and
+    // the AM helper Static.Serve translates that to a 500. This
+    // setter is library-grade — the static middleware enforces
+    // the safety checks (path traversal, IsFile, …) before reaching
+    // here.
+    public HttpResponse File(string path) {
+        this.FilePath = path
+        return this
+    }
+
     // Serialize to wire bytes — used by HttpServer.
     public string Render() {
         let crlf: string = String_FromByte(13) + "\n"
@@ -183,13 +213,27 @@ public class HttpResponse {
         } else if (this.Headers.Has("content-type")) {
             ct = this.Headers.Get("content-type")
         }
+        // v0.9.6: binary-safe file response. When FilePath is set
+        // we send via H1Conn_RespondFile (fread + explicit
+        // Content-Length, no strlen). Plain text/html/json bodies
+        // keep the legacy strlen-based path because (a) they're
+        // already null-clean by construction, and (b) BodyText is
+        // already an AM string that lives in GC memory — going
+        // through RespondFile would re-fopen which is wasteful.
         @c {
             AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
             if (c) {
-                Amalgame_Net_Http_H1Conn_Respond(c,
-                    (i64) self->StatusCode,
-                    (code_string) ct,
-                    (code_string) self->BodyText);
+                if (self->FilePath && self->FilePath[0]) {
+                    Amalgame_Net_Http_H1Conn_RespondFile(c,
+                        (i64) self->StatusCode,
+                        (code_string) ct,
+                        (code_string) self->FilePath);
+                } else {
+                    Amalgame_Net_Http_H1Conn_Respond(c,
+                        (i64) self->StatusCode,
+                        (code_string) ct,
+                        (code_string) self->BodyText);
+                }
             }
         }
         return this

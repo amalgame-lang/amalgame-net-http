@@ -1905,6 +1905,124 @@ static inline void Amalgame_Net_Http_H1Conn_Respond(AmalgameH1Conn* c,
     c->response_sent = 1;
 }
 
+/* v0.9.6: binary-safe response variants.
+ *
+ * H1Conn_Respond uses strlen(body) for Content-Length — fine for
+ * text, broken for assets that contain NUL bytes (PNG, JPEG, PDF,
+ * WASM, …). These two siblings carry the length explicitly:
+ *
+ *   H1Conn_RespondBytes — body is (ptr, len), already in memory.
+ *                         Used when the AM caller has the bytes
+ *                         (e.g. dynamically generated image).
+ *
+ *   H1Conn_RespondFile  — body is a filesystem path; we fopen("rb"),
+ *                         GC_MALLOC the bytes, send with explicit
+ *                         Content-Length. The static-file
+ *                         middleware in amalgame-web is the prime
+ *                         consumer. Returns 0 on success, -1 on
+ *                         file open/read failure (so the caller
+ *                         can fall back to a 500 response).
+ *
+ * Both share the reason-phrase table + Connection header logic
+ * with H1Conn_Respond. Factored through a static helper to avoid
+ * triplicating ~30 lines.
+ */
+static inline int amalgame_h1_send_response(AmalgameH1Conn* c,
+                                             i64 status,
+                                             const char* ct,
+                                             const char* body,
+                                             size_t blen) {
+    if (!c || c->fd < 0 || c->response_sent) return -1;
+
+    const char* reason = "OK";
+    switch ((int)status) {
+        case 100: reason = "Continue"; break;
+        case 200: reason = "OK"; break;
+        case 201: reason = "Created"; break;
+        case 202: reason = "Accepted"; break;
+        case 204: reason = "No Content"; break;
+        case 206: reason = "Partial Content"; break;
+        case 301: reason = "Moved Permanently"; break;
+        case 302: reason = "Found"; break;
+        case 303: reason = "See Other"; break;
+        case 304: reason = "Not Modified"; break;
+        case 307: reason = "Temporary Redirect"; break;
+        case 308: reason = "Permanent Redirect"; break;
+        case 400: reason = "Bad Request"; break;
+        case 401: reason = "Unauthorized"; break;
+        case 403: reason = "Forbidden"; break;
+        case 404: reason = "Not Found"; break;
+        case 405: reason = "Method Not Allowed"; break;
+        case 409: reason = "Conflict"; break;
+        case 410: reason = "Gone"; break;
+        case 413: reason = "Payload Too Large"; break;
+        case 415: reason = "Unsupported Media Type"; break;
+        case 416: reason = "Range Not Satisfiable"; break;
+        case 422: reason = "Unprocessable Content"; break;
+        case 429: reason = "Too Many Requests"; break;
+        case 500: reason = "Internal Server Error"; break;
+        case 501: reason = "Not Implemented"; break;
+        case 502: reason = "Bad Gateway"; break;
+        case 503: reason = "Service Unavailable"; break;
+        case 504: reason = "Gateway Timeout"; break;
+    }
+
+    const char* ctype = (ct && ct[0]) ? ct : "application/octet-stream";
+    const char* conn_hdr = c->keep_alive ? "keep-alive" : "close";
+    char header[1024];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 %lld %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        (long long)status, reason, ctype, blen, conn_hdr);
+
+    int rc = -1;
+    if (header_len > 0
+        && amalgame_h1_send_all(c, header, (size_t)header_len) == 0) {
+        if (blen > 0) {
+            rc = amalgame_h1_send_all(c, body, blen);
+        } else {
+            rc = 0;
+        }
+    }
+    c->response_sent = 1;
+    return rc;
+}
+
+static inline void Amalgame_Net_Http_H1Conn_RespondBytes(AmalgameH1Conn* c,
+                                                          i64 status,
+                                                          code_string ct,
+                                                          i64 body_ptr,
+                                                          i64 body_len) {
+    const char* body = (const char*)(uintptr_t) body_ptr;
+    size_t blen = (body_len > 0) ? (size_t) body_len : 0;
+    amalgame_h1_send_response(c, status, ct, body, blen);
+}
+
+static inline i64 Amalgame_Net_Http_H1Conn_RespondFile(AmalgameH1Conn* c,
+                                                       i64 status,
+                                                       code_string ct,
+                                                       code_string path) {
+    if (!c || !path) return -1;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    rewind(f);
+    char* buf = (char*) GC_MALLOC_ATOMIC((size_t) sz + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t got = fread(buf, 1, (size_t) sz, f);
+    fclose(f);
+    if (got != (size_t) sz) return -1;
+    buf[got] = 0;  /* defensive — NUL after payload so a stray strlen
+                    * on the buffer stops at sz, not past the heap end */
+    int rc = amalgame_h1_send_response(c, status, ct, buf, (size_t) sz);
+    return rc == 0 ? 0 : -1;
+}
+
 static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
     if (!c) return;
     if (c->fd >= 0) {

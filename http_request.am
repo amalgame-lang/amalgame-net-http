@@ -190,6 +190,19 @@ public class HttpRequest {
                 }
             }
         }
+        // v0.9.7: parse the query string off RawTarget. The HTTP/1.1
+        // wire path (FromH1Conn) used to leave `req.Query` as the
+        // empty Map from the constructor — only ParseHeaders (the
+        // legacy text-based parser) populated it. Handlers calling
+        // `req.Query.Has("since")` on a live H1 server got false
+        // for any param. Fixed by mirroring ParseHeaders' split on
+        // the first `?` in RawTarget.
+        let qIdx: int = String_IndexOf(req.RawTarget, "?")
+        if (qIdx >= 0) {
+            let q: string = String_Substring(req.RawTarget, qIdx + 1,
+                                              String_Length(req.RawTarget) - qIdx - 1)
+            req.Query = HttpRequest.ParseQuery(q)
+        }
         return req
     }
 }

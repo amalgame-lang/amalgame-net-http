@@ -39,6 +39,21 @@ jobs:
           cp -r amalgame-async-sibling/* ../amalgame-async/
           ls ../amalgame-async/runtime/
 
+      # v0.11.0: HttpClient HTTPS path needs amalgame-tls' runtime
+      # (TlsConfig + TlsContext + TlsStream). The version pin
+      # matches the [dependencies] entry in amalgame.toml.
+      - name: Checkout amalgame-tls (peer dep)
+        uses: actions/checkout@v4
+        with:
+          repository: amalgame-lang/amalgame-tls
+          ref: v0.3.0
+          path: amalgame-tls-sibling
+      - name: Stage amalgame-tls at sibling path
+        run: |
+          mkdir -p ../amalgame-tls
+          cp -r amalgame-tls-sibling/* ../amalgame-tls/
+          ls ../amalgame-tls/runtime/
+
       - name: Download amc ${{ matrix.amc-tag }}
         run: |
           set -e

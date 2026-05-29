@@ -190,50 +190,71 @@ public class HttpResponse {
     // ── v0.7.0: Bridge to H1Conn ───────────────────
     //
     // Render this HttpResponse onto the H1Conn that handed us the
-    // request. Picks Content-Type from the headers map if present
-    // (`Content-Type` or `content-type`), defaults to text/plain
-    // otherwise. The H1Conn.Respond C entry handles the
-    // status-line + Content-Length + Connection: close/keep-alive
-    // framing.
+    // request. Serializes EVERY entry in this.Headers (Content-Type,
+    // Location, Set-Cookie, custom X-… headers, …) — the C runtime
+    // handles the status-line, Content-Length, and Connection
+    // header. v0.11.1 fixed the long-standing gap where only
+    // Content-Type was propagated and Location/Set-Cookie/etc.
+    // were silently dropped.
     //
-    // Headers beyond Content-Type are NOT yet propagated through
-    // H1Conn.Respond (its signature only takes status / ct / body).
-    // For richer header control, a follow-up v0.7.x will add
-    // H1Conn.RespondFull(conn, status, headers_map, body) that
-    // walks every entry of the headers map.
+    // The FilePath branch (set via .File(path) for binary-safe
+    // file responses) is unchanged — H1Conn_RespondFile still uses
+    // the legacy single-Content-Type framing because the Static
+    // middleware that calls it doesn't set custom headers.
     //
     // Returns this for chaining (e.g. final-cleanup callers).
     //
     // `conn` is passed as int (pointer-as-i64 handle) for the same
     // self-build reason explained on HttpRequest.FromH1Conn.
     public HttpResponse WriteToH1Conn(conn: int) {
-        var ct: string = "text/plain"
-        if (this.Headers.Has("Content-Type")) {
-            ct = this.Headers.Get("Content-Type")
-        } else if (this.Headers.Has("content-type")) {
-            ct = this.Headers.Get("content-type")
+        // File responses still go through the legacy path — Static
+        // never builds custom headers worth preserving.
+        if (String_Length(this.FilePath) > 0) {
+            var ctFile: string = "application/octet-stream"
+            if (this.Headers.Has("Content-Type")) {
+                ctFile = this.Headers.Get("Content-Type")
+            } else if (this.Headers.Has("content-type")) {
+                ctFile = this.Headers.Get("content-type")
+            }
+            @c {
+                AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+                if (c) {
+                    Amalgame_Net_Http_H1Conn_RespondFile(c,
+                        (i64) self->StatusCode,
+                        (code_string) ctFile,
+                        (code_string) self->FilePath);
+                }
+            }
+            return this
         }
-        // v0.9.6: binary-safe file response. When FilePath is set
-        // we send via H1Conn_RespondFile (fread + explicit
-        // Content-Length, no strlen). Plain text/html/json bodies
-        // keep the legacy strlen-based path because (a) they're
-        // already null-clean by construction, and (b) BodyText is
-        // already an AM string that lives in GC memory — going
-        // through RespondFile would re-fopen which is wasteful.
+
+        // Build the headers block — every entry of this.Headers as
+        // "Name: Value\r\n" lines. We MUST NOT include Content-Length
+        // or Connection here; the C runtime adds those authoritatively.
+        let crlf: string = String_FromByte(13) + String_FromByte(10)
+        let keys: List<string> = this.Headers.Keys()
+        let kn: int = keys.Count()
+        var headerBlock: string = ""
+        // Default Content-Type so plain `.New().Text("foo")` callers
+        // still get the right Content-Type when they didn't set one.
+        if (!this.Headers.Has("Content-Type") && !this.Headers.Has("content-type")) {
+            headerBlock = "Content-Type: text/plain; charset=utf-8" + crlf
+        }
+        for i in 0..kn {
+            let k: string = keys.Get(i)
+            // Skip framing headers the C runtime owns.
+            let kl: string = String_ToLower(k)
+            if (kl == "content-length") { continue }
+            if (kl == "connection") { continue }
+            headerBlock = headerBlock + k + ": " + this.Headers.Get(k) + crlf
+        }
         @c {
             AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
             if (c) {
-                if (self->FilePath && self->FilePath[0]) {
-                    Amalgame_Net_Http_H1Conn_RespondFile(c,
-                        (i64) self->StatusCode,
-                        (code_string) ct,
-                        (code_string) self->FilePath);
-                } else {
-                    Amalgame_Net_Http_H1Conn_Respond(c,
-                        (i64) self->StatusCode,
-                        (code_string) ct,
-                        (code_string) self->BodyText);
-                }
+                Amalgame_Net_Http_H1Conn_RespondFull(c,
+                    (i64) self->StatusCode,
+                    (code_string) headerBlock,
+                    (code_string) self->BodyText);
             }
         }
         return this

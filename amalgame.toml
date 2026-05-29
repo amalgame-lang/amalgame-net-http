@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.11.0"
+version           = "0.11.1"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.11 adds HTTPS client support to HttpClient (TLS via amalgame-tls, SNI, ALPN http/1.1) — unblocks OAuth2 / JWKS fetch / webhook posts."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.11.1 ships HttpResponse.WriteToH1Conn that finally serializes Location / Set-Cookie / CSP / arbitrary headers from the Headers map (long-standing bug — only Content-Type made the wire before)."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 
@@ -95,6 +95,13 @@ H1Conn_Header                = { returns = "code_string" }
 H1Conn_Body                  = { returns = "code_string" }
 H1Conn_BodyLen               = { returns = "i64" }
 H1Conn_Respond               = { returns = "void" }
+# v0.11.1 — caller-supplied header block (Location, Set-Cookie,
+# CSP, …). headers_block is "Name: Value\r\n"-formatted; the C
+# runtime adds the status-line, Content-Length, and Connection
+# headers, then appends this block, the end-of-headers blank
+# line, and the body. Used by HttpResponse.WriteToH1Conn so
+# arbitrary headers set via .Header(…) finally reach the wire.
+H1Conn_RespondFull           = { returns = "void" }
 # v0.9.6 — binary-safe response variants. Both carry Content-Length
 # explicitly instead of strlen(body), so PNG / JPEG / PDF / WASM
 # survive NUL bytes intact. RespondFile fopens path in "rb" mode +

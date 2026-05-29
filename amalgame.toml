@@ -27,7 +27,7 @@ name              = "amalgame-net-http"
 version           = "0.11.0"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.11 adds HTTPS client support to HttpClient (TLS via amalgame-tls, SNI, ALPN http/1.1) — unblocks OAuth2 / JWKS fetch / webhook posts."
-required-amalgame = ">=0.8.48"
+required-amalgame = ">=0.8.58"
 schema-version    = 1
 
 [stdlib]

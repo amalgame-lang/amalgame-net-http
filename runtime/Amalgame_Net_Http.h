@@ -1339,6 +1339,10 @@ static inline i64 Amalgame_Net_Http_Https_ServeWith(i64 port,
     return -3;
 }
 
+/* v0.10.0 HttpsH1Server stubs live with the active definitions
+ * later in the file (paired with #if AMALGAME_HAS_OPENSSL after
+ * the AmalgameH1Conn struct), so nothing to declare here. */
+
 #endif /* AMALGAME_HAS_OPENSSL */
 
 #else  /* !AMALGAME_HAS_NGHTTP2 — stub fallback */
@@ -1511,6 +1515,11 @@ typedef struct AmalgameH1Conn {
     AmalgameFiber*           async_fiber;
     struct AmalgameH1Conn*   async_next;
     struct AmalgameH1Conn*   async_prev;
+    /* v0.10.0: TLS termination. When non-NULL, recv/send dispatch
+     * through SSL_read / SSL_write instead of the bare fd. Set by
+     * HttpsH1Server_Accept after a successful SSL handshake; NULL
+     * for plain Http1.Serve/ServeMt/ServeAsync conns. */
+    SSL*                     ssl;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -1548,6 +1557,34 @@ static inline i64 amalgame_h1_async_body_timeout_ms(AmalgameH1Conn* c) {
 
 static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n,
                                      i64 timeout_ms) {
+    /* v0.10.0: TLS branch. SSL_read fully drains its own internal
+     * record buffer before pulling from the socket, so the EAGAIN
+     * loop is at the SSL layer (WANT_READ/WANT_WRITE) rather than
+     * recv(). Map both to the standard async-park / blocking-retry
+     * pattern. The plain-text path below stays bit-identical to
+     * v0.9.x. */
+    if (c->ssl) {
+        while (1) {
+            int r = SSL_read(c->ssl, buf, (int) n);
+            if (r > 0) return (ssize_t) r;
+            int err = SSL_get_error(c->ssl, r);
+            if (err == SSL_ERROR_ZERO_RETURN) return 0;  /* clean close */
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                if (c->async_io) {
+                    code_bool ok = (err == SSL_ERROR_WANT_WRITE)
+                        ? Amalgame_Async_WaitFdWritable((i64) c->fd, timeout_ms)
+                        : Amalgame_Async_WaitFdReadable((i64) c->fd, timeout_ms);
+                    if (!ok) { errno = ETIMEDOUT; return -1; }
+                    continue;
+                }
+                /* Blocking SSL — OpenSSL handles waits internally;
+                 * a WANT_* from a blocking BIO is unusual. Retry. */
+                continue;
+            }
+            if (err == SSL_ERROR_SYSCALL && errno == EINTR) continue;
+            return -1;
+        }
+    }
     int flags = c->async_io ? MSG_DONTWAIT : 0;
     while (1) {
         ssize_t r = recv(c->fd, buf, n, flags);
@@ -1566,6 +1603,33 @@ static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n,
 static int amalgame_h1_send_all(AmalgameH1Conn* c, const void* buf, size_t n) {
     const char* p = (const char*) buf;
     size_t left = n;
+    /* v0.10.0: TLS branch — mirror of the recv path. SSL_write drains
+     * into the SSL record buffer; partial writes manifest as WANT_*
+     * rather than short returns, so the loop pattern is the same. */
+    if (c->ssl) {
+        while (left > 0) {
+            int w = SSL_write(c->ssl, p, (int) left);
+            if (w > 0) {
+                p    += w;
+                left -= (size_t) w;
+                continue;
+            }
+            int err = SSL_get_error(c->ssl, w);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                if (c->async_io) {
+                    code_bool ok = (err == SSL_ERROR_WANT_READ)
+                        ? Amalgame_Async_WaitFdReadable((i64) c->fd, AMALGAME_H1_ASYNC_WRITE_TIMEOUT_MS)
+                        : Amalgame_Async_WaitFdWritable((i64) c->fd, AMALGAME_H1_ASYNC_WRITE_TIMEOUT_MS);
+                    if (!ok) { errno = ETIMEDOUT; return -1; }
+                    continue;
+                }
+                continue;
+            }
+            if (err == SSL_ERROR_SYSCALL && errno == EINTR) continue;
+            return -1;
+        }
+        return 0;
+    }
     int flags = c->async_io ? MSG_DONTWAIT : 0;
     while (left > 0) {
         ssize_t w = send(c->fd, p, left, flags);
@@ -2025,6 +2089,15 @@ static inline i64 Amalgame_Net_Http_H1Conn_RespondFile(AmalgameH1Conn* c,
 
 static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
     if (!c) return;
+    /* v0.10.0: TLS shutdown before the bare fd close so the peer
+     * gets a clean close-notify alert. SSL_shutdown is best-effort —
+     * we don't reblock waiting for the peer's response (matches the
+     * existing H2/Https path). */
+    if (c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+        c->ssl = NULL;
+    }
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
@@ -2110,6 +2183,302 @@ static inline int amalgame_h1_request_keep_alive(AmalgameH1Conn* c) {
  * For tunable behavior (Slowloris timeouts, size limits) see
  * Http1.ServeWith below.
  */
+
+#ifdef AMALGAME_HAS_OPENSSL
+
+/* ══════════════════════════════════════════════════════════════════
+ *  HTTPS-over-HTTP/1.1 (v0.10.0) — TLS-terminating H1 server
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * Sibling of Https.Serve (ALPN h2) shipped in v0.3. The v0.3
+ * server terminates TLS and dispatches HTTP/2 — fine for h2
+ * origins but leaves the (much larger) HTTP/1.1 routing surface
+ * (amalgame-web's WebApp + Mosaic, Pollen Manager, every existing
+ * handler in user code) unable to terminate TLS on its own.
+ * Production deployments had to front the HTTP/1.1 server with
+ * nginx or Caddy doing TLS termination.
+ *
+ * v0.10.0 adds a parallel TLS-terminating server that speaks
+ * HTTP/1.1 directly:
+ *
+ *   - HttpsH1Server_Listen → AmalgameHttpsH1Server*
+ *   - HttpsH1Server_Accept → AmalgameH1Conn*  (with ssl != NULL)
+ *   - HttpsH1Server_Close  → void
+ *   - Https.H1Serve(port, cert, key, handler)            single-thread
+ *   - Https.H1ServeMt(port, cert, key, handler)          thread-per-conn
+ *
+ * The returned H1Conn has its `ssl` field set; the recv/send helpers
+ * upstream already branch on that, so user code (HttpRequest.FromH1Conn,
+ * HttpResponse.WriteToH1Conn) is bit-identical between plaintext and
+ * TLS — the only difference is which Listen call you make.
+ *
+ * ALPN policy: advertise "http/1.1" only. Browsers happy. Pure-h2-only
+ * clients (rare in 2026) get rejected at handshake. Clients that
+ * don't offer ALPN at all (legacy curl --http1.1) are also accepted —
+ * OpenSSL's select_cb isn't invoked when the client doesn't request
+ * ALPN, and we don't insist on it. */
+
+typedef struct AmalgameHttpsH1Server {
+    int       fd;
+    int32_t   listening;
+    i64       port;
+    SSL_CTX*  ssl_ctx;
+} AmalgameHttpsH1Server;
+
+static int amalgame_https_h1_alpn_select_cb(SSL* ssl,
+        const unsigned char** out, unsigned char* outlen,
+        const unsigned char* in, unsigned int inlen, void* arg) {
+    (void)ssl; (void)arg;
+    for (unsigned int i = 0; i < inlen; ) {
+        unsigned int plen = in[i];
+        if (i + 1 + plen > inlen) break;
+        if (plen == 8
+            && in[i+1] == 'h' && in[i+2] == 't' && in[i+3] == 't'
+            && in[i+4] == 'p' && in[i+5] == '/' && in[i+6] == '1'
+            && in[i+7] == '.' && in[i+8] == '1') {
+            *out    = &in[i+1];
+            *outlen = 8;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += 1 + plen;
+    }
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+static inline AmalgameHttpsH1Server* Amalgame_Net_Http_HttpsH1Server_Listen(
+        i64 port, code_string cert_file, code_string key_file, i64 backlog) {
+    AmalgameHttpsH1Server* s =
+        (AmalgameHttpsH1Server*) GC_MALLOC(sizeof(AmalgameHttpsH1Server));
+    memset(s, 0, sizeof(*s));
+    s->port = port; s->fd = -1;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return s;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
+        close(fd); return s;
+    }
+    s->fd = fd;
+
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) { close(fd); s->fd = -1; return s; }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_check_private_key(ctx) != 1) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx); close(fd); s->fd = -1; return s;
+    }
+    SSL_CTX_set_alpn_select_cb(ctx, amalgame_https_h1_alpn_select_cb, NULL);
+    s->ssl_ctx   = ctx;
+    s->listening = 1;
+    Amalgame_Net_Http_InstallShutdownSignals();
+    amalgame_net_http_register_listen_fd(s->fd);
+    return s;
+}
+
+static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
+        AmalgameHttpsH1Server* s) {
+    if (!s || !s->listening || s->fd < 0) return NULL;
+    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
+    if (cfd < 0) return NULL;
+    SSL* ssl = SSL_new(s->ssl_ctx);
+    if (!ssl) { close(cfd); return NULL; }
+    SSL_set_fd(ssl, cfd);
+    int rv = SSL_accept(ssl);
+    if (rv != 1) {
+        int err = SSL_get_error(ssl, rv);
+        fprintf(stderr, "Https.H1Serve: TLS handshake failed (SSL err %d)\n", err);
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl); close(cfd);
+        return NULL;
+    }
+    const unsigned char* alpn = NULL; unsigned int alen2 = 0;
+    SSL_get0_alpn_selected(ssl, &alpn, &alen2);
+    if (alen2 != 0 && (alen2 != 8 || memcmp(alpn, "http/1.1", 8) != 0)) {
+        fprintf(stderr, "Https.H1Serve: client picked non-h1 ALPN\n");
+        SSL_shutdown(ssl); SSL_free(ssl); close(cfd);
+        return NULL;
+    }
+    AmalgameH1Conn* c = (AmalgameH1Conn*) GC_MALLOC(sizeof(AmalgameH1Conn));
+    memset(c, 0, sizeof(*c));
+    c->fd  = cfd;
+    c->ssl = ssl;
+    char ipbuf[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf))) {
+        snprintf(c->remote_addr, sizeof(c->remote_addr),
+                 "%s:%u", ipbuf, (unsigned) ntohs(addr.sin_port));
+    }
+    return c;
+}
+
+static inline void Amalgame_Net_Http_HttpsH1Server_Close(AmalgameHttpsH1Server* s) {
+    if (!s) return;
+    amalgame_net_http_unregister_listen_fd(s->fd);
+    if (s->fd >= 0) close(s->fd);
+    if (s->ssl_ctx) SSL_CTX_free(s->ssl_ctx);
+    s->fd = -1; s->ssl_ctx = NULL; s->listening = 0;
+}
+
+static inline code_bool Amalgame_Net_Http_HttpsH1Server_IsListening(
+        AmalgameHttpsH1Server* s) {
+    return s && s->listening ? 1 : 0;
+}
+
+static inline i64 Amalgame_Net_Http_HttpsH1Server_RawFd(AmalgameHttpsH1Server* s) {
+    return s ? (i64) s->fd : -1;
+}
+
+static inline i64 Amalgame_Net_Http_Https_H1Serve(i64 port,
+        code_string cert_file, code_string key_file,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Https.H1Serve: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Https.H1Serve: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameHttpsH1Server* srv = Amalgame_Net_Http_HttpsH1Server_Listen(
+        port, cert_file, key_file, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Https.H1Serve: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Https.H1Serve: listening on :%lld (HTTPS, ALPN http/1.1)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening && !amalgame_net_http_stopping) {
+        AmalgameH1Conn* conn = Amalgame_Net_Http_HttpsH1Server_Accept(srv);
+        if (!conn) {
+            if (amalgame_net_http_stopping) break;
+            continue;
+        }
+        if (amalgame_h1_parse_request(conn) > 0) {
+            AmalgameClosure_call1(handler, (void*)conn);
+        }
+        Amalgame_Net_Http_H1Conn_Close(conn);
+    }
+    Amalgame_Net_Http_HttpsH1Server_Close(srv);
+    if (amalgame_net_http_stopping) {
+        fprintf(stdout, "Https.H1Serve: graceful shutdown — stopped accepting\n");
+        fflush(stdout);
+    }
+    return 0;
+}
+
+typedef struct amalgame_https_h1_mt_arg {
+    AmalgameH1Conn*   conn;
+    AmalgameClosure*  handler;
+} amalgame_https_h1_mt_arg;
+
+static void* amalgame_https_h1_mt_worker(void* p) {
+    amalgame_https_h1_mt_arg* a = (amalgame_https_h1_mt_arg*) p;
+    if (amalgame_h1_parse_request(a->conn) > 0) {
+        AmalgameClosure_call1(a->handler, (void*)a->conn);
+    }
+    Amalgame_Net_Http_H1Conn_Close(a->conn);
+    return NULL;
+}
+
+static inline i64 Amalgame_Net_Http_Https_H1ServeMt(i64 port,
+        code_string cert_file, code_string key_file,
+        AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Https.H1ServeMt: handler is NULL\n");
+        return -1;
+    }
+    if (!cert_file || !cert_file[0] || !key_file || !key_file[0]) {
+        fprintf(stderr, "Https.H1ServeMt: certFile and keyFile required\n");
+        return -4;
+    }
+    static int ssl_initialised = 0;
+    if (!ssl_initialised) {
+        SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms();
+        ssl_initialised = 1;
+    }
+    AmalgameHttpsH1Server* srv = Amalgame_Net_Http_HttpsH1Server_Listen(
+        port, cert_file, key_file, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Https.H1ServeMt: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Https.H1ServeMt: listening on :%lld (HTTPS h1, multi-thread)\n",
+            (long long)port);
+    fflush(stdout);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    while (srv->listening && !amalgame_net_http_stopping) {
+        AmalgameH1Conn* conn = Amalgame_Net_Http_HttpsH1Server_Accept(srv);
+        if (!conn) {
+            if (amalgame_net_http_stopping) break;
+            continue;
+        }
+        amalgame_https_h1_mt_arg* a =
+            (amalgame_https_h1_mt_arg*) GC_MALLOC(sizeof(*a));
+        a->conn = conn; a->handler = handler;
+        pthread_t t;
+        int rc = GC_pthread_create(&t, &attr, amalgame_https_h1_mt_worker, a);
+        if (rc != 0) {
+            fprintf(stderr, "Https.H1ServeMt: thread create failed (%s), inline\n",
+                    strerror(rc));
+            amalgame_https_h1_mt_worker(a);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    Amalgame_Net_Http_HttpsH1Server_Close(srv);
+    return 0;
+}
+
+#else  /* !AMALGAME_HAS_OPENSSL — HTTPS-H1 stubs */
+
+typedef struct AmalgameHttpsH1Server AmalgameHttpsH1Server;
+static inline AmalgameHttpsH1Server* Amalgame_Net_Http_HttpsH1Server_Listen(
+        i64 p, code_string c, code_string k, i64 b) {
+    (void)p;(void)c;(void)k;(void)b; return NULL; }
+static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
+        AmalgameHttpsH1Server* s) { (void)s; return NULL; }
+static inline void Amalgame_Net_Http_HttpsH1Server_Close(AmalgameHttpsH1Server* s) {
+    (void)s; }
+static inline code_bool Amalgame_Net_Http_HttpsH1Server_IsListening(
+        AmalgameHttpsH1Server* s) { (void)s; return 0; }
+static inline i64 Amalgame_Net_Http_HttpsH1Server_RawFd(AmalgameHttpsH1Server* s) {
+    (void)s; return -1; }
+static inline i64 Amalgame_Net_Http_Https_H1Serve(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h;
+    fprintf(stderr,
+        "Https.H1Serve: built without OpenSSL — install libssl-dev "
+        "and rebuild this package.\n");
+    return -3;
+}
+static inline i64 Amalgame_Net_Http_Https_H1ServeMt(i64 port,
+        code_string cert, code_string key, AmalgameClosure* h) {
+    (void)port; (void)cert; (void)key; (void)h;
+    fprintf(stderr, "Https.H1ServeMt: built without OpenSSL.\n");
+    return -3;
+}
+
+#endif /* AMALGAME_HAS_OPENSSL */
+
 static inline i64 Amalgame_Net_Http_Http1_Serve(i64 port,
                                                 AmalgameClosure* handler) {
     if (!handler) {

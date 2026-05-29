@@ -9,6 +9,16 @@ namespace Amalgame.Net.Http
 import Amalgame.Collections
 import Amalgame.String
 
+// v0.11.0: HTTPS client support. We pull amalgame-tls in via the
+// runtime header only (no AM-side import) — the Tls* classes
+// aren't reachable at AM resolution time when downstream tests
+// only `--external` net-http's own sources, so we call the C
+// primitives directly from @c blocks. The full TLS context setup
+// stays a single static-inline call away.
+@c {
+    #include "Amalgame_Tls.h"
+}
+
 // ─────────────────────────────────────────────────────────────────
 // HttpClient — small surface for the common GET/POST cases.
 //
@@ -128,11 +138,103 @@ public class HttpClient {
         }
         s = s + crlf + b.Body
 
-        // Plain TCP path — HTTPS path lands in v0.1.x.
+        // Connect (TCP — TLS upgrade follows for https://).
         let conn = TcpClient_Connect(u.Host, port)
         if (!TcpClient_IsConnected(conn)) {
             return HttpResponse.New().Status(0).Text("connect failed")
         }
+
+        if (isTls) {
+            // v0.11.0: HTTPS path. Everything below is inlined C
+            // against the amalgame-tls runtime header — the Tls*
+            // classes aren't reachable at AM resolution time when
+            // downstream tests only --external net-http's own
+            // sources, so we sidestep AM-level dispatch entirely.
+            // SNI is set per-connection (Github/Google would
+            // otherwise return the wrong cert). ALPN advertises
+            // "http/1.1" for parity with the plaintext path.
+            let host: string = u.Host
+            let req:  string = s
+            var status: int = 0
+            var rawResp: string = ""
+            @c {
+                int fd = conn ? conn->_fd : -1;
+                if (fd < 0) {
+                    status = -1;
+                } else {
+                    AmalgameTlsConfig* cfg =
+                        Amalgame_Tls_TlsConfig_Default();
+                    cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
+                    AmalgameTlsContext* ctx = _amtls_new_ctx(cfg, false);
+                    if (!ctx || !ctx->_ctx) {
+                        status = -2;
+                    } else {
+                        AmalgameTlsStream* stream =
+                            Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
+                        if (stream && stream->_ssl && host) {
+                            SSL_set_tlsext_host_name((SSL*) stream->_ssl, host);
+                        }
+                        if (!stream || !Amalgame_Tls_TlsStream_Handshake(stream)) {
+                            status = -3;
+                            if (stream) Amalgame_Tls_TlsStream_Close(stream);
+                        } else {
+                            /* Send request bytes via TLS. */
+                            size_t reqLen = req ? strlen(req) : 0;
+                            i64 wn = Amalgame_Tls_TlsStream_WriteBytes(
+                                stream, req ? req : "", (i64) reqLen);
+                            if (wn < 0) {
+                                status = -4;
+                                Amalgame_Tls_TlsStream_Close(stream);
+                            } else {
+                                /* Read up to 1 MiB into a growable
+                                 * buffer; loop until clean close
+                                 * (rn <= 0) or cap. */
+                                size_t cap = 65536;
+                                size_t total = 0;
+                                char* buf = (char*) GC_MALLOC(cap);
+                                char chunk[4096];
+                                for (;;) {
+                                    i64 rn = Amalgame_Tls_TlsStream_ReadBytes(
+                                        stream, chunk, (i64) sizeof(chunk));
+                                    if (rn <= 0) break;
+                                    if (total + rn > cap) {
+                                        size_t newCap = cap * 2;
+                                        while (newCap < total + (size_t) rn) newCap *= 2;
+                                        if (newCap > 1048576) newCap = 1048576;
+                                        char* nbuf = (char*) GC_MALLOC(newCap);
+                                        memcpy(nbuf, buf, total);
+                                        buf = nbuf;
+                                        cap = newCap;
+                                    }
+                                    size_t can = (size_t) rn;
+                                    if (total + can > cap) can = cap - total;
+                                    memcpy(buf + total, chunk, can);
+                                    total += can;
+                                    if (total >= cap) break;
+                                }
+                                Amalgame_Tls_TlsStream_Close(stream);
+                                char* nul = (char*) GC_MALLOC(total + 1);
+                                if (total > 0) memcpy(nul, buf, total);
+                                nul[total] = 0;
+                                rawResp = nul;
+                                status = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            TcpClient_Close(conn)
+            if (status != 0) {
+                return HttpResponse.New().Status(0).Text("tls error " + String_FromInt(status))
+            }
+            let resp: HttpResponse = HttpParser.ParseResponse(rawResp)
+            if (resp == null) {
+                return HttpResponse.New().Status(0).Text("invalid response")
+            }
+            return resp
+        }
+
+        // Plain TCP path (http://).
         TcpClient_Send(conn, s)
         let raw: string = TcpClient_Receive(conn, 1048576)   // 1 MB cap
         TcpClient_Close(conn)
@@ -145,6 +247,7 @@ public class HttpClient {
         }
         return resp
     }
+
 
     private static ParsedUrl ParseUrl(string url) {
         let p = new ParsedUrl()

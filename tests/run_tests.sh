@@ -96,9 +96,13 @@ build_test() {
     local src="$1"
     local out="$2"
     "$AMC" -o "$out" "$src" $NETHTTP_EXTERNAL_FLAGS 2>&1 | tail -2
+    # v0.10.0: facade.o pulls in HTTPS-H1's SSL_read/SSL_write
+    # via amalgame_h1_send_all / amalgame_h1_recv_into branches
+    # on c->ssl. Link -lssl -lcrypto unconditionally; users on
+    # OpenSSL-less builds (rare) can override via a -U define.
     gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
         "$out.c" "$BUILD_DIR/facade.o" \
-        -lgc -lm -lcurl -lz -lpthread -o "$out" 2>&1 | head -5
+        -lgc -lm -lcurl -lz -lpthread -lssl -lcrypto -lnghttp2 -o "$out" 2>&1 | head -5
     [ -x "$out" ]
 }
 
@@ -145,7 +149,7 @@ int main(void) {
 }
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" "$BUILD_DIR/cfg_smoke.c" \
-    -lgc -o "$BUILD_DIR/cfg_smoke" 2>&1 | head -5
+    -lgc -lssl -lcrypto -o "$BUILD_DIR/cfg_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/cfg_smoke" ]; then
     echo -e "${RED}FAIL${NC} (HttpServerConfig smoke build)"
     exit 1
@@ -247,7 +251,7 @@ int main(void) {
 }
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
-    "$BUILD_DIR/respondfile_smoke.c" -lgc -o "$BUILD_DIR/respondfile_smoke" 2>&1 | head -5
+    "$BUILD_DIR/respondfile_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/respondfile_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/respondfile_smoke" ]; then
     echo -e "${RED}FAIL${NC} (RespondFile smoke build)"
     exit 1
@@ -302,7 +306,7 @@ int main(void) {
 }
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" "$BUILD_DIR/mt_smoke.c" \
-    -lgc -lpthread -o "$BUILD_DIR/mt_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/mt_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/mt_smoke" ]; then
     echo -e "${RED}FAIL${NC} (Http1.ServeMt smoke build)"
     exit 1
@@ -338,7 +342,7 @@ int main(void) {
 }
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" "$BUILD_DIR/h2c_smoke.c" \
-    -lnghttp2 -lgc -o "$BUILD_DIR/h2c_smoke" 2>&1 | head -5
+    -lnghttp2 -lssl -lcrypto -lgc -o "$BUILD_DIR/h2c_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/h2c_smoke" ]; then
     echo -e "${RED}FAIL${NC} (h2c smoke build)"
     exit 1
@@ -421,7 +425,7 @@ int main(void) {
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
     "$BUILD_DIR/serve_async_smoke.c" \
-    -lgc -lpthread -o "$BUILD_DIR/serve_async_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/serve_async_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/serve_async_smoke" ]; then
     echo -e "${RED}FAIL${NC} (ServeAsync smoke build)"
     exit 1
@@ -527,7 +531,7 @@ int main(void) {
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
     "$BUILD_DIR/serve_async_with_smoke.c" \
-    -lgc -lpthread -o "$BUILD_DIR/serve_async_with_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/serve_async_with_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/serve_async_with_smoke" ]; then
     echo -e "${RED}FAIL${NC} (ServeAsyncWith smoke build)"
     exit 1
@@ -620,7 +624,7 @@ int main(void) {
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
     "$BUILD_DIR/header_timeout_smoke.c" \
-    -lgc -lpthread -o "$BUILD_DIR/header_timeout_smoke" 2>&1 | head -3
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/header_timeout_smoke" 2>&1 | head -3
 if [ ! -x "$BUILD_DIR/header_timeout_smoke" ]; then
     echo -e "${RED}FAIL${NC} (header-timeout smoke build)"
     exit 1
@@ -745,7 +749,7 @@ int main(void) {
 EOF
 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
     "$BUILD_DIR/graceful_shutdown_smoke.c" \
-    -lgc -lpthread -o "$BUILD_DIR/graceful_shutdown_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/graceful_shutdown_smoke" 2>&1 | head -5
 if [ ! -x "$BUILD_DIR/graceful_shutdown_smoke" ]; then
     echo -e "${RED}FAIL${NC} (graceful-shutdown smoke build)"
     exit 1
@@ -761,6 +765,103 @@ if [ -n "$GS_MS" ] && [ "$GS_MS" -lt 1500 ]; then
 else
     echo -e "${RED}FAIL${NC} (expected < 1500ms, got '$GS_OUT' — FiberCancel not wiring through?)"
     exit 1
+fi
+
+# ── Https.H1Serve smoke (v0.10.0) ────────────────────────────────
+# Verifies the TLS-terminating HTTP/1.1 server end-to-end:
+#   1. Generate a self-signed cert in BUILD_DIR (openssl one-liner).
+#   2. Spawn Https.H1Serve in a pthread on port $TLS_H1_PORT.
+#   3. curl --insecure --http1.1 https://127.0.0.1:$TLS_H1_PORT/.
+#   4. Assert HTTP 200 + expected body.
+#   5. Signal graceful shutdown via Http1_RequestShutdown.
+#
+# Skips cleanly if `openssl` or `curl` is missing.
+echo -e "\n── Https.H1Serve e2e (TLS termination + ALPN http/1.1) ──"
+if ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    echo -e "${YELLOW}SKIP${NC} (openssl or curl missing)"
+else
+    TLS_H1_PORT=18099
+    TLS_CERT="$BUILD_DIR/tls_h1.crt"
+    TLS_KEY="$BUILD_DIR/tls_h1.key"
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$TLS_KEY" -out "$TLS_CERT" -days 1 \
+        -subj "/CN=localhost" 2>/dev/null
+
+    cat > "$BUILD_DIR/https_h1_smoke.c" <<EOF
+#include "Amalgame_Net_Http.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+
+static void* handler_fn(void* env, void* arg) {
+    (void) env;
+    AmalgameH1Conn* c = (AmalgameH1Conn*) arg;
+    Amalgame_Net_Http_H1Conn_Respond(
+        c, 200, "text/plain", "ok-from-tls-h1");
+    return NULL;
+}
+
+static void* server_thread(void* unused) {
+    (void) unused;
+    AmalgameClosure* h =
+        AmalgameClosure_new((void*) handler_fn, NULL);
+    Amalgame_Net_Http_Https_H1Serve($TLS_H1_PORT,
+        "$TLS_CERT", "$TLS_KEY", h);
+    return NULL;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec rem;
+    rem.tv_sec  = ms / 1000;
+    rem.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&rem, &rem) == -1) {
+        if (errno != EINTR) break;
+    }
+}
+
+int main(void) {
+    GC_INIT();
+    pthread_t srv_t;
+    if (GC_pthread_create(&srv_t, NULL, server_thread, NULL) != 0) return 1;
+    sleep_ms(400);  /* let the server bind + SSL_CTX setup */
+    printf("server-up\n");
+    fflush(stdout);
+    sleep_ms(2000); /* hold so curl from outside can probe */
+    Amalgame_Net_Http_Http1_RequestShutdown();
+    GC_pthread_join(srv_t, NULL);
+    return 0;
+}
+EOF
+    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" \
+        "$BUILD_DIR/https_h1_smoke.c" \
+        -lssl -lcrypto -lnghttp2 -lgc -lpthread -o "$BUILD_DIR/https_h1_smoke" 2>&1 | head -5
+    if [ ! -x "$BUILD_DIR/https_h1_smoke" ]; then
+        echo -e "${RED}FAIL${NC} (https_h1_smoke build)"
+        exit 1
+    fi
+    "$BUILD_DIR/https_h1_smoke" > "$BUILD_DIR/https_h1.log" 2>&1 &
+    SERVER_PID=$!
+    # Wait up to 2s for "server-up" to appear in the log.
+    for _ in $(seq 1 20); do
+        if grep -q "server-up" "$BUILD_DIR/https_h1.log" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    CURL_OUT=$(curl -sk --max-time 3 --http1.1 \
+        -o /dev/stdout -w "HTTP_CODE=%{http_code}\nALPN=%{ssl_proto}\n" \
+        "https://127.0.0.1:$TLS_H1_PORT/" 2>&1)
+    wait $SERVER_PID 2>/dev/null
+    SERVER_PID=""
+    echo "$CURL_OUT" | head -5
+    if echo "$CURL_OUT" | grep -q "ok-from-tls-h1" && \
+       echo "$CURL_OUT" | grep -q "HTTP_CODE=200"; then
+        echo -e "${GREEN}PASS${NC} (TLS-terminated HTTP/1.1 200 returned via Https.H1Serve)"
+    else
+        echo -e "${RED}FAIL${NC} (Https.H1Serve didn't serve 200)"
+        cat "$BUILD_DIR/https_h1.log" | head -20
+        exit 1
+    fi
 fi
 
 echo -e "\n${GREEN}All tests completed${NC}"

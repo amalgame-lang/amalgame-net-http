@@ -1969,6 +1969,103 @@ static inline void Amalgame_Net_Http_H1Conn_Respond(AmalgameH1Conn* c,
     c->response_sent = 1;
 }
 
+/* v0.11.1: respond with a caller-supplied header block.
+ *
+ * H1Conn_Respond hard-codes the header set (Content-Type / Length /
+ * Connection) — fine for a 200 with text, useless for redirects
+ * (Location), cookies (Set-Cookie), CSP/CORS, cache-control, …
+ * Callers needing arbitrary headers (HttpResponse.Render via the
+ * AM Headers map) build a `headers_block` string of the form
+ *
+ *   "Content-Type: text/html\r\n"
+ *   "Location: https://...\r\n"
+ *   "Set-Cookie: sid=abc; HttpOnly\r\n"
+ *
+ * — i.e. each header line terminated with CRLF, NO trailing empty
+ * line. This function emits the status-line, adds Content-Length
+ * and Connection (still authoritative — caller MUST NOT include
+ * those in headers_block), appends the caller's block, the
+ * end-of-headers blank line, and the body.
+ *
+ * `headers_block` may be NULL or "" — equivalent to calling
+ * H1Conn_Respond with ct="text/plain; charset=utf-8".
+ */
+static inline void Amalgame_Net_Http_H1Conn_RespondFull(AmalgameH1Conn* c,
+                                                         i64 status,
+                                                         code_string headers_block,
+                                                         code_string body) {
+    if (!c || c->fd < 0 || c->response_sent) return;
+
+    const char* reason = "OK";
+    switch ((int)status) {
+        case 100: reason = "Continue"; break;
+        case 200: reason = "OK"; break;
+        case 201: reason = "Created"; break;
+        case 202: reason = "Accepted"; break;
+        case 204: reason = "No Content"; break;
+        case 301: reason = "Moved Permanently"; break;
+        case 302: reason = "Found"; break;
+        case 303: reason = "See Other"; break;
+        case 304: reason = "Not Modified"; break;
+        case 307: reason = "Temporary Redirect"; break;
+        case 308: reason = "Permanent Redirect"; break;
+        case 400: reason = "Bad Request"; break;
+        case 401: reason = "Unauthorized"; break;
+        case 403: reason = "Forbidden"; break;
+        case 404: reason = "Not Found"; break;
+        case 405: reason = "Method Not Allowed"; break;
+        case 409: reason = "Conflict"; break;
+        case 410: reason = "Gone"; break;
+        case 413: reason = "Payload Too Large"; break;
+        case 415: reason = "Unsupported Media Type"; break;
+        case 422: reason = "Unprocessable Content"; break;
+        case 429: reason = "Too Many Requests"; break;
+        case 500: reason = "Internal Server Error"; break;
+        case 501: reason = "Not Implemented"; break;
+        case 502: reason = "Bad Gateway"; break;
+        case 503: reason = "Service Unavailable"; break;
+        case 504: reason = "Gateway Timeout"; break;
+    }
+
+    size_t blen = body ? strlen(body) : 0;
+    const char* conn_hdr = c->keep_alive ? "keep-alive" : "close";
+
+    /* Status line + Content-Length + Connection (caller-managed
+     * headers come after). Buffer is generous — 256 bytes covers
+     * any reason phrase + framing headers. */
+    char start[256];
+    int start_len = snprintf(start, sizeof(start),
+        "HTTP/1.1 %lld %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n",
+        (long long)status, reason, blen, conn_hdr);
+    if (start_len <= 0 || start_len >= (int)sizeof(start)) {
+        c->response_sent = 1;
+        return;
+    }
+
+    if (amalgame_h1_send_all(c, start, (size_t)start_len) != 0) {
+        c->response_sent = 1;
+        return;
+    }
+    if (headers_block && headers_block[0]) {
+        size_t hlen = strlen(headers_block);
+        if (amalgame_h1_send_all(c, headers_block, hlen) != 0) {
+            c->response_sent = 1;
+            return;
+        }
+    }
+    /* End of headers */
+    if (amalgame_h1_send_all(c, "\r\n", 2) != 0) {
+        c->response_sent = 1;
+        return;
+    }
+    if (blen > 0) {
+        amalgame_h1_send_all(c, body, blen);
+    }
+    c->response_sent = 1;
+}
+
 /* v0.9.6: binary-safe response variants.
  *
  * H1Conn_Respond uses strlen(body) for Content-Length — fine for

@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.9.6"
+version           = "0.10.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket server (ws:// + wss://). Fiber-driven Http1.ServeAsync via amalgame-async."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.10 adds HTTPS-over-HTTP/1.1 (Https.H1Serve / H1ServeMt) so user code can terminate TLS for h1 handlers without nginx in front."
 required-amalgame = ">=0.8.48"
 schema-version    = 1
 
@@ -50,6 +50,7 @@ classes   = [
     "Http2",
     "HttpsServer",
     "Https",
+    "HttpsH1Server",
     "WsServer",
     "WsConn",
     "Ws",
@@ -206,6 +207,21 @@ HttpsServer_IsListening      = { returns = "code_bool" }
 HttpsServer_Accept           = { returns = "AmalgameH2Conn*" }
 HttpsServer_Close            = { returns = "void" }
 Https_Serve                  = { returns = "i64" }
+Https_ServeMt                = { returns = "i64" }
+Https_ServeWith              = { returns = "i64" }
+
+# ── HttpsH1Server — HTTPS-over-HTTP/1.1 (v0.10) ─────────────────
+# Same shape as HttpsServer + Https.Serve but advertises ALPN
+# "http/1.1" (not "h2") and returns AmalgameH1Conn* on Accept.
+# Lets WebApp / Mosaic / Pollen Manager terminate TLS natively
+# without an nginx/Caddy proxy in front.
+HttpsH1Server_Listen         = { returns = "AmalgameHttpsH1Server*" }
+HttpsH1Server_IsListening    = { returns = "code_bool" }
+HttpsH1Server_Accept         = { returns = "AmalgameH1Conn*" }
+HttpsH1Server_Close          = { returns = "void" }
+HttpsH1Server_RawFd          = { returns = "i64" }
+Https_H1Serve                = { returns = "i64" }
+Https_H1ServeMt              = { returns = "i64" }
 
 # ── WsServer / WsConn / Ws.Serve — WebSocket server (v0.4) ───────
 WsServer_Listen              = { returns = "AmalgameWsServer*" }

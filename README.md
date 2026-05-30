@@ -42,22 +42,34 @@ public class Program {
 }
 ```
 
-### HTTPS server (via amalgame-tls)
+### HTTPS server (HTTP/1.1 over TLS, since v0.10.0)
 
 ```amalgame
 import Amalgame.Net.Http
-import Amalgame.Tls
 
-let tlsCfg = TlsConfig.Default()
-    .WithCertFile("cert.pem", "key.pem")
-    .WithAlpn("http/1.1")
-let tlsCtx = TlsContext.Server(tlsCfg)
-
-let srv = HttpServer.Listen(":443", tlsCtx)
-srv.Serve(fn(req) {
-    return HttpResponse.New().Text("Hello over HTTPS")
-})
+// Hand the cert + key paths to Https.H1Serve — it opens an OpenSSL
+// context with ALPN http/1.1, terminates TLS in-process, parses each
+// request as HTTP/1.1, and invokes your handler with an H1Conn whose
+// .ssl is set (recv/send dispatch through SSL_read/write).
+let handler = (conn: int) {
+    let req = HttpRequest.FromH1Conn(conn)
+    let resp = HttpResponse.New().Text("Hello over HTTPS")
+    resp.WriteToH1Conn(conn)
+}
+Https.H1Serve(443, "/etc/letsencrypt/live/example.com/fullchain.pem",
+                   "/etc/letsencrypt/live/example.com/privkey.pem",
+                   handler)
 ```
+
+The multi-thread variant (`Https.H1ServeMt`) accepts the same args
+and spawns one pthread per accepted TLS connection.
+
+Pair this with [`amalgame-tls`](https://github.com/amalgame-lang/amalgame-tls)
+(`AcmeNative.EnsureCert` + `AutoRenewTimer`) for a fully in-process
+HTTPS deployment — no reverse proxy needed.
+
+The older `Https.Serve` (HTTP/2-only, requires the client to negotiate
+h2 via ALPN) is still available for browsers that prefer h2.
 
 ### Client
 

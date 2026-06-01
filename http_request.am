@@ -203,6 +203,14 @@ public class HttpRequest {
                                               String_Length(req.RawTarget) - qIdx - 1)
             req.Query = HttpRequest.ParseQuery(q)
         }
+        // v0.12.2: percent-decode the path. The wire path is
+        // percent-encoded (e.g. "/%C3%A0-propos" for "/à-propos",
+        // "/a%20b.png" for "/a b.png"). Routing + static file lookup
+        // need the decoded form to match real route patterns and
+        // filenames on disk. Query already decodes per-param above;
+        // Path was previously left raw, so non-ASCII / spaced URLs
+        // 404'd against static mounts and catch-all routes.
+        req.Path = HttpRequest.UrlDecode(req.Path)
         return req
     }
 }

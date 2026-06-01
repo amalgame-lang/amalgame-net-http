@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.12.1"
+version           = "0.12.2"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.12.1: SNI (HttpsH1Server.AddSni — one HTTPS listener, per-domain certs) now sends the FULL chain (use_certificate_chain_file, fixes INCOMPLETE_CHAIN), plus HttpsH1Server.AcceptParsed (handshake + request parse) for custom HTTPS accept loops."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.12.2: percent-decode req.Path (non-ASCII / spaced URLs now match static files + routes). v0.12.1: SNI full chain (use_certificate_chain_file) + HttpsH1Server.AcceptParsed."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 

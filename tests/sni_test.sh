@@ -18,10 +18,19 @@ command -v openssl >/dev/null 2>&1 || { echo "[SKIP] openssl CLI absent"; exit 0
 
 B="$(mktemp -d)"; trap 'rm -rf "$B"; [ -n "${SRVPID:-}" ] && kill "$SRVPID" 2>/dev/null || true' EXIT
 
-# 2 certs auto-signés.
+# A throwaway CA, then a leaf per domain signed by it. The served cert
+# file for alpha is a FULLCHAIN (leaf + CA) so we can also check that
+# the server sends the whole chain (use_certificate_chain_file), not
+# just the leaf — that was the v0.12.1 INCOMPLETE_CHAIN fix.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "$B/ca.key" -out "$B/ca.crt" -subj "/CN=Test Intermediate CA" >/dev/null 2>&1
 for d in alpha.test beta.test; do
-    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-        -keyout "$B/$d.key" -out "$B/$d.crt" -subj "/CN=$d" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -keyout "$B/$d.key" -out "$B/$d.csr" \
+        -subj "/CN=$d" >/dev/null 2>&1
+    openssl x509 -req -in "$B/$d.csr" -CA "$B/ca.crt" -CAkey "$B/ca.key" \
+        -CAcreateserial -days 1 -out "$B/$d.leaf.crt" >/dev/null 2>&1
+    # fullchain = leaf + CA (intermediate)
+    cat "$B/$d.leaf.crt" "$B/ca.crt" > "$B/$d.crt"
 done
 
 PORT=18443
@@ -40,10 +49,13 @@ int main(void){
     Amalgame_Net_Http_HttpsH1Server_AddSni(s, "beta.test",
         "$B/beta.test.crt", "$B/beta.test.key");
     printf("ready\n"); fflush(stdout);
-    /* Accept a few handshakes then exit (the test makes 2 connections). */
-    for (int i = 0; i < 4; i++) {
-        AmalgameH1Conn* c = Amalgame_Net_Http_HttpsH1Server_Accept(s);
-        (void)c;  /* handshake done inside Accept; we don't need the request */
+    /* AcceptParsed: handshake + parse (covers the v0.12.1 parse fix —
+     * Accept alone leaves Method/Path/headers empty). The test makes a
+     * few probing connections; some send no request (s_client) so we
+     * tolerate NULL and just keep accepting. */
+    for (int i = 0; i < 6; i++) {
+        AmalgameH1Conn* c = Amalgame_Net_Http_HttpsH1Server_AcceptParsed(s);
+        (void)c;
     }
     return 0;
 }
@@ -73,4 +85,10 @@ fail=0
 echo "$A"    | grep -q "alpha.test" || { echo "[FAIL] alpha.test n'a pas reçu le cert alpha"; fail=1; }
 echo "$Bsub" | grep -q "beta.test"  || { echo "[FAIL] beta.test n'a pas reçu le cert beta (SNI cassé)"; fail=1; }
 
-[ "$fail" -eq 0 ] && echo "[PASS] SNI sert le bon cert par servername" || { echo "FAIL (SNI)"; exit 1; }
+# Chaîne complète : le serveur doit renvoyer leaf + CA (>= 2 certs),
+# sinon les clients/proxies stricts rejettent (INCOMPLETE_CHAIN).
+NCERTS="$(echo | openssl s_client -connect 127.0.0.1:$PORT -servername alpha.test -showcerts 2>/dev/null | grep -c 'BEGIN CERTIFICATE')"
+echo "alpha.test → $NCERTS cert(s) servis"
+[ "${NCERTS:-0}" -ge 2 ] || { echo "[FAIL] chaîne incomplète (leaf seul) — use_certificate_chain_file ?"; fail=1; }
+
+[ "$fail" -eq 0 ] && echo "[PASS] SNI + chaîne complète" || { echo "FAIL (SNI/chain)"; exit 1; }

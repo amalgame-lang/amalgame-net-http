@@ -1059,7 +1059,7 @@ static inline AmalgameHttpsServer* Amalgame_Net_Http_HttpsServer_ListenEx(
         else if (cfg->tls_min_version == 12) min_ver = TLS1_2_VERSION;
     }
     SSL_CTX_set_min_proto_version(ctx, min_ver);
-    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0 ||
         SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         SSL_CTX_free(ctx);
@@ -2357,7 +2357,7 @@ static SSL_CTX* amalgame_https_h1_make_ctx(code_string cert_file,
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) return NULL;
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0 ||
         SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_check_private_key(ctx) != 1) {
         ERR_print_errors_fp(stderr);
@@ -2413,7 +2413,7 @@ static inline AmalgameHttpsH1Server* Amalgame_Net_Http_HttpsH1Server_Listen(
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) { close(fd); s->fd = -1; return s; }
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0 ||
         SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0 ||
         SSL_CTX_check_private_key(ctx) != 1) {
         ERR_print_errors_fp(stderr);
@@ -2499,6 +2499,25 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
     if (inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf))) {
         snprintf(c->remote_addr, sizeof(c->remote_addr),
                  "%s:%u", ipbuf, (unsigned) ntohs(addr.sin_port));
+    }
+    return c;
+}
+
+/* Accept + parse the HTTP request in one call. HttpsH1Server_Accept only
+ * does the TLS handshake (Https_H1Serve parses afterwards); a custom
+ * accept loop in user code needs the request parsed too, or Method /
+ * Path / Header(...) come back empty. Returns a conn with headers
+ * populated, or NULL on handshake/parse failure or a closed listener.
+ *
+ * AM: public static AmalgameH1Conn* HttpsH1Server_AcceptParsed(server)
+ */
+static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_AcceptParsed(
+        AmalgameHttpsH1Server* s) {
+    AmalgameH1Conn* c = Amalgame_Net_Http_HttpsH1Server_Accept(s);
+    if (!c) return NULL;
+    if (amalgame_h1_parse_request(c) <= 0) {
+        Amalgame_Net_Http_H1Conn_Close(c);
+        return NULL;
     }
     return c;
 }
@@ -3834,7 +3853,7 @@ static inline AmalgameWssServer* Amalgame_Net_Http_WssServer_ListenEx(
         else if (cfg->tls_min_version == 12) min_ver = TLS1_2_VERSION;
     }
     SSL_CTX_set_min_proto_version(ctx, min_ver);
-    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0 ||
         SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
         SSL_CTX_free(ctx);

@@ -200,6 +200,17 @@ public class Program {
             Console.WriteLine("[FAIL] HeaderUnsafe was guarded")
         }
 
+        // v0.12.2: percent-decode (used to decode req.Path so non-ASCII
+        // / spaced URLs match static files + routes). UTF-8 multi-byte
+        // sequences decode byte-by-byte (%C3%A0 → "à").
+        if (HttpRequest.UrlDecode("/%C3%A0-propos") == "/à-propos"
+            && HttpRequest.UrlDecode("/a%20b.png") == "/a b.png") {
+            Console.WriteLine("[PASS] UrlDecode handles UTF-8 + spaces")
+        } else {
+            Console.WriteLine("[FAIL] UrlDecode got '"
+                + HttpRequest.UrlDecode("/%C3%A0-propos") + "'")
+        }
+
         Console.WriteLine("done")
     }
 }

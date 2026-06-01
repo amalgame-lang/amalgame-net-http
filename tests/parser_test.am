@@ -150,6 +150,25 @@ public class Program {
             Console.WriteLine("[FAIL] response parsing")
         }
 
+        // ── Chunked transfer-encoding (v0.13.2) ───────────────────
+        // Google's reCAPTCHA siteverify replies chunked; the raw body
+        // is "<hexsize>CRLF<data>CRLF…0CRLFCRLF" and must be de-chunked
+        // before Json.Parse sees it. Two chunks: 0xA ("0123456789") +
+        // 0x5 ("abcde") → "0123456789abcde".
+        let chunkedRaw: string = "HTTP/1.1 200 OK" + crlf
+            + "Content-Type: application/json" + crlf
+            + "Transfer-Encoding: chunked" + dcrlf
+            + "a" + crlf + "0123456789" + crlf
+            + "5" + crlf + "abcde" + crlf
+            + "0" + crlf + crlf
+        let respChunk: HttpResponse = HttpParser.ParseResponse(chunkedRaw)
+        if (respChunk != null && respChunk.BodyText == "0123456789abcde") {
+            Console.WriteLine("[PASS] chunked transfer-encoding decoded")
+        } else {
+            Console.WriteLine("[FAIL] chunked got '"
+                + respChunk.BodyText + "'")
+        }
+
         // ── Malformed input ───────────────────────────────────────
         let bad1: HttpRequest = HttpParser.ParseFull("garbage")
         if (bad1 == null) {

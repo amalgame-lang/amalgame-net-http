@@ -120,8 +120,14 @@ public class HttpClient {
             return HttpResponse.New().Status(0).Text("invalid url")
         }
         let isTls: bool = u.Scheme == "https"
-        let port: int = u.Port
-        if (port == 0) { port = isTls ? 443 : 80 }
+        var port: int = u.Port
+        // NB: pas de ternaire `? :` ici — amc le compile à tort en
+        // `port = isTls` (le `? 443 : 80` est ignoré par la cgen), ce
+        // qui donnait port=0 sur http:// → connect(:0) qui PEND. if/else
+        // explicite. Bug amc à corriger séparément.
+        if (port == 0) {
+            if (isTls) { port = 443 } else { port = 80 }
+        }
 
         // Build request bytes.
         let crlf: string = String_FromByte(13) + "\n"

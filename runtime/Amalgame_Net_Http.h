@@ -2315,12 +2315,57 @@ static inline int amalgame_h1_request_keep_alive(AmalgameH1Conn* c) {
  * OpenSSL's select_cb isn't invoked when the client doesn't request
  * ALPN, and we don't insist on it. */
 
+/* SNI: up to this many per-domain certs in addition to the default. */
+#ifndef AMALGAME_HTTPS_SNI_MAX
+#define AMALGAME_HTTPS_SNI_MAX 16
+#endif
+
 typedef struct AmalgameHttpsH1Server {
     int       fd;
     int32_t   listening;
     i64       port;
-    SSL_CTX*  ssl_ctx;
+    SSL_CTX*  ssl_ctx;                 /* default ctx (fallback / no-SNI) */
+    /* SNI table: client servername → ctx. The default ctx above is used
+     * when the SNI name matches none of these (or no SNI sent). */
+    int       sni_count;
+    char*     sni_names[AMALGAME_HTTPS_SNI_MAX];
+    SSL_CTX*  sni_ctxs[AMALGAME_HTTPS_SNI_MAX];
 } AmalgameHttpsH1Server;
+
+/* servername callback: pick the matching per-domain SSL_CTX at handshake
+ * time. arg = the AmalgameHttpsH1Server*. Case-insensitive exact match;
+ * falls through to the default ctx (already set on the SSL) otherwise. */
+static int amalgame_https_h1_sni_cb(SSL* ssl, int* al, void* arg) {
+    (void)al;
+    AmalgameHttpsH1Server* s = (AmalgameHttpsH1Server*) arg;
+    if (!s || s->sni_count <= 0) return SSL_TLSEXT_ERR_OK;
+    const char* name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (!name) return SSL_TLSEXT_ERR_OK;
+    for (int i = 0; i < s->sni_count; i++) {
+        if (s->sni_names[i] && strcasecmp(s->sni_names[i], name) == 0) {
+            SSL_set_SSL_CTX(ssl, s->sni_ctxs[i]);
+            return SSL_TLSEXT_ERR_OK;
+        }
+    }
+    return SSL_TLSEXT_ERR_OK;   /* unknown host → default cert */
+}
+
+/* Build a server-side SSL_CTX from a cert+key PEM pair. Returns NULL on
+ * error (caller logs). Shared by the plain and SNI listen paths. */
+static SSL_CTX* amalgame_https_h1_make_ctx(code_string cert_file,
+                                           code_string key_file) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) return NULL;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (SSL_CTX_use_certificate_file(ctx, cert_file, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file (ctx, key_file,  SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_check_private_key(ctx) != 1) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
 
 static int amalgame_https_h1_alpn_select_cb(SSL* ssl,
         const unsigned char** out, unsigned char* outlen,
@@ -2375,11 +2420,51 @@ static inline AmalgameHttpsH1Server* Amalgame_Net_Http_HttpsH1Server_Listen(
         SSL_CTX_free(ctx); close(fd); s->fd = -1; return s;
     }
     SSL_CTX_set_alpn_select_cb(ctx, amalgame_https_h1_alpn_select_cb, NULL);
+    /* Arm SNI on the default ctx: at handshake the callback may swap in
+     * a per-domain ctx added via HttpsH1Server_AddSni. With no AddSni
+     * calls (sni_count == 0) the callback is a no-op and this stays a
+     * plain single-cert listener — fully backwards compatible. */
+    SSL_CTX_set_tlsext_servername_callback(ctx, amalgame_https_h1_sni_cb);
+    SSL_CTX_set_tlsext_servername_arg(ctx, s);
     s->ssl_ctx   = ctx;
+    s->sni_count = 0;
     s->listening = 1;
     Amalgame_Net_Http_InstallShutdownSignals();
     amalgame_net_http_register_listen_fd(s->fd);
     return s;
+}
+
+/* Register an additional cert/key for a specific servername (SNI).
+ * Call after HttpsH1Server_Listen, before accepting. Returns 1 on
+ * success, 0 on error (bad cert/key, table full, server not listening).
+ *
+ * AM: public static bool HttpsH1Server_AddSni(AmalgameHttpsH1Server* s,
+ *                          string name, string certFile, string keyFile)
+ */
+static inline code_bool Amalgame_Net_Http_HttpsH1Server_AddSni(
+        AmalgameHttpsH1Server* s, code_string name,
+        code_string cert_file, code_string key_file) {
+    if (!s || !s->listening) return 0;
+    if (s->sni_count >= AMALGAME_HTTPS_SNI_MAX) {
+        fprintf(stderr, "HttpsH1Server_AddSni: SNI table full (max %d)\n",
+                AMALGAME_HTTPS_SNI_MAX);
+        return 0;
+    }
+    if (!name || !name[0] || !cert_file || !cert_file[0]
+        || !key_file || !key_file[0]) return 0;
+    SSL_CTX* c = amalgame_https_h1_make_ctx(cert_file, key_file);
+    if (!c) {
+        fprintf(stderr, "HttpsH1Server_AddSni: bad cert/key for %s\n", name);
+        return 0;
+    }
+    SSL_CTX_set_alpn_select_cb(c, amalgame_https_h1_alpn_select_cb, NULL);
+    int n = s->sni_count;
+    size_t nl = strlen(name);
+    s->sni_names[n] = (char*) GC_MALLOC_ATOMIC(nl + 1);
+    memcpy(s->sni_names[n], name, nl + 1);
+    s->sni_ctxs[n]  = c;
+    s->sni_count    = n + 1;
+    return 1;
 }
 
 static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
@@ -2553,6 +2638,9 @@ static inline AmalgameHttpsH1Server* Amalgame_Net_Http_HttpsH1Server_Listen(
     (void)p;(void)c;(void)k;(void)b; return NULL; }
 static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
         AmalgameHttpsH1Server* s) { (void)s; return NULL; }
+static inline code_bool Amalgame_Net_Http_HttpsH1Server_AddSni(
+        AmalgameHttpsH1Server* s, code_string n, code_string c, code_string k) {
+    (void)s;(void)n;(void)c;(void)k; return 0; }
 static inline void Amalgame_Net_Http_HttpsH1Server_Close(AmalgameHttpsH1Server* s) {
     (void)s; }
 static inline code_bool Amalgame_Net_Http_HttpsH1Server_IsListening(

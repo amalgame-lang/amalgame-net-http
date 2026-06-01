@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.11.1"
+version           = "0.12.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.11.1 ships HttpResponse.WriteToH1Conn that finally serializes Location / Set-Cookie / CSP / arbitrary headers from the Headers map (long-standing bug — only Content-Type made the wire before)."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.12.0 adds SNI: HttpsH1Server_AddSni registers a per-domain cert so one HTTPS listener serves several domains (multi-site TLS, no SNI before)."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 
@@ -223,6 +223,7 @@ Https_ServeWith              = { returns = "i64" }
 # Lets WebApp / Mosaic / Pollen Manager terminate TLS natively
 # without an nginx/Caddy proxy in front.
 HttpsH1Server_Listen         = { returns = "AmalgameHttpsH1Server*" }
+HttpsH1Server_AddSni         = { returns = "code_bool" }
 HttpsH1Server_IsListening    = { returns = "code_bool" }
 HttpsH1Server_Accept         = { returns = "AmalgameH1Conn*" }
 HttpsH1Server_Close          = { returns = "void" }

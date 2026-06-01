@@ -7,10 +7,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Runtime dirs. run_tests.sh passes ASYNC_RT / TLS_RT (resolved from
+# env vars or sibling repos — the CI has no ~/.amalgame cache). Fall
+# back to the local package cache for standalone runs.
 RT="${AMC_RUNTIME:-$HOME/.local/share/amalgame/runtime}"
-ASYNC="$(ls -d "$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-async"/*/ 2>/dev/null | sort -V | tail -1)"
-TLS="$(ls -d "$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-tls"/*/ 2>/dev/null | sort -V | tail -1)"
+ASYNC_RT="${ASYNC_RT:-$(ls -d "$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-async"/*/runtime 2>/dev/null | sort -V | tail -1)}"
+TLS_RT="${TLS_RT:-$(ls -d "$HOME/.amalgame/packages/github.com/amalgame-lang/amalgame-tls"/*/runtime 2>/dev/null | sort -V | tail -1)}"
 [ -d "$RT" ] || { echo "AMC_RUNTIME introuvable"; exit 1; }
+command -v openssl >/dev/null 2>&1 || { echo "[SKIP] openssl CLI absent"; exit 0; }
 
 B="$(mktemp -d)"; trap 'rm -rf "$B"; [ -n "${SRVPID:-}" ] && kill "$SRVPID" 2>/dev/null || true' EXIT
 
@@ -45,8 +49,10 @@ int main(void){
 }
 EOF
 
-gcc -O2 -Iruntime -I"$RT" -I"$ASYNC/runtime" -I"$TLS/runtime" \
-    "$B/srv.c" -lssl -lcrypto -lgc -lnghttp2 -lpthread -o "$B/srv"
+if ! gcc -O2 -Iruntime -I"$RT" -I"$ASYNC_RT" -I"$TLS_RT" \
+    "$B/srv.c" -lssl -lcrypto -lgc -lnghttp2 -lpthread -o "$B/srv" 2>"$B/gcc.log"; then
+    echo "[FAIL] build du serveur SNI de test:"; head -10 "$B/gcc.log"; exit 1
+fi
 
 "$B/srv" > "$B/srv.out" 2>/dev/null &
 SRVPID=$!

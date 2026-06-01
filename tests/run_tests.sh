@@ -962,7 +962,7 @@ fi
 
 # ── SNI: one HTTPS listener, per-domain certs (v0.12.0) ──────────
 echo -e "\n── SNI (HttpsH1Server_AddSni) ──"
-if AMC_RUNTIME="$RUNTIME_DIR" bash tests/sni_test.sh; then
+if AMC_RUNTIME="$RUNTIME_DIR" ASYNC_RT="$ASYNC_RUNTIME_DIR" TLS_RT="$TLS_RUNTIME_DIR" bash tests/sni_test.sh; then
     echo -e "${GREEN}PASS${NC} (SNI: bon cert par servername)"
 else
     echo -e "${RED}FAIL${NC} (SNI)"

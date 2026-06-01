@@ -2473,6 +2473,18 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
     struct sockaddr_in addr; socklen_t alen = sizeof(addr);
     int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
     if (cfd < 0) return NULL;
+    /* Bound the TLS handshake with a recv/send timeout. SSL_accept runs
+     * inline in the accept loop; without this a slow or malicious client
+     * (port scanners that open a connection and send nothing, or the
+     * "https proxy request" probes that hit :443) blocks SSL_accept
+     * forever — and since it's reading the *client* socket, shutting down
+     * the listen fd on SIGINT can't wake it, so the whole server hangs on
+     * Ctrl-C. A 15 s ceiling makes the loop return to its IsStopping()
+     * check and doubles as slowloris hardening. Cleared (0 = no timeout)
+     * after a successful handshake so keep-alive reads aren't affected. */
+    struct timeval hs_to; hs_to.tv_sec = 15; hs_to.tv_usec = 0;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &hs_to, sizeof(hs_to));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &hs_to, sizeof(hs_to));
     SSL* ssl = SSL_new(s->ssl_ctx);
     if (!ssl) { close(cfd); return NULL; }
     SSL_set_fd(ssl, cfd);
@@ -2491,6 +2503,11 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
         SSL_shutdown(ssl); SSL_free(ssl); close(cfd);
         return NULL;
     }
+    /* Handshake done — clear the timeout so keep-alive idle waits aren't
+     * cut short (ServeConnOn drives its own idle deadline). */
+    struct timeval no_to; no_to.tv_sec = 0; no_to.tv_usec = 0;
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &no_to, sizeof(no_to));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &no_to, sizeof(no_to));
     AmalgameH1Conn* c = (AmalgameH1Conn*) GC_MALLOC(sizeof(AmalgameH1Conn));
     memset(c, 0, sizeof(*c));
     c->fd  = cfd;

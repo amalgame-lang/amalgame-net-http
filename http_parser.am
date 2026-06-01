@@ -132,7 +132,96 @@ public class HttpParser {
         }
 
         let bodyStart: int = idx + 4
-        resp.BodyText = String_Substring(raw, bodyStart, String_Length(raw) - bodyStart)
+        var body: string = String_Substring(raw, bodyStart, String_Length(raw) - bodyStart)
+
+        // Transfer-Encoding: chunked → de-chunk before handing the body
+        // back. Servers like Google's reCAPTCHA siteverify reply chunked,
+        // so the raw body is "<hexsize>CRLF<data>CRLF…0CRLFCRLF" and a
+        // naive consumer (e.g. Json.Parse) chokes on the size prefixes.
+        // Header names are stored as received (mixed case), so match
+        // case-insensitively.
+        let te: string = String_ToLower(HttpParser.HeaderValue(resp, "transfer-encoding"))
+        if (String_IndexOf(te, "chunked") >= 0) {
+            body = HttpParser.DeChunk(body)
+        }
+        resp.BodyText = body
         return resp
+    }
+
+    // Look up a response header case-insensitively (ParseResponse stores
+    // names verbatim). Returns "" when absent.
+    public static string HeaderValue(HttpResponse resp, string lowerName) {
+        let keys: List<string> = resp.Headers.Keys()
+        let n: int = keys.Count()
+        for i in 0..n {
+            let k: string = keys.Get(i)
+            if (String_ToLower(k) == lowerName) { return resp.Headers.Get(k) }
+        }
+        return ""
+    }
+
+    // Decode an HTTP/1.1 chunked transfer-encoding body into the raw
+    // payload. Each chunk is "<hex-size>[;ext]CRLF<data>CRLF"; a final
+    // "0CRLF" (optionally followed by trailers + CRLF) ends the stream.
+    // Tolerant: stops on a malformed size or when the data runs short.
+    public static string DeChunk(string body) {
+        let crlf: string = HttpParser.Crlf()
+        let clen: int = String_Length(crlf)
+        let total: int = String_Length(body)
+        var out: string = ""
+        var pos: int = 0
+        while (pos < total) {
+            let sub: string = String_Substring(body, pos, total - pos)
+            let nl: int = String_IndexOf(sub, crlf)
+            if (nl < 0) { break }
+            var sizeLine: string = String_Substring(sub, 0, nl)
+            let semi: int = String_IndexOf(sizeLine, ";")   // drop chunk-extensions
+            if (semi >= 0) { sizeLine = String_Substring(sizeLine, 0, semi) }
+            let size: int = HttpParser.ParseHex(String_Trim(sizeLine))
+            if (size <= 0) { break }                          // 0 = last chunk
+            let dataStart: int = pos + nl + clen
+            if (dataStart + size > total) {
+                out = out + String_Substring(body, dataStart, total - dataStart)
+                break
+            }
+            out = out + String_Substring(body, dataStart, size)
+            pos = dataStart + size + clen                     // skip data + trailing CRLF
+        }
+        return out
+    }
+
+    // Parse a lowercase/uppercase hex string to int. Returns 0 on the
+    // empty string; stops at the first non-hex character.
+    public static int ParseHex(string s) {
+        let n: int = String_Length(s)
+        var v: int = 0
+        for i in 0..n {
+            let d: int = HttpParser.HexNibble(String_CharAt1(s, i))
+            if (d < 0) { break }
+            v = v * 16 + d
+        }
+        return v
+    }
+
+    // Single hex digit char → 0-15, or -1. (HttpRequest.HexDigit is
+    // private; this mirrors it for the parser's chunk-size decoding.)
+    private static int HexNibble(string c) {
+        if (c == "0") { return 0 }
+        if (c == "1") { return 1 }
+        if (c == "2") { return 2 }
+        if (c == "3") { return 3 }
+        if (c == "4") { return 4 }
+        if (c == "5") { return 5 }
+        if (c == "6") { return 6 }
+        if (c == "7") { return 7 }
+        if (c == "8") { return 8 }
+        if (c == "9") { return 9 }
+        if (c == "a" || c == "A") { return 10 }
+        if (c == "b" || c == "B") { return 11 }
+        if (c == "c" || c == "C") { return 12 }
+        if (c == "d" || c == "D") { return 13 }
+        if (c == "e" || c == "E") { return 14 }
+        if (c == "f" || c == "F") { return 15 }
+        return -1
     }
 }

@@ -2522,6 +2522,65 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_AcceptParsed(
     return c;
 }
 
+/* HTTPS keep-alive: accept ONE TLS connection (handshake), then loop
+ * parse→handler→ResetForReuse on the SAME connection while the client
+ * keeps it open (HTTP/1.1 default unless Connection: close). One TLS
+ * handshake serves every request of a page (page + favicon + assets),
+ * instead of a fresh handshake per asset. `idle_timeout_sec` bounds the
+ * wait for the next request (SO_RCVTIMEO on the fd → recv EAGAIN →
+ * parse returns -1 → loop ends). Custom accept loops (e.g. a SNI multi-
+ * site dispatcher) call this per accepted connection, ideally in a
+ * worker thread so handshakes of distinct clients run in parallel.
+ *
+ * Returns 0 always (the per-connection lifecycle is fully handled:
+ * handshake, request loop, close). Returns -1 only if the handshake
+ * failed (nothing to serve).
+ *
+ * AM: public static int HttpsH1Server_ServeConn(server, handler, idleSec)
+ */
+static inline i64 Amalgame_Net_Http_HttpsH1Server_ServeConnOn(
+        AmalgameH1Conn* conn, AmalgameClosure* handler, i64 idle_timeout_sec);
+
+static inline i64 Amalgame_Net_Http_HttpsH1Server_ServeConn(
+        AmalgameHttpsH1Server* s, AmalgameClosure* handler, i64 idle_timeout_sec) {
+    if (!handler) return -1;
+    AmalgameH1Conn* conn = Amalgame_Net_Http_HttpsH1Server_Accept(s);  /* TLS handshake */
+    if (!conn) return -1;
+    return Amalgame_Net_Http_HttpsH1Server_ServeConnOn(conn, handler, idle_timeout_sec);
+}
+
+/* Same keep-alive request loop as ServeConn, but on a connection the
+ * caller has ALREADY accepted (TLS handshake done). Lets a custom loop
+ * accept in the main thread (serial, cheap) and hand each conn to a
+ * worker thread for the request loop — bounded concurrency, no
+ * thread-spawn storm. Takes ownership of conn (closes it at the end).
+ *
+ * AM: public static int HttpsH1Server_ServeConnOn(conn, handler, idleSec)
+ */
+static inline i64 Amalgame_Net_Http_HttpsH1Server_ServeConnOn(
+        AmalgameH1Conn* conn, AmalgameClosure* handler, i64 idle_timeout_sec) {
+    if (!conn) return -1;
+    if (!handler) { Amalgame_Net_Http_H1Conn_Close(conn); return -1; }
+    int keep_alive_enabled = idle_timeout_sec > 0 ? 1 : 0;
+    /* Bound the idle wait between requests. */
+    if (keep_alive_enabled) {
+        struct timeval tv;
+        tv.tv_sec  = (time_t) idle_timeout_sec;
+        tv.tv_usec = 0;
+        setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    while (1) {
+        int parsed = amalgame_h1_parse_request(conn);
+        if (parsed <= 0) break;
+        conn->keep_alive = keep_alive_enabled ? amalgame_h1_request_keep_alive(conn) : 0;
+        AmalgameClosure_call1(handler, (void*) conn);
+        if (!conn->keep_alive) break;
+        Amalgame_Net_Http_H1Conn_ResetForReuse(conn);
+    }
+    Amalgame_Net_Http_H1Conn_Close(conn);
+    return 0;
+}
+
 static inline void Amalgame_Net_Http_HttpsH1Server_Close(AmalgameHttpsH1Server* s) {
     if (!s) return;
     amalgame_net_http_unregister_listen_fd(s->fd);

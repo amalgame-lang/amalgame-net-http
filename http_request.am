@@ -150,11 +150,10 @@ public class HttpRequest {
     // / ServeMtWith). Bundles every getter the parser exposes —
     // Method / Path / RawTarget / Body / RemoteAddr.
     //
-    // Headers are NOT bulk-iterated here (the H1Conn API exposes
-    // header lookup by name but not bulk enumeration); callers who
-    // need a specific header should use H1Conn.Header(conn, name)
-    // directly or extend this bridge in a future version that adds
-    // enumeration support to the parser.
+    // v0.13.6: all request headers are now copied into req.Headers
+    // (lowercased keys), so handlers/middlewares read Host / Cookie /
+    // Authorization / … directly. H1Conn.Header(conn, name) still
+    // works for one-off lookups.
     //
     // RemoteAddr (e.g. "192.0.2.1:54321") populated from the
     // accepted socket's peer name where the parser tracks it.
@@ -187,6 +186,17 @@ public class HttpRequest {
                  * back to allow. */
                 if (c->remote_addr[0]) {
                     req->RemoteAddr = (code_string) c->remote_addr;
+                }
+                /* v0.13.6: copy every request header into req->Headers
+                 * (names already lowercased by the parser), so handlers
+                 * and middlewares on the live H1 path can read Host /
+                 * Cookie / Authorization / Content-Type / … — previously
+                 * this map was left empty and only H1Conn.Header(conn,
+                 * name) could reach a header. */
+                for (int hi = 0; hi < c->header_count; hi++) {
+                    AmalgameMap_set((AmalgameMap*) req->Headers,
+                                    (code_string) c->headers[hi].name,
+                                    (void*) c->headers[hi].value);
                 }
             }
         }

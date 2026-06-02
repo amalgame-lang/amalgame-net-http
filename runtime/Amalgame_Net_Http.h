@@ -1113,9 +1113,14 @@ static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
     SSL_set_fd(ssl, cfd);
     int rv = SSL_accept(ssl);
     if (rv != 1) {
-        int err = SSL_get_error(ssl, rv);
-        fprintf(stderr, "Https.Serve: TLS handshake failed (SSL err %d)\n", err);
-        ERR_print_errors_fp(stderr);
+        /* Routine on a public :443 (scanners, old clients) — silent unless
+         * AMALGAME_TLS_DEBUG. Clear the OpenSSL error queue. */
+        if (getenv("AMALGAME_TLS_DEBUG")) {
+            int err = SSL_get_error(ssl, rv);
+            fprintf(stderr, "Https.Serve: TLS handshake failed (SSL err %d)\n", err);
+            ERR_print_errors_fp(stderr);
+        }
+        ERR_clear_error();
         SSL_free(ssl);
         close(cfd);
         return NULL;
@@ -2490,16 +2495,28 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
     SSL_set_fd(ssl, cfd);
     int rv = SSL_accept(ssl);
     if (rv != 1) {
-        int err = SSL_get_error(ssl, rv);
-        fprintf(stderr, "Https.H1Serve: TLS handshake failed (SSL err %d)\n", err);
-        ERR_print_errors_fp(stderr);
+        /* Failed handshakes are ROUTINE on a public :443 — port scanners,
+         * old/SSLv3 clients, plain-HTTP-to-HTTPS mistakes, slowloris cut at
+         * the recv timeout. Logging each (with the OpenSSL error dump) just
+         * spams stderr. Stay silent by default like nginx/apache; opt in to
+         * the diagnostic via AMALGAME_TLS_DEBUG. Clear the error queue so a
+         * stale entry can't leak into a later SSL op. */
+        if (getenv("AMALGAME_TLS_DEBUG")) {
+            int err = SSL_get_error(ssl, rv);
+            fprintf(stderr, "Https.H1Serve: TLS handshake failed (SSL err %d)\n", err);
+            ERR_print_errors_fp(stderr);
+        }
+        ERR_clear_error();
         SSL_free(ssl); close(cfd);
         return NULL;
     }
     const unsigned char* alpn = NULL; unsigned int alen2 = 0;
     SSL_get0_alpn_selected(ssl, &alpn, &alen2);
     if (alen2 != 0 && (alen2 != 8 || memcmp(alpn, "http/1.1", 8) != 0)) {
-        fprintf(stderr, "Https.H1Serve: client picked non-h1 ALPN\n");
+        if (getenv("AMALGAME_TLS_DEBUG")) {
+            fprintf(stderr, "Https.H1Serve: client picked non-h1 ALPN\n");
+        }
+        ERR_clear_error();
         SSL_shutdown(ssl); SSL_free(ssl); close(cfd);
         return NULL;
     }

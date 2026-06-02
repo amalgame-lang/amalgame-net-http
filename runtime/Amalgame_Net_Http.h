@@ -1880,6 +1880,11 @@ static inline code_string Amalgame_Net_Http_H1Conn_Path(AmalgameH1Conn* c) {
 static inline code_string Amalgame_Net_Http_H1Conn_RawTarget(AmalgameH1Conn* c) {
     return (c && c->raw_target) ? c->raw_target : "";
 }
+/* Peer "ip:port" captured at accept time. Lets AM read the client IP
+ * (e.g. for geoip) without an @c cast into the struct. */
+static inline code_string Amalgame_Net_Http_H1Conn_RemoteAddr(AmalgameH1Conn* c) {
+    return (c && c->remote_addr[0]) ? c->remote_addr : "";
+}
 static inline code_string Amalgame_Net_Http_H1Conn_Header(AmalgameH1Conn* c,
                                                           code_string name) {
     if (!c || !name) return "";

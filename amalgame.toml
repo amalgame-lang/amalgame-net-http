@@ -24,7 +24,7 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.13.3"
+version           = "0.13.4"
 license           = "Apache-2.0"
 description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.13.0: HTTPS keep-alive — HttpsH1Server.ServeConn/ServeConnOn loop parse→handler→ResetForReuse on one TLS connection (one handshake per page, not per asset), for custom SNI/multi-site accept loops. v0.12.2: req.Path percent-decode. v0.12.1: SNI full chain + AcceptParsed."
 required-amalgame = ">=0.8.58"

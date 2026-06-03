@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.13.6"
+version           = "0.14.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.13.0: HTTPS keep-alive — HttpsH1Server.ServeConn/ServeConnOn loop parse→handler→ResetForReuse on one TLS connection (one handshake per page, not per asset), for custom SNI/multi-site accept loops. v0.12.2: req.Path percent-decode. v0.12.1: SNI full chain + AcceptParsed."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.14.0: response streaming primitives (H1Conn.BeginStream / WriteRaw / WriteRawBytes / Flush) for SSE + long-poll, and H1Conn.BodyByteAt for binary-safe multipart parsing. v0.13.0: HTTPS keep-alive — HttpsH1Server.ServeConn/ServeConnOn loop parse→handler→ResetForReuse on one TLS connection (one handshake per page, not per asset), for custom SNI/multi-site accept loops. v0.12.2: req.Path percent-decode. v0.12.1: SNI full chain + AcceptParsed."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 
@@ -95,6 +95,10 @@ H1Conn_RemoteAddr            = { returns = "code_string" }
 H1Conn_Header                = { returns = "code_string" }
 H1Conn_Body                  = { returns = "code_string" }
 H1Conn_BodyLen               = { returns = "i64" }
+# v0.14.0 — raw body byte at index i (0..BodyLen-1) as i64 0..255, -1
+# out of range. H1Conn_Body truncates at the first NUL (code_string);
+# this walks the binary buffer byte-by-byte for the multipart parser.
+H1Conn_BodyByteAt            = { returns = "i64" }
 H1Conn_Respond               = { returns = "void" }
 # v0.11.1 — caller-supplied header block (Location, Set-Cookie,
 # CSP, …). headers_block is "Name: Value\r\n"-formatted; the C
@@ -114,6 +118,15 @@ H1Conn_Close                 = { returns = "void" }
 # Pair with amalgame-async ≥ v0.2.0: MakeNonBlocking +
 # WaitFdReadable / WaitFdWritable around non-blocking recv / send.
 H1Conn_RawFd                 = { returns = "i64" }
+# v0.14.0 — response streaming primitives (SSE / long-poll). BeginStream
+# emits status + caller headers with NO Content-Length (Connection: close
+# framing), forces keep_alive=0 so the keep-alive loop closes after the
+# handler returns. WriteRaw/WriteRawBytes push frames (0 ok, -1 peer gone).
+# Flush is a no-op on the blocking path (API symmetry / future async hook).
+H1Conn_BeginStream           = { returns = "i64" }
+H1Conn_WriteRaw              = { returns = "i64" }
+H1Conn_WriteRawBytes         = { returns = "i64" }
+H1Conn_Flush                 = { returns = "i64" }
 # v0.5.0: keep-alive helpers. ResetForReuse clears per-request state
 # (keeps fd / config / keep_alive intact) so the parser can reuse the
 # struct for the next request on the same connection.

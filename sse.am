@@ -1,0 +1,107 @@
+// amalgame-net-http — Server-Sent Events connection (v0.16.0).
+//
+// Thin AM wrapper over the v0.14.0 streaming primitives (H1Conn
+// BeginStream / WriteRaw / Close). A handler that wants to push events
+// opens an SseConn on its live H1 connection, then loops Send()-ing
+// frames until the peer disconnects (Send returns false). The response
+// is framed with Connection: close (BeginStream forces it), so the
+// keep-alive loop closes the socket when the handler returns.
+//
+//   let s = SseConn.Open(conn)            // emits 200 + text/event-stream
+//   while (s.Send("tick " + String_FromInt(n))) { ... DateTime.SleepMillis(1000) ... }
+//
+// The conn is the int (pointer-as-i64) handle every H1 handler already
+// receives — same convention as HttpRequest.FromH1Conn.
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+public class SseConn {
+    public Conn: int
+
+    public SseConn() { this.Conn = 0 }
+
+    // Open the stream: status 200 + the SSE headers (text/event-stream,
+    // no-cache, X-Accel-Buffering off to defeat proxy buffering).
+    public static SseConn Open(conn: int) {
+        var s: SseConn = new SseConn()
+        s.Conn = conn
+        let crlf: string = String_FromByte(13) + String_FromByte(10)
+        var hdrs: string = "Content-Type: text/event-stream" + crlf
+        hdrs = hdrs + "Cache-Control: no-cache, no-transform" + crlf
+        hdrs = hdrs + "X-Accel-Buffering: no" + crlf
+        @c {
+            AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+            if (c) {
+                Amalgame_Net_Http_H1Conn_BeginStream(c, (i64) 200, (code_string) hdrs);
+            }
+        }
+        return s
+    }
+
+    // Send a `data:` event. Multi-line payloads are split into one
+    // `data:` line each (SSE requires it). Returns false if the peer is
+    // gone — the caller's loop should stop.
+    public bool Send(string data) {
+        return this.writeRaw(SseConn.dataFrame("", data, ""))
+    }
+
+    // Send a named event with optional id.
+    public bool SendEvent(string event, string data, string id) {
+        return this.writeRaw(SseConn.dataFrame(event, data, id))
+    }
+
+    // Send a comment line (`: ...`) — handy as a keep-alive heartbeat
+    // that detects a dead peer without delivering an event.
+    public bool Comment(string s) {
+        return this.writeRaw(": " + s + "\n\n")
+    }
+
+    // Suggest a client reconnect delay (ms).
+    public bool Retry(int ms) {
+        return this.writeRaw("retry: " + String_FromInt(ms) + "\n\n")
+    }
+
+    public void Close() {
+        let conn: int = this.Conn
+        @c {
+            AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+            if (c) { Amalgame_Net_Http_H1Conn_Close(c); }
+        }
+    }
+
+    // ── internals ───────────────────────────────────────────────────
+
+    // Build an SSE frame: optional `event:` / `id:` lines + one
+    // `data:` line per LF-separated chunk + the terminating blank line.
+    static string dataFrame(string event, string data, string id) {
+        let lf: string = String_FromByte(10)
+        var frame: string = ""
+        if (String_Length(event) > 0) { frame = frame + "event: " + event + "\n" }
+        if (String_Length(id) > 0)    { frame = frame + "id: " + id + "\n" }
+        let lines: List<string> = String_Split(data, lf)
+        let n: int = lines.Count()
+        var i: int = 0
+        while (i < n) {
+            frame = frame + "data: " + lines.Get(i) + "\n"
+            i = i + 1
+        }
+        frame = frame + "\n"
+        return frame
+    }
+
+    bool writeRaw(string frame) {
+        var ok: bool = false
+        let conn: int = this.Conn
+        @c {
+            AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+            if (c) {
+                i64 rc = Amalgame_Net_Http_H1Conn_WriteRaw(c, (code_string) frame);
+                ok = (rc == 0) ? 1 : 0;
+            }
+        }
+        return ok
+    }
+}

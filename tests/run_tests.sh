@@ -368,6 +368,48 @@ else
     exit 1
 fi
 
+# ── v0.17.0: WebSocket subprotocol negotiation ────────────────────
+echo -e "\n── WS subprotocol negotiation (pick_subprotocol) ──"
+cat > "$BUILD_DIR/wsproto_smoke.c" <<'EOF'
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    GC_INIT();
+    char out[128];
+    int ok = 1;
+    // first client offer that the server supports wins
+    if (!(amalgame_ws_pick_subprotocol("chat, superchat", "superchat, chat", out, sizeof(out)) == 1
+          && strcmp(out, "chat") == 0)) { ok = 0; printf("c1 out=%s\n", out); }
+    // server order doesn't matter; client preference does
+    if (!(amalgame_ws_pick_subprotocol("v2.json, v1", "v1, v2.json", out, sizeof(out)) == 1
+          && strcmp(out, "v2.json") == 0)) { ok = 0; printf("c2 out=%s\n", out); }
+    // case-insensitive token match
+    if (!(amalgame_ws_pick_subprotocol("GraphQL-WS", "graphql-ws", out, sizeof(out)) == 1)) { ok = 0; printf("c3\n"); }
+    // no overlap → 0
+    if (amalgame_ws_pick_subprotocol("a, b", "c, d", out, sizeof(out)) != 0) { ok = 0; printf("c4\n"); }
+    // empty offer / empty server → 0
+    if (amalgame_ws_pick_subprotocol("", "chat", out, sizeof(out)) != 0) { ok = 0; printf("c5\n"); }
+    if (amalgame_ws_pick_subprotocol("chat", "", out, sizeof(out)) != 0) { ok = 0; printf("c6\n"); }
+    printf(ok ? "PASS\n" : "FAIL\n");
+    return ok ? 0 : 1;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/wsproto_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/wsproto_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/wsproto_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (wsproto smoke build)"
+    exit 1
+fi
+WP_OUT=$("$BUILD_DIR/wsproto_smoke")
+echo "$WP_OUT"
+if echo "$WP_OUT" | grep -q "^PASS$"; then
+    echo -e "${GREEN}PASS${NC} (WS subprotocol negotiation)"
+else
+    echo -e "${RED}FAIL${NC} (WS subprotocol negotiation broken)"
+    exit 1
+fi
+
 # ── End-to-end (server + client as separate processes) ────────────
 echo -e "\n── End-to-end test (server + client) ──"
 build_test tests/server_test.am "$BUILD_DIR/server_test" || { echo "server build failed"; exit 1; }

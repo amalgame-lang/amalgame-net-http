@@ -1,0 +1,87 @@
+// Unit tests for Multipart (v0.14.1) — no sockets.
+//
+// Builds a multipart/form-data body as a string and parses it via
+// Multipart.Parse(req). BodyPtr stays 0, so the parser uses the
+// bytesFromStr fallback (ASCII test data) — exercising the same
+// boundary/header/part logic as the live binary path.
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+
+public class Program {
+    static int check(string label, string got, string want) {
+        if (got == want) {
+            Console.WriteLine("[PASS] " + label)
+            return 0
+        }
+        Console.WriteLine("[FAIL] " + label + " — got <" + got + "> want <" + want + ">")
+        return 1
+    }
+
+    static int checkTrue(string label, bool cond) {
+        if (cond) { Console.WriteLine("[PASS] " + label); return 0 }
+        Console.WriteLine("[FAIL] " + label)
+        return 1
+    }
+
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-http — Multipart tests")
+        var failed: int = 0
+
+        let CRLF: string = String_FromByte(13) + String_FromByte(10)
+        let b: string = "BOUNDARY123"
+
+        var body: string = "--" + b + CRLF
+        body = body + "Content-Disposition: form-data; name=\"title\"" + CRLF
+        body = body + CRLF
+        body = body + "Hello World" + CRLF
+        body = body + "--" + b + CRLF
+        body = body + "Content-Disposition: form-data; name=\"avatar\"; filename=\"a.txt\"" + CRLF
+        body = body + "Content-Type: text/plain" + CRLF
+        body = body + CRLF
+        body = body + "ABCxyz" + CRLF
+        body = body + "--" + b + "--" + CRLF
+
+        var req: HttpRequest = new HttpRequest()
+        req.Headers.Set("content-type", "multipart/form-data; boundary=" + b)
+        req.Body = body
+
+        failed = failed + Program.checkTrue("IsMultipart", req.IsMultipart())
+
+        let mp: Multipart = Multipart.Parse(req)
+
+        // text field
+        failed = failed + Program.check("text field value", mp.Field("title"), "Hello World")
+
+        // file part
+        let f: UploadedFile = mp.File("avatar")
+        failed = failed + Program.checkTrue("file present", f != null)
+        if (f != null) {
+            failed = failed + Program.check("file name", f.Name, "avatar")
+            failed = failed + Program.check("file filename", f.Filename, "a.txt")
+            failed = failed + Program.check("file content-type", f.ContentType, "text/plain")
+            failed = failed + Program.check("file text", f.Text(), "ABCxyz")
+            failed = failed + Program.checkTrue("file size==6", f.Size() == 6)
+        }
+
+        // counts: exactly one file, one field
+        failed = failed + Program.checkTrue("one file", mp.AllFiles().Count() == 1)
+        failed = failed + Program.checkTrue("missing field empty", mp.Field("nope") == "")
+        failed = failed + Program.checkTrue("missing file null", mp.File("nope") == null)
+
+        // non-multipart request → empty
+        var plain: HttpRequest = new HttpRequest()
+        plain.Headers.Set("content-type", "application/json")
+        plain.Body = "{}"
+        let mp2: Multipart = Multipart.Parse(plain)
+        failed = failed + Program.checkTrue("non-multipart → 0 files", mp2.AllFiles().Count() == 0)
+
+        Console.WriteLine("")
+        Console.WriteLine("failed=" + String_FromInt(failed))
+        if (failed > 0) { Console.WriteLine("[FAIL] multipart suite") }
+        else { Console.WriteLine("[PASS] multipart suite") }
+    }
+}

@@ -91,7 +91,7 @@ cd "$PKG_DIR"
 # v0.4.6: facade.am split across multiple source files (cookie,
 # http_request, http_response, http_parser, http_server, http_client).
 # Order matches amalgame.toml's `sources = [...]` for cross-file refs.
-NETHTTP_SOURCES="facade.am cookie.am http_request.am http_response.am http_parser.am http_server.am http_client.am"
+NETHTTP_SOURCES="facade.am cookie.am http_request.am http_response.am http_parser.am http_server.am http_client.am multipart.am"
 NETHTTP_EXTERNAL_FLAGS=""
 for src in $NETHTTP_SOURCES; do
     NETHTTP_EXTERNAL_FLAGS="$NETHTTP_EXTERNAL_FLAGS --external $src"
@@ -128,6 +128,15 @@ if build_test tests/parser_test.am "$BUILD_DIR/parser_test"; then
     "$BUILD_DIR/parser_test"
 else
     echo -e "${RED}FAIL${NC} (parser test build)"
+    exit 1
+fi
+
+# ── Multipart unit tests (no sockets) ─────────────────────────────
+echo -e "\n── Multipart unit tests ──"
+if build_test tests/multipart_test.am "$BUILD_DIR/multipart_test"; then
+    "$BUILD_DIR/multipart_test"
+else
+    echo -e "${RED}FAIL${NC} (multipart test build)"
     exit 1
 fi
 

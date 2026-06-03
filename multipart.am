@@ -1,0 +1,316 @@
+// amalgame-net-http — multipart/form-data parser (v0.14.1).
+//
+// Pure-Amalgame parse over the raw request body bytes, so binary file
+// uploads (PNG/PDF/…) survive intact — `HttpRequest.Body` is a
+// code_string that truncates at the first NUL and can't carry them.
+//
+// @c is confined to the FFI frontier: copying the C-owned body buffer
+// into a List<int> (bytesFromPtr) and writing a file to disk (SaveTo).
+// Everything else — boundary scan, per-part header parse,
+// Content-Disposition name/filename extraction — is plain Amalgame.
+//
+// Usage:
+//   if (req.IsMultipart()) {
+//     let mp = Multipart.Parse(req)
+//     let avatar = mp.File("avatar")     // UploadedFile or null
+//     if (avatar != null) { avatar.SaveTo("/uploads/" + avatar.Filename) }
+//     let note = mp.Field("note")        // text field
+//   }
+
+namespace Amalgame.Net.Http
+
+import Amalgame.Collections
+import Amalgame.String
+
+// One file part of a multipart/form-data body.
+public class UploadedFile {
+    public Name:        string       // form field name
+    public Filename:    string       // client-supplied filename
+    public ContentType: string       // part Content-Type ("" if absent)
+    public Data:        List<int>     // raw bytes (binary-safe)
+
+    public UploadedFile() {
+        this.Name        = ""
+        this.Filename    = ""
+        this.ContentType = ""
+        this.Data        = new List<int>()
+    }
+
+    public int Size() { return this.Data.Count() }
+
+    public List<int> Bytes() { return this.Data }
+
+    // Decode the bytes as a UTF-8 string. Stops at an embedded NUL
+    // (code_string semantics) — fine for text, lossy for true binary;
+    // use Bytes()/SaveTo for binary content.
+    public string Text() { return Multipart.bytesToString(this.Data) }
+
+    // Write the raw bytes to `path` (binary, "wb"). Returns false on
+    // open failure. The only file-writing FFI in the package.
+    public bool SaveTo(string path) {
+        var ok: bool = false
+        let n: int = this.Data.Count()
+        @c {
+            AmalgameList* d = (AmalgameList*) self->Data;
+            const char* p = (const char*) path;
+            FILE* f = fopen(p, "wb");
+            if (f) {
+                int cnt = (int) n;
+                for (int i = 0; i < cnt; i++) {
+                    unsigned char b = (unsigned char)(intptr_t) AmalgameList_get(d, i);
+                    fputc((int) b, f);
+                }
+                fclose(f);
+                ok = 1;
+            }
+        }
+        return ok
+    }
+}
+
+public class Multipart {
+    public Files:  List<UploadedFile>
+    public Fields: Map<string, string>     // non-file text parts
+
+    public Multipart() {
+        this.Files  = new List<UploadedFile>()
+        this.Fields = new Map<string, string>()
+    }
+
+    // Parse req's multipart/form-data body. Returns an empty Multipart
+    // when the request isn't multipart or the boundary is missing.
+    public static Multipart Parse(req: HttpRequest) {
+        var m: Multipart = new Multipart()
+        let ct: string = req.Header("content-type")
+        if (!String_StartsWith(String_ToLower(ct), "multipart/form-data")) { return m }
+        let boundary: string = Multipart.extractBoundary(ct)
+        if (String_Length(boundary) == 0) { return m }
+
+        var bytes: List<int> = new List<int>()
+        if (req.BodyLen > 0 && req.BodyPtr != 0) {
+            bytes = Multipart.bytesFromPtr(req.BodyPtr, req.BodyLen)
+        } else {
+            bytes = Multipart.bytesFromStr(req.Body)
+        }
+        let n: int = bytes.Count()
+        if (n == 0) { return m }
+
+        let CR: string = String_FromByte(13)
+        let LF: string = String_FromByte(10)
+        let delim: string     = "--" + boundary               // "--boundary"
+        let delimB: List<int> = Multipart.bytesFromStr(delim)
+        let crlfDelimB: List<int> = Multipart.bytesFromStr(CR + LF + delim)
+        let crlf2B: List<int> = Multipart.bytesFromStr(CR + LF + CR + LF)
+
+        var pos: int = Multipart.findFrom(bytes, delimB, 0)
+        if (pos < 0) { return m }
+        pos = pos + delimB.Count()
+
+        var iters: int = 0
+        while (iters < 100000) {
+            iters = iters + 1
+            // End of body: delimiter immediately followed by "--".
+            if (pos + 1 < n && bytes.Get(pos) == 45 && bytes.Get(pos + 1) == 45) { return m }
+            // Otherwise a CRLF must follow the delimiter.
+            if (pos + 1 < n && bytes.Get(pos) == 13 && bytes.Get(pos + 1) == 10) {
+                pos = pos + 2
+            } else {
+                return m
+            }
+            // Part headers end at the first CRLFCRLF.
+            let hEnd: int = Multipart.findFrom(bytes, crlf2B, pos)
+            if (hEnd < 0) { return m }
+            let headerStr: string = Multipart.bytesToString(Multipart.slice(bytes, pos, hEnd))
+            let bodyStart: int = hEnd + 4
+            // Part body ends at the CRLF that precedes the next delimiter.
+            let bodyEnd: int = Multipart.findFrom(bytes, crlfDelimB, bodyStart)
+            if (bodyEnd < 0) { return m }
+            let partBytes: List<int> = Multipart.slice(bytes, bodyStart, bodyEnd)
+
+            let name: string     = Multipart.dispoParam(headerStr, "name")
+            let filename: string = Multipart.dispoParam(headerStr, "filename")
+            if (String_Length(filename) > 0) {
+                var f: UploadedFile = new UploadedFile()
+                f.Name        = name
+                f.Filename    = filename
+                f.ContentType = Multipart.partContentType(headerStr)
+                f.Data        = partBytes
+                var fileList: List<UploadedFile> = m.Files
+                fileList.Add(f)
+            } else {
+                if (String_Length(name) > 0) {
+                    m.Fields.Set(name, Multipart.bytesToString(partBytes))
+                }
+            }
+            // Advance past "\r\n--boundary"; loop re-checks for end / CRLF.
+            pos = bodyEnd + crlfDelimB.Count()
+        }
+        return m
+    }
+
+    // First file part with the given field name, or null.
+    public UploadedFile File(string name) {
+        let n: int = this.Files.Count()
+        var i: int = 0
+        while (i < n) {
+            let f: UploadedFile = this.Files.Get(i)
+            if (f.Name == name) { return f }
+            i = i + 1
+        }
+        return null
+    }
+
+    public List<UploadedFile> AllFiles() { return this.Files }
+
+    public string Field(string name) {
+        if (this.Fields.Has(name)) { return this.Fields.Get(name) }
+        return ""
+    }
+
+    // ── internals ───────────────────────────────────────────────────
+
+    // Content-Type of a part ("" if no Content-Type header line).
+    static string partContentType(string headers) {
+        let CR: string = String_FromByte(13)
+        let LF: string = String_FromByte(10)
+        let lines: List<string> = String_Split(headers, CR + LF)
+        let ln: int = lines.Count()
+        var i: int = 0
+        while (i < ln) {
+            let line: string = lines.Get(i)
+            if (String_StartsWith(String_ToLower(line), "content-type:")) {
+                let colon: int = String_IndexOf(line, ":")
+                return String_Trim(String_Substring(line, colon + 1, String_Length(line) - colon - 1))
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    // Extract a Content-Disposition parameter ("name" / "filename") by
+    // exact key match on the ';'-split params — so "name" never matches
+    // inside "filename".
+    static string dispoParam(string headers, string key) {
+        let CR: string = String_FromByte(13)
+        let LF: string = String_FromByte(10)
+        let lines: List<string> = String_Split(headers, CR + LF)
+        let ln: int = lines.Count()
+        var i: int = 0
+        while (i < ln) {
+            let line: string = lines.Get(i)
+            if (String_StartsWith(String_ToLower(line), "content-disposition:")) {
+                let parts: List<string> = String_Split(line, ";")
+                let pn: int = parts.Count()
+                var j: int = 0
+                while (j < pn) {
+                    let p: string = String_Trim(parts.Get(j))
+                    let eq: int = String_IndexOf(p, "=")
+                    if (eq > 0) {
+                        let k: string = String_Trim(String_Substring(p, 0, eq))
+                        if (k == key) {
+                            var v: string = String_Trim(String_Substring(p, eq + 1, String_Length(p) - eq - 1))
+                            if (String_Length(v) >= 2 && String_StartsWith(v, "\"")) {
+                                v = String_Substring(v, 1, String_Length(v) - 2)
+                            }
+                            return v
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        return ""
+    }
+
+    // boundary token from a "multipart/form-data; boundary=..." header.
+    static string extractBoundary(string ct) {
+        let key: string = "boundary="
+        let idx: int = String_IndexOf(ct, key)
+        if (idx < 0) { return "" }
+        let start: int = idx + String_Length(key)
+        var rest: string = String_Substring(ct, start, String_Length(ct) - start)
+        let sc: int = String_IndexOf(rest, ";")
+        if (sc >= 0) { rest = String_Substring(rest, 0, sc) }
+        rest = String_Trim(rest)
+        if (String_Length(rest) >= 2 && String_StartsWith(rest, "\"")) {
+            rest = String_Substring(rest, 1, String_Length(rest) - 2)
+        }
+        return rest
+    }
+
+    static bool matchAt(List<int> hay, int pos, List<int> pat) {
+        let pn: int = pat.Count()
+        if (pos + pn > hay.Count()) { return false }
+        var j: int = 0
+        while (j < pn) {
+            if (hay.Get(pos + j) != pat.Get(j)) { return false }
+            j = j + 1
+        }
+        return true
+    }
+
+    static int findFrom(List<int> hay, List<int> pat, int from) {
+        let hn: int = hay.Count()
+        let pn: int = pat.Count()
+        if (pn == 0) { return -1 }
+        var i: int = from
+        while (i + pn <= hn) {
+            if (Multipart.matchAt(hay, i, pat)) { return i }
+            i = i + 1
+        }
+        return -1
+    }
+
+    static List<int> slice(List<int> src, int start, int end) {
+        var out: List<int> = new List<int>()
+        var i: int = start
+        while (i < end) {
+            out.Add(src.Get(i))
+            i = i + 1
+        }
+        return out
+    }
+
+    public static string bytesToString(List<int> b) {
+        var out: string = ""
+        let n: int = b.Count()
+        var i: int = 0
+        while (i < n) {
+            out = out + String_FromByte(b.Get(i))
+            i = i + 1
+        }
+        return out
+    }
+
+    // Copy a C-owned byte buffer into a List<int> (binary-safe).
+    static List<int> bytesFromPtr(int ptr, int len) {
+        var out: List<int> = new List<int>()
+        @c {
+            const unsigned char* p = (const unsigned char*)(uintptr_t) ptr;
+            long L = (long) len;
+            AmalgameList* o = (AmalgameList*) out;
+            if (p) {
+                for (long i = 0; i < L; i++) {
+                    AmalgameList_add(o, (void*)(intptr_t) p[i]);
+                }
+            }
+        }
+        return out
+    }
+
+    // Copy a code_string's bytes (up to its NUL) into a List<int>. The
+    // fallback for non-H1 requests (tests build the body as a string).
+    static List<int> bytesFromStr(string s) {
+        var out: List<int> = new List<int>()
+        @c {
+            const char* p = (const char*) s;
+            size_t L = p ? strlen(p) : 0;
+            AmalgameList* o = (AmalgameList*) out;
+            for (size_t i = 0; i < L; i++) {
+                AmalgameList_add(o, (void*)(intptr_t)(unsigned char) p[i]);
+            }
+        }
+        return out
+    }
+}

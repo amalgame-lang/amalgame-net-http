@@ -2189,6 +2189,84 @@ static inline void Amalgame_Net_Http_H1Conn_RespondBytes(AmalgameH1Conn* c,
     amalgame_h1_send_response(c, status, ct, body, blen);
 }
 
+/* Reason phrase for a status code — shared by the v0.14.1 caller-header
+ * binary path. Mirrors amalgame_h1_send_response's table. */
+static inline const char* amalgame_h1_reason_phrase(i64 status) {
+    switch ((int)status) {
+        case 100: return "Continue";
+        case 200: return "OK";
+        case 201: return "Created";
+        case 202: return "Accepted";
+        case 204: return "No Content";
+        case 206: return "Partial Content";
+        case 301: return "Moved Permanently";
+        case 302: return "Found";
+        case 303: return "See Other";
+        case 304: return "Not Modified";
+        case 307: return "Temporary Redirect";
+        case 308: return "Permanent Redirect";
+        case 400: return "Bad Request";
+        case 401: return "Unauthorized";
+        case 403: return "Forbidden";
+        case 404: return "Not Found";
+        case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
+        case 410: return "Gone";
+        case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
+        case 416: return "Range Not Satisfiable";
+        case 422: return "Unprocessable Content";
+        case 429: return "Too Many Requests";
+        case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
+        case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
+        case 504: return "Gateway Timeout";
+    }
+    return "OK";
+}
+
+/* v0.14.1: binary body (ptr,len) WITH a caller-supplied header block —
+ * the binary-safe sibling of RespondFull. Lets HttpResponse ship a
+ * gzip-compressed or otherwise-binary body while keeping its custom
+ * headers (Content-Encoding, CSP, Set-Cookie, …). headers_block is the
+ * RespondFull shape: "Name: Value\r\n" lines, NO trailing blank line,
+ * and MUST NOT carry Content-Length / Connection (added here). */
+static inline void Amalgame_Net_Http_H1Conn_RespondBytesFull(AmalgameH1Conn* c,
+                                                              i64 status,
+                                                              code_string headers_block,
+                                                              i64 body_ptr,
+                                                              i64 body_len) {
+    if (!c || c->fd < 0 || c->response_sent) return;
+    const char* body = (const char*)(uintptr_t) body_ptr;
+    size_t blen = (body_len > 0) ? (size_t) body_len : 0;
+    const char* reason = amalgame_h1_reason_phrase(status);
+    const char* conn_hdr = c->keep_alive ? "keep-alive" : "close";
+    char start[256];
+    int start_len = snprintf(start, sizeof(start),
+        "HTTP/1.1 %lld %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n",
+        (long long)status, reason, blen, conn_hdr);
+    if (start_len <= 0 || start_len >= (int)sizeof(start)) {
+        c->response_sent = 1;
+        return;
+    }
+    if (amalgame_h1_send_all(c, start, (size_t)start_len) != 0) {
+        c->response_sent = 1; return;
+    }
+    if (headers_block && headers_block[0]) {
+        if (amalgame_h1_send_all(c, headers_block, strlen(headers_block)) != 0) {
+            c->response_sent = 1; return;
+        }
+    }
+    if (amalgame_h1_send_all(c, "\r\n", 2) != 0) {
+        c->response_sent = 1; return;
+    }
+    if (blen > 0) { amalgame_h1_send_all(c, body, blen); }
+    c->response_sent = 1;
+}
+
 static inline i64 Amalgame_Net_Http_H1Conn_RespondFile(AmalgameH1Conn* c,
                                                        i64 status,
                                                        code_string ct,

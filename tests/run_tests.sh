@@ -281,6 +281,84 @@ else
     exit 1
 fi
 
+# ── v0.14.0: streaming primitives + raw body byte accessor ────────
+echo -e "\n── Streaming primitives (BeginStream / WriteRaw / BodyByteAt) ──"
+cat > "$BUILD_DIR/stream_smoke.c" <<'EOF'
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+int main(void) {
+    GC_INIT();
+
+    /* (1) BodyByteAt over a body that contains NUL bytes — the exact
+     * case H1Conn_Body (code_string) truncates and loses. */
+    AmalgameH1Conn* b = (AmalgameH1Conn*) GC_MALLOC(sizeof(AmalgameH1Conn));
+    memset(b, 0, sizeof(*b));
+    static const unsigned char payload[5] = { 0xff, 0x00, 0x41, 0x00, 0x7e };
+    b->body = (char*) payload;
+    b->body_len = 5;
+    int byte_ok = 1;
+    if (Amalgame_Net_Http_H1Conn_BodyByteAt(b, 0) != 0xff) byte_ok = 0;
+    if (Amalgame_Net_Http_H1Conn_BodyByteAt(b, 1) != 0x00) byte_ok = 0;
+    if (Amalgame_Net_Http_H1Conn_BodyByteAt(b, 2) != 0x41) byte_ok = 0;
+    if (Amalgame_Net_Http_H1Conn_BodyByteAt(b, 4) != 0x7e) byte_ok = 0;
+    if (Amalgame_Net_Http_H1Conn_BodyByteAt(b, 5) != -1)   byte_ok = 0;  /* OOR */
+    if (Amalgame_Net_Http_H1Conn_BodyByteAt(b, -1) != -1)  byte_ok = 0;
+    printf("byteat_ok=%d\n", byte_ok);
+
+    /* (2) BeginStream + WriteRaw over a socketpair. */
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { perror("socketpair"); return 1; }
+    AmalgameH1Conn* c = (AmalgameH1Conn*) GC_MALLOC(sizeof(AmalgameH1Conn));
+    memset(c, 0, sizeof(*c));
+    c->fd = sv[0];
+    c->keep_alive = 1;   /* BeginStream must force this to 0 */
+
+    i64 bs = Amalgame_Net_Http_H1Conn_BeginStream(c, 200,
+        (code_string) "Content-Type: text/event-stream\r\nCache-Control: no-cache\r\n");
+    i64 w1 = Amalgame_Net_Http_H1Conn_WriteRaw(c, (code_string) "data: hello\n\n");
+    i64 w2 = Amalgame_Net_Http_H1Conn_WriteRaw(c, (code_string) "data: world\n\n");
+    Amalgame_Net_Http_H1Conn_Flush(c);
+
+    shutdown(sv[0], SHUT_WR);
+    char buf[4096]; ssize_t got = 0, n;
+    while ((n = read(sv[1], buf + got, sizeof(buf) - got - 1)) > 0) got += n;
+    buf[got] = 0;
+    close(sv[0]); close(sv[1]);
+
+    printf("bs=%lld w1=%lld w2=%lld keep_alive=%d streaming=%d resp_sent=%d\n",
+        (long long)bs, (long long)w1, (long long)w2,
+        (int)c->keep_alive, (int)c->streaming, (int)c->response_sent);
+
+    int ok = byte_ok
+        && bs == 0 && w1 == 0 && w2 == 0
+        && c->keep_alive == 0 && c->streaming == 1 && c->response_sent == 1
+        && strstr(buf, "HTTP/1.1 200 OK\r\n") == buf
+        && strstr(buf, "Connection: close\r\n")
+        && strstr(buf, "Content-Type: text/event-stream\r\n")
+        && strstr(buf, "\r\n\r\ndata: hello\n\ndata: world\n\n")
+        && !strstr(buf, "Content-Length:");
+    printf(ok ? "PASS\n" : "FAIL\n");
+    return ok ? 0 : 1;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/stream_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/stream_smoke" 2>&1 | head -5
+if [ ! -x "$BUILD_DIR/stream_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (streaming smoke build)"
+    exit 1
+fi
+ST_OUT=$("$BUILD_DIR/stream_smoke")
+echo "$ST_OUT"
+if echo "$ST_OUT" | grep -q "^PASS$"; then
+    echo -e "${GREEN}PASS${NC} (BeginStream/WriteRaw wire framing + BodyByteAt binary-safe)"
+else
+    echo -e "${RED}FAIL${NC} (streaming primitives broken)"
+    exit 1
+fi
+
 # ── End-to-end (server + client as separate processes) ────────────
 echo -e "\n── End-to-end test (server + client) ──"
 build_test tests/server_test.am "$BUILD_DIR/server_test" || { echo "server build failed"; exit 1; }

@@ -24,9 +24,9 @@
 
 [package]
 name              = "amalgame-net-http"
-version           = "0.14.1"
+version           = "0.15.0"
 license           = "Apache-2.0"
-description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.14.1: multipart/form-data parser (Multipart / UploadedFile, pure-AM over raw bytes — binary-safe file uploads) + H1Conn.RespondBytesFull (binary body with caller headers, for gzip/binary responses) + HttpRequest.BodyPtr/BodyLen. v0.14.0: response streaming primitives (H1Conn.BeginStream / WriteRaw / WriteRawBytes / Flush) for SSE + long-poll, and H1Conn.BodyByteAt for binary-safe multipart parsing. v0.13.0: HTTPS keep-alive — HttpsH1Server.ServeConn/ServeConnOn loop parse→handler→ResetForReuse on one TLS connection (one handshake per page, not per asset), for custom SNI/multi-site accept loops. v0.12.2: req.Path percent-decode. v0.12.1: SNI full chain + AcceptParsed."
+description       = "HTTP/1.1 + HTTP/2 (h2c + HTTPS+ALPN h2) + WebSocket (ws/wss). v0.15.0: HTTP Range support — H1Conn.RespondFileRange (206 Partial Content, caller Content-Range header) + HttpResponse.FileRange; backs the Static middleware's Range / 206 + Last-Modified. v0.14.1: multipart/form-data parser (Multipart / UploadedFile, pure-AM over raw bytes — binary-safe file uploads) + H1Conn.RespondBytesFull (binary body with caller headers, for gzip/binary responses) + HttpRequest.BodyPtr/BodyLen. v0.14.0: response streaming primitives (H1Conn.BeginStream / WriteRaw / WriteRawBytes / Flush) for SSE + long-poll, and H1Conn.BodyByteAt for binary-safe multipart parsing. v0.13.0: HTTPS keep-alive — HttpsH1Server.ServeConn/ServeConnOn loop parse→handler→ResetForReuse on one TLS connection (one handshake per page, not per asset), for custom SNI/multi-site accept loops. v0.12.2: req.Path percent-decode. v0.12.1: SNI full chain + AcceptParsed."
 required-amalgame = ">=0.8.58"
 schema-version    = 1
 
@@ -121,6 +121,10 @@ H1Conn_RespondBytes          = { returns = "void" }
 # BodyBytes mode routes here.
 H1Conn_RespondBytesFull      = { returns = "void" }
 H1Conn_RespondFile           = { returns = "i64" }
+# v0.15.0 — serve a byte range [off, off+len) of a file with a caller
+# header block (Content-Range / Accept-Ranges / ETag). 206 normally.
+# Returns 0 ok, -1 file error, -2 range unsatisfiable (→ 416).
+H1Conn_RespondFileRange      = { returns = "i64" }
 H1Conn_Close                 = { returns = "void" }
 # v0.9.0 — raw connection fd for async I/O parking.
 # Pair with amalgame-async ≥ v0.2.0: MakeNonBlocking +

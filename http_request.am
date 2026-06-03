@@ -23,6 +23,13 @@ public class HttpRequest {
     public Body:        string                    // raw body bytes (text-safe)
     public RemoteAddr:  string                    // client IP:port
     public IsSecure:    bool                      // true if served over TLS
+    // v0.14.1: raw body buffer (pointer-as-i64 + length). Stashed by
+    // FromH1Conn so the multipart parser can walk binary bytes that
+    // `Body` (a NUL-truncating code_string) would lose. 0 / 0 when the
+    // request came from a non-H1 path (then the parser falls back to
+    // `Body`, fine for text/ASCII multipart).
+    public BodyPtr:     int
+    public BodyLen:     int
 
     public HttpRequest() {
         this.Method      = ""
@@ -34,6 +41,8 @@ public class HttpRequest {
         this.Body        = ""
         this.RemoteAddr  = ""
         this.IsSecure    = false
+        this.BodyPtr     = 0
+        this.BodyLen     = 0
     }
 
     // Get a header value (case-insensitive lookup).
@@ -46,6 +55,12 @@ public class HttpRequest {
     // Parse Body as a urlencoded form (Content-Type application/x-www-form-urlencoded).
     public Map<string, string> Form() {
         return HttpRequest.ParseQuery(this.Body)
+    }
+
+    // v0.14.1: true when the request carries a multipart/form-data body
+    // (file uploads). Parse it with `Multipart.Parse(req)`.
+    public bool IsMultipart() {
+        return String_StartsWith(String_ToLower(this.Header("content-type")), "multipart/form-data")
     }
 
     // Body as plain text (already a string in v0.1).
@@ -180,6 +195,10 @@ public class HttpRequest {
                 req->RawTarget   = (code_string) Amalgame_Net_Http_H1Conn_RawTarget(c);
                 req->HttpVersion = "HTTP/1.1";
                 req->Body        = (code_string) Amalgame_Net_Http_H1Conn_Body(c);
+                /* v0.14.1: stash the raw body buffer so the multipart
+                 * parser can walk binary bytes (Body truncates at NUL). */
+                req->BodyPtr     = (i64)(uintptr_t) c->body;
+                req->BodyLen     = (i64) c->body_len;
                 /* RemoteAddr captured at accept time, formatted
                  * "ip:port". If missing on older builds the field
                  * stays empty and RateLimit "ip" strategy falls

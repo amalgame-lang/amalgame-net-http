@@ -2289,6 +2289,49 @@ static inline i64 Amalgame_Net_Http_H1Conn_RespondFile(AmalgameH1Conn* c,
     return rc == 0 ? 0 : -1;
 }
 
+/* v0.15.0: serve a byte range [off, off+len) of a file with a caller
+ * header block (Content-Range / ETag / Last-Modified / Accept-Ranges).
+ * `status` is normally 206. `len <= 0` means "to end of file". Returns
+ * 0 on success, -1 on file open/read error, -2 if the range is
+ * unsatisfiable (off past EOF — caller should answer 416). */
+static inline i64 Amalgame_Net_Http_H1Conn_RespondFileRange(AmalgameH1Conn* c,
+        i64 status, code_string headers_block, code_string path,
+        i64 off, i64 len) {
+    if (!c || c->fd < 0 || c->response_sent || !path) return -1;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    if (off < 0 || off >= (i64) sz) { fclose(f); return -2; }
+    i64 maxlen = (i64) sz - off;
+    i64 n = (len > 0 && len < maxlen) ? len : maxlen;
+    if (fseek(f, (long) off, SEEK_SET) != 0) { fclose(f); return -1; }
+    char* buf = (char*) GC_MALLOC_ATOMIC((size_t) n + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t got = fread(buf, 1, (size_t) n, f);
+    fclose(f);
+    if (got != (size_t) n) return -1;
+    buf[got] = 0;
+    const char* reason = amalgame_h1_reason_phrase(status);
+    const char* conn_hdr = c->keep_alive ? "keep-alive" : "close";
+    char start[256];
+    int start_len = snprintf(start, sizeof(start),
+        "HTTP/1.1 %lld %s\r\n"
+        "Content-Length: %lld\r\n"
+        "Connection: %s\r\n",
+        (long long)status, reason, (long long) n, conn_hdr);
+    if (start_len <= 0 || start_len >= (int)sizeof(start)) { c->response_sent = 1; return -1; }
+    if (amalgame_h1_send_all(c, start, (size_t)start_len) != 0) { c->response_sent = 1; return -1; }
+    if (headers_block && headers_block[0]) {
+        if (amalgame_h1_send_all(c, headers_block, strlen(headers_block)) != 0) { c->response_sent = 1; return -1; }
+    }
+    if (amalgame_h1_send_all(c, "\r\n", 2) != 0) { c->response_sent = 1; return -1; }
+    if (n > 0) { amalgame_h1_send_all(c, buf, (size_t) n); }
+    c->response_sent = 1;
+    return 0;
+}
+
 static inline void Amalgame_Net_Http_H1Conn_Close(AmalgameH1Conn* c) {
     if (!c) return;
     /* v0.10.0: TLS shutdown before the bare fd close so the peer

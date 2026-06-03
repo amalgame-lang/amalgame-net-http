@@ -91,7 +91,7 @@ cd "$PKG_DIR"
 # v0.4.6: facade.am split across multiple source files (cookie,
 # http_request, http_response, http_parser, http_server, http_client).
 # Order matches amalgame.toml's `sources = [...]` for cross-file refs.
-NETHTTP_SOURCES="facade.am cookie.am http_request.am http_response.am http_parser.am http_server.am http_client.am multipart.am"
+NETHTTP_SOURCES="facade.am cookie.am http_request.am http_response.am http_parser.am http_server.am http_client.am multipart.am sse.am"
 NETHTTP_EXTERNAL_FLAGS=""
 for src in $NETHTTP_SOURCES; do
     NETHTTP_EXTERNAL_FLAGS="$NETHTTP_EXTERNAL_FLAGS --external $src"

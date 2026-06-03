@@ -35,6 +35,14 @@ public class HttpResponse {
     // middleware (gzip) and dynamically-generated images use this.
     public BodyBytes:   List<int>
     public HasBytes:    bool
+    // v0.15.0 — byte-range file response (206). When HasRange is true,
+    // WriteToH1Conn streams [RangeOff, RangeOff+RangeLen) of FilePath
+    // via H1Conn_RespondFileRange with the caller's headers (the Static
+    // middleware sets Content-Range / Accept-Ranges). RangeLen <= 0 =
+    // to end of file. Set via .FileRange(path, off, len).
+    public RangeOff:    int
+    public RangeLen:    int
+    public HasRange:    bool
 
     public HttpResponse() {
         this.StatusCode = 200
@@ -43,6 +51,9 @@ public class HttpResponse {
         this.FilePath   = ""
         this.BodyBytes  = new List<int>()
         this.HasBytes   = false
+        this.RangeOff   = 0
+        this.RangeLen   = 0
+        this.HasRange   = false
     }
 
     public static HttpResponse New() { return new HttpResponse() }
@@ -155,6 +166,17 @@ public class HttpResponse {
         return this
     }
 
+    // v0.15.0 — serve a byte range of a file as 206 Partial Content.
+    // The caller (Static) sets Content-Range / Accept-Ranges headers +
+    // Status(206). `len <= 0` streams to end of file.
+    public HttpResponse FileRange(string path, int off, int len) {
+        this.FilePath = path
+        this.RangeOff = off
+        this.RangeLen = len
+        this.HasRange = true
+        return this
+    }
+
     // v0.14.1 — set an in-memory binary body (NUL-safe). `contentType`
     // is set unless the caller already set one. Wire-out goes through
     // H1Conn_RespondBytesFull, preserving every custom header.
@@ -230,6 +252,37 @@ public class HttpResponse {
     // `conn` is passed as int (pointer-as-i64 handle) for the same
     // self-build reason explained on HttpRequest.FromH1Conn.
     public HttpResponse WriteToH1Conn(conn: int) {
+        // v0.15.0: byte-range file response (206) — stream a slice of
+        // FilePath with the caller's headers (Content-Range etc.).
+        if (this.HasRange) {
+            let crlfR: string = String_FromByte(13) + String_FromByte(10)
+            let keysR: List<string> = this.Headers.Keys()
+            let knR: int = keysR.Count()
+            var headerBlockR: string = ""
+            if (!this.Headers.Has("Content-Type") && !this.Headers.Has("content-type")) {
+                headerBlockR = "Content-Type: application/octet-stream" + crlfR
+            }
+            for i in 0..knR {
+                let k: string = keysR.Get(i)
+                let kl: string = String_ToLower(k)
+                if (kl == "content-length") { continue }
+                if (kl == "connection") { continue }
+                headerBlockR = headerBlockR + k + ": " + this.Headers.Get(k) + crlfR
+            }
+            @c {
+                AmalgameH1Conn* c = (AmalgameH1Conn*)(uintptr_t) conn;
+                if (c) {
+                    Amalgame_Net_Http_H1Conn_RespondFileRange(c,
+                        (i64) self->StatusCode,
+                        (code_string) headerBlockR,
+                        (code_string) self->FilePath,
+                        (i64) self->RangeOff,
+                        (i64) self->RangeLen);
+                }
+            }
+            return this
+        }
+
         // v0.14.1: in-memory binary body — marshal BodyBytes to a C
         // buffer and ship via RespondBytesFull (keeps custom headers,
         // explicit Content-Length, NUL-safe). Custom headers built the

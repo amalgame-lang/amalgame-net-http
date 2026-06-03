@@ -1525,6 +1525,12 @@ typedef struct AmalgameH1Conn {
      * HttpsH1Server_Accept after a successful SSL handshake; NULL
      * for plain Http1.Serve/ServeMt/ServeAsync conns. */
     SSL*                     ssl;
+    /* v0.14.0: open-ended streaming response (SSE / long-poll). Set by
+     * H1Conn_BeginStream, which also forces keep_alive=0 so the
+     * keep-alive request loop breaks + closes after the handler
+     * returns (framing is Connection: close — the response ends when
+     * the socket closes). Cleared by ResetForReuse for completeness. */
+    int32_t                  streaming;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -1910,6 +1916,17 @@ static inline code_string Amalgame_Net_Http_H1Conn_Body(AmalgameH1Conn* c) {
 static inline i64 Amalgame_Net_Http_H1Conn_BodyLen(AmalgameH1Conn* c) {
     return (c && c->body) ? (i64)c->body_len : 0;
 }
+/* v0.14.0: raw body byte at index i (0..BodyLen-1), as an i64 0..255;
+ * -1 when out of range or no body. H1Conn_Body returns a char* that AM
+ * treats as a NUL-terminated code_string — it truncates at the first
+ * NUL, which is fatal for binary uploads (PNG/PDF/…). The multipart
+ * parser walks the raw buffer with this accessor and slices each part
+ * into a List<int>, sidestepping the truncation entirely. */
+static inline i64 Amalgame_Net_Http_H1Conn_BodyByteAt(AmalgameH1Conn* c, i64 i) {
+    if (!c || !c->body) return -1;
+    if (i < 0 || i >= (i64)c->body_len) return -1;
+    return (i64)(unsigned char)c->body[i];
+}
 
 static inline void Amalgame_Net_Http_H1Conn_Respond(AmalgameH1Conn* c,
                                                      i64 status,
@@ -2220,6 +2237,94 @@ static inline i64 Amalgame_Net_Http_H1Conn_RawFd(AmalgameH1Conn* c) {
     return c ? (i64) c->fd : -1;
 }
 
+/* ── v0.14.0: response streaming primitives (SSE / long-poll) ───────
+ * The normal model is parse → handler → return one HttpResponse →
+ * close. That can't stream: Server-Sent Events / long-poll need the
+ * handler to hold the connection and push frames over time. These let
+ * an AM handler open an open-ended response and write until the peer
+ * disconnects:
+ *
+ *   H1Conn_BeginStream(c, status, headers_block)
+ *       Emit the status line + caller headers + end-of-headers blank
+ *       line, with NO Content-Length. Framing is `Connection: close`
+ *       (forced): the response ends when the server closes the socket.
+ *       Sets response_sent (the dispatch loop won't double-respond)
+ *       and keep_alive=0 (every keep-alive loop re-reads conn->keep_alive
+ *       after the handler returns → breaks → closes). Returns 0 / -1.
+ *
+ *   H1Conn_WriteRaw(c, buf) / WriteRawBytes(c, ptr, len)
+ *       Push a frame. 0 on success, -1 if the peer is gone (send_all →
+ *       EPIPE; SIGPIPE already ignored). The AM SSE loop stops on -1.
+ *
+ *   H1Conn_Flush(c)
+ *       No-op on the blocking path (send() already flushed); present
+ *       for API symmetry and a future buffered/async hook.
+ *
+ * headers_block is the RespondFull shape: each line CRLF-terminated, NO
+ * trailing blank line, and MUST NOT carry Content-Length or Connection
+ * (managed here). NULL / "" is allowed. */
+static inline i64 Amalgame_Net_Http_H1Conn_BeginStream(AmalgameH1Conn* c,
+                                                        i64 status,
+                                                        code_string headers_block) {
+    if (!c || c->fd < 0 || c->response_sent) return -1;
+    const char* reason = "OK";
+    switch ((int)status) {
+        case 200: reason = "OK"; break;
+        case 201: reason = "Created"; break;
+        case 202: reason = "Accepted"; break;
+        /* streaming responses are virtually always 200 — keep it tiny */
+    }
+    c->keep_alive = 0;   /* stream ends on close → never reuse this conn */
+    c->streaming  = 1;
+    char start[256];
+    int start_len = snprintf(start, sizeof(start),
+        "HTTP/1.1 %lld %s\r\n"
+        "Connection: close\r\n",
+        (long long)status, reason);
+    if (start_len <= 0 || start_len >= (int)sizeof(start)) {
+        c->response_sent = 1;
+        return -1;
+    }
+    if (amalgame_h1_send_all(c, start, (size_t)start_len) != 0) {
+        c->response_sent = 1;
+        return -1;
+    }
+    if (headers_block && headers_block[0]) {
+        if (amalgame_h1_send_all(c, headers_block, strlen(headers_block)) != 0) {
+            c->response_sent = 1;
+            return -1;
+        }
+    }
+    if (amalgame_h1_send_all(c, "\r\n", 2) != 0) {
+        c->response_sent = 1;
+        return -1;
+    }
+    c->response_sent = 1;
+    return 0;
+}
+
+static inline i64 Amalgame_Net_Http_H1Conn_WriteRaw(AmalgameH1Conn* c,
+                                                     code_string buf) {
+    if (!c || c->fd < 0 || !buf) return -1;
+    size_t n = strlen(buf);
+    if (n == 0) return 0;
+    return amalgame_h1_send_all(c, buf, n) == 0 ? 0 : -1;
+}
+
+static inline i64 Amalgame_Net_Http_H1Conn_WriteRawBytes(AmalgameH1Conn* c,
+                                                          i64 ptr, i64 len) {
+    if (!c || c->fd < 0) return -1;
+    if (len <= 0) return 0;
+    const char* p = (const char*)(uintptr_t) ptr;
+    if (!p) return -1;
+    return amalgame_h1_send_all(c, p, (size_t) len) == 0 ? 0 : -1;
+}
+
+static inline i64 Amalgame_Net_Http_H1Conn_Flush(AmalgameH1Conn* c) {
+    (void) c;
+    return 0;
+}
+
 /* ── Keep-alive helpers (v0.5.0) ─────────────────────────────────
  * Used by the Http1.ServeWith dispatch loop to read the next
  * request off the same TCP connection. AM-side users who write
@@ -2238,6 +2343,7 @@ static inline void Amalgame_Net_Http_H1Conn_ResetForReuse(AmalgameH1Conn* c) {
     c->body_len      = 0;
     c->header_count  = 0;
     c->response_sent = 0;
+    c->streaming     = 0;
     /* fd / config / keep_alive are intentionally preserved. */
 }
 

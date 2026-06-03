@@ -3636,7 +3636,8 @@ typedef struct AmalgameWsServer {
 typedef struct AmalgameWsConn {
     int       fd;
     int32_t   closed;
-    SSL*      ssl;        /* non-NULL on the wss:// path (v0.4.1+) */
+    SSL*      ssl;            /* non-NULL on the wss:// path (v0.4.1+) */
+    char      subprotocol[128]; /* v0.17.0: negotiated Sec-WebSocket-Protocol, "" if none */
 } AmalgameWsConn;
 
 /* ── Server lifecycle ──────────────────────────────────────────── */
@@ -3922,8 +3923,49 @@ static int amalgame_ws_read_header_line(int fd, SSL* ssl,
 /* Run the WebSocket upgrade handshake on a connected (and, if TLS,
  * post-handshake) socket. Returns a fresh AmalgameWsConn on success,
  * NULL on protocol error (closes the fd in that case). */
-static inline AmalgameWsConn* amalgame_ws_do_upgrade(int cfd, SSL* ssl) {
+/* v0.17.0: pick the first client-offered subprotocol that the server
+ * supports. Both args are comma-separated, case-insensitive token
+ * lists. Writes the match into `out` and returns 1; 0 if none. */
+static inline int amalgame_ws_pick_subprotocol(const char* offered,
+        const char* server_csv, char* out, size_t outsz) {
+    if (!offered || !offered[0] || !server_csv || !server_csv[0]) return 0;
+    const char* o = offered;
+    while (*o) {
+        while (*o == ' ' || *o == ',' || *o == '\t') o++;
+        const char* start = o;
+        while (*o && *o != ',') o++;
+        const char* end = o;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        size_t tlen = (size_t)(end - start);
+        if (tlen > 0) {
+            const char* s = server_csv;
+            while (*s) {
+                while (*s == ' ' || *s == ',' || *s == '\t') s++;
+                const char* ss = s;
+                while (*s && *s != ',') s++;
+                const char* se = s;
+                while (se > ss && (se[-1] == ' ' || se[-1] == '\t')) se--;
+                size_t slen = (size_t)(se - ss);
+                if (slen == tlen && strncasecmp(start, ss, tlen) == 0) {
+                    if (tlen >= outsz) tlen = outsz - 1;
+                    memcpy(out, start, tlen);
+                    out[tlen] = 0;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Upgrade with optional server subprotocol set (CSV). When the client
+ * offers a Sec-WebSocket-Protocol the server supports, the first match
+ * is echoed in the 101 and stored on the conn; otherwise the header is
+ * omitted (RFC 6455 — do NOT fail the handshake). */
+static inline AmalgameWsConn* amalgame_ws_do_upgrade_ex(int cfd, SSL* ssl,
+        const char* server_protos) {
     char key[256] = {0};
+    char offered[256] = {0};
     int seen_upgrade = 0;
     char line[1024];
     int rv;
@@ -3934,6 +3976,10 @@ static inline AmalgameWsConn* amalgame_ws_do_upgrade(int cfd, SSL* ssl) {
             const char* v = line + 18;
             while (*v == ' ' || *v == '\t') v++;
             strncpy(key, v, sizeof(key) - 1);
+        } else if (strncasecmp(line, "Sec-WebSocket-Protocol:", 23) == 0) {
+            const char* v = line + 23;
+            while (*v == ' ' || *v == '\t') v++;
+            strncpy(offered, v, sizeof(offered) - 1);
         } else if (strncasecmp(line, "Upgrade:", 8) == 0) {
             const char* p = line;
             while (*p) {
@@ -3958,21 +4004,43 @@ static inline AmalgameWsConn* amalgame_ws_do_upgrade(int cfd, SSL* ssl) {
                                             accept_b64, sizeof(accept_b64));
     if (alen2 < 0) goto fail;
 
-    char resp[512];
-    int rlen = snprintf(resp, sizeof(resp),
-        "HTTP/1.1 101 Switching Protocols\r\n"
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: %s\r\n\r\n", accept_b64);
+    char chosen[128] = {0};
+    int have_proto = 0;
+    if (server_protos && server_protos[0] && offered[0]) {
+        have_proto = amalgame_ws_pick_subprotocol(offered, server_protos,
+                                                   chosen, sizeof(chosen));
+    }
+
+    char resp[640];
+    int rlen;
+    if (have_proto) {
+        rlen = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: %s\r\n"
+            "Sec-WebSocket-Protocol: %s\r\n\r\n", accept_b64, chosen);
+    } else {
+        rlen = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: %s\r\n\r\n", accept_b64);
+    }
     if (amalgame_ws_write_full(cfd, ssl, resp, rlen) < 0) goto fail;
 
     AmalgameWsConn* c = (AmalgameWsConn*)GC_MALLOC(sizeof(*c));
-    c->fd = cfd; c->closed = 0; c->ssl = ssl;
+    c->fd = cfd; c->closed = 0; c->ssl = ssl; c->subprotocol[0] = 0;
+    if (have_proto) { strncpy(c->subprotocol, chosen, sizeof(c->subprotocol) - 1); }
     return c;
 
 fail:
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     close(cfd);
     return NULL;
+}
+
+/* Legacy entry — no subprotocol negotiation. */
+static inline AmalgameWsConn* amalgame_ws_do_upgrade(int cfd, SSL* ssl) {
+    return amalgame_ws_do_upgrade_ex(cfd, ssl, NULL);
 }
 
 /* Accept one connection + perform WS handshake (raw ws://). */
@@ -3983,6 +4051,12 @@ static inline AmalgameWsConn* Amalgame_Net_Http_WsServer_Accept(
     int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
     if (cfd < 0) return NULL;
     return amalgame_ws_do_upgrade(cfd, NULL);
+}
+
+/* v0.17.0: negotiated WebSocket subprotocol ("" if none). */
+static inline code_string Amalgame_Net_Http_WsConn_Subprotocol(
+        AmalgameWsConn* c) {
+    return (c && c->subprotocol[0]) ? (code_string) c->subprotocol : "";
 }
 
 /* ── High-level entry point: Ws.Serve(port, handler) ────────────── */
@@ -4004,6 +4078,39 @@ static inline i64 Amalgame_Net_Http_Ws_Serve(i64 port,
     fflush(stdout);
     while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameWsConn* conn = Amalgame_Net_Http_WsServer_Accept(srv);
+        if (!conn) continue;
+        AmalgameClosure_call1(handler, (void*)conn);
+        Amalgame_Net_Http_WsConn_Close(conn);
+    }
+    Amalgame_Net_Http_WsServer_Close(srv);
+    return 0;
+}
+
+/* v0.17.0: Ws.ServeWithProtocols(port, csv, handler) — single-thread
+ * WebSocket with subprotocol negotiation. `protocols` is a CSV of the
+ * subprotocols the server supports; the handshake echoes the first the
+ * client offers (read back via WsConn.Subprotocol). Delegates to
+ * Ws.Serve semantics otherwise. */
+static inline i64 Amalgame_Net_Http_Ws_ServeWithProtocols(i64 port,
+        code_string protocols, AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Ws.ServeWithProtocols: handler is NULL\n");
+        return -1;
+    }
+    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Ws.ServeWithProtocols: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Ws.ServeWithProtocols: listening on :%lld (WebSocket)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening && !amalgame_net_http_stopping) {
+        struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+        int cfd = accept(srv->fd, (struct sockaddr*)&addr, &alen);
+        if (cfd < 0) continue;
+        AmalgameWsConn* conn = amalgame_ws_do_upgrade_ex(cfd, NULL, protocols);
         if (!conn) continue;
         AmalgameClosure_call1(handler, (void*)conn);
         Amalgame_Net_Http_WsConn_Close(conn);

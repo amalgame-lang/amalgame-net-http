@@ -139,6 +139,37 @@ extern int GC_pthread_create(pthread_t* new_thread,
 
 static volatile sig_atomic_t amalgame_net_http_stopping = 0;
 
+/* ── Connection-level cap (v0.20.0) ────────────────────────────────
+ * A process-wide ceiling on concurrently-served connections, across all
+ * multi-thread accept loops. Defends against connection exhaustion /
+ * slowloris-at-the-connection-level (which per-request rate limiting
+ * doesn't see) and bounds worker-thread RSS. 0 = unlimited (default).
+ * Opt in with Http.SetMaxConnections(n); accept loops call conn_admit()
+ * and each worker calls conn_release() exactly once on exit. */
+static long amalgame_net_http_active_conns = 0;
+static long amalgame_net_http_max_conns    = 0;   /* 0 = unlimited */
+
+static inline void Amalgame_Net_Http_Http1_SetMaxConnections(i64 n) {
+    amalgame_net_http_max_conns = (long) n;
+}
+static inline i64 Amalgame_Net_Http_Http1_ActiveConnections(void) {
+    return (i64) __sync_add_and_fetch(&amalgame_net_http_active_conns, 0);
+}
+/* Reserve a slot for one new connection. Returns 1 if admitted (counter
+ * incremented), 0 if at capacity (caller must close the fd). */
+static inline int amalgame_net_http_conn_admit(void) {
+    long max = amalgame_net_http_max_conns;
+    long cur = __sync_add_and_fetch(&amalgame_net_http_active_conns, 1);
+    if (max > 0 && cur > max) {
+        __sync_sub_and_fetch(&amalgame_net_http_active_conns, 1);
+        return 0;
+    }
+    return 1;
+}
+static inline void amalgame_net_http_conn_release(void) {
+    __sync_sub_and_fetch(&amalgame_net_http_active_conns, 1);
+}
+
 #define AMALGAME_NH_MAX_LISTEN_FDS 8
 static int amalgame_net_http_listen_fds[AMALGAME_NH_MAX_LISTEN_FDS];
 static int amalgame_net_http_listen_fd_count = 0;
@@ -878,6 +909,7 @@ static void* amalgame_h2_mt_worker(void* p) {
         AmalgameClosure_call1(a->handler, (void*) a->conn);
     }
     Amalgame_Net_Http_H2Conn_Close(a->conn);
+    amalgame_net_http_conn_release();
     return NULL;
 }
 
@@ -902,6 +934,11 @@ static inline i64 Amalgame_Net_Http_Http2_ServeMt(i64 port,
     while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(srv);
         if (!conn) continue;
+        /* Connection cap: reject (close) when at capacity. */
+        if (!amalgame_net_http_conn_admit()) {
+            Amalgame_Net_Http_H2Conn_Close(conn);
+            continue;
+        }
         amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) GC_MALLOC(sizeof(*a));
         a->conn = conn; a->handler = handler;
         pthread_t t;
@@ -1247,6 +1284,11 @@ static inline i64 Amalgame_Net_Http_Https_ServeMt(i64 port,
     while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(srv);
         if (!conn) continue;
+        /* Connection cap: reject (close) when at capacity. */
+        if (!amalgame_net_http_conn_admit()) {
+            Amalgame_Net_Http_H2Conn_Close(conn);
+            continue;
+        }
         amalgame_h2_mt_arg* a = (amalgame_h2_mt_arg*) GC_MALLOC(sizeof(*a));
         a->conn = conn; a->handler = handler;
         pthread_t t;
@@ -2962,6 +3004,7 @@ static void* amalgame_https_h1_mt_worker(void* p) {
         AmalgameClosure_call1(a->handler, (void*)a->conn);
     }
     Amalgame_Net_Http_H1Conn_Close(a->conn);
+    amalgame_net_http_conn_release();
     return NULL;
 }
 
@@ -2998,6 +3041,11 @@ static inline i64 Amalgame_Net_Http_Https_H1ServeMt(i64 port,
         AmalgameH1Conn* conn = Amalgame_Net_Http_HttpsH1Server_Accept(srv);
         if (!conn) {
             if (amalgame_net_http_stopping) break;
+            continue;
+        }
+        /* Connection cap: reject (close) when at capacity. */
+        if (!amalgame_net_http_conn_admit()) {
+            Amalgame_Net_Http_H1Conn_Close(conn);
             continue;
         }
         amalgame_https_h1_mt_arg* a =
@@ -3413,6 +3461,7 @@ static void* amalgame_h1_mt_worker(void* p) {
         AmalgameClosure_call1(a->handler, (void*)a->conn);
     }
     Amalgame_Net_Http_H1Conn_Close(a->conn);
+    amalgame_net_http_conn_release();
     return NULL;
 }
 
@@ -3439,6 +3488,11 @@ static inline i64 Amalgame_Net_Http_Http1_ServeMt(i64 port,
     while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
+        /* Connection cap: reject (close) when at capacity. */
+        if (!amalgame_net_http_conn_admit()) {
+            Amalgame_Net_Http_H1Conn_Close(conn);
+            continue;
+        }
         amalgame_h1_mt_arg* a =
             (amalgame_h1_mt_arg*) GC_MALLOC(sizeof(*a));
         a->conn    = conn;
@@ -3507,6 +3561,7 @@ static void* amalgame_h1_mt_with_worker(void* p) {
         Amalgame_Net_Http_H1Conn_ResetForReuse(a->conn);
     }
     Amalgame_Net_Http_H1Conn_Close(a->conn);
+    amalgame_net_http_conn_release();
     return NULL;
 }
 
@@ -3537,6 +3592,11 @@ static inline i64 Amalgame_Net_Http_Http1_ServeMtWith(i64 port,
     while (srv->listening && !amalgame_net_http_stopping) {
         AmalgameH1Conn* conn = Amalgame_Net_Http_H1Server_Accept(srv);
         if (!conn) continue;
+        /* Connection cap: reject (close) when at capacity. */
+        if (!amalgame_net_http_conn_admit()) {
+            Amalgame_Net_Http_H1Conn_Close(conn);
+            continue;
+        }
         amalgame_h1_mt_with_arg* a =
             (amalgame_h1_mt_with_arg*) GC_MALLOC(sizeof(*a));
         a->conn    = conn;

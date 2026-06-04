@@ -458,6 +458,18 @@ int main(void) {
     check(amalgame_ws_origin_allowed("https://app.example.com.evil.com", list) == 0, "suffix-extension -> deny");
     check(amalgame_ws_origin_allowed("HTTPS://APP.EXAMPLE.COM", list)    == 1, "case-insensitive -> allow");
 
+    /* G10 — connection-level cap */
+    Amalgame_Net_Http_Http1_SetMaxConnections(2);
+    check(amalgame_net_http_conn_admit() == 1, "conn admit 1/2");
+    check(amalgame_net_http_conn_admit() == 1, "conn admit 2/2");
+    check(amalgame_net_http_conn_admit() == 0, "conn admit 3 -> rejected (at cap)");
+    check(Amalgame_Net_Http_Http1_ActiveConnections() == 2, "active conns == 2");
+    amalgame_net_http_conn_release();
+    check(amalgame_net_http_conn_admit() == 1, "after release admit again");
+    Amalgame_Net_Http_Http1_SetMaxConnections(0);
+    { int u = 1; for (int i = 0; i < 50; i++) u = u && amalgame_net_http_conn_admit();
+      check(u == 1, "unlimited (max=0) admits all"); }
+
     if (fails == 0) { printf("PASS\n"); return 0; }
     printf("FAIL (%d)\n", fails); return 1;
 }

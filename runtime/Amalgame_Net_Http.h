@@ -267,6 +267,75 @@ static inline void amalgame_net_http_set_reuseport(int fd) {
 #endif
 }
 
+/* Dual-stack listener (v0.21.0). An AF_INET6 socket with IPV6_V6ONLY=0
+ * accepts BOTH IPv6 and IPv4 clients (the latter arrive as v4-mapped
+ * ::ffff:a.b.c.d). Falls back to a plain AF_INET socket when IPv6 is
+ * unavailable on the host (so behaviour never regresses). Returns a
+ * bound + listening fd with SO_REUSEADDR (+ SO_REUSEPORT), or -1. */
+static inline int amalgame_net_http_listen_dual(i64 port, i64 backlog) {
+    int blog = (backlog > 0 ? (int)backlog : 64);
+    int one = 1;
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd >= 0) {
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        amalgame_net_http_set_reuseport(fd);
+        int zero = 0;                       /* accept IPv4 on this v6 socket */
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof(a6));
+        a6.sin6_family = AF_INET6;
+        a6.sin6_addr   = in6addr_any;
+        a6.sin6_port   = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr*)&a6, sizeof(a6)) == 0 &&
+            listen(fd, blog) == 0) {
+            return fd;
+        }
+        close(fd);
+    }
+    /* Fallback: IPv4-only. */
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    amalgame_net_http_set_reuseport(fd);
+    struct sockaddr_in a4;
+    memset(&a4, 0, sizeof(a4));
+    a4.sin_family      = AF_INET;
+    a4.sin_addr.s_addr = INADDR_ANY;
+    a4.sin_port        = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&a4, sizeof(a4)) < 0 ||
+        listen(fd, blog) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Format an accepted peer as "ip:port". A v4-mapped IPv6 address
+ * (::ffff:a.b.c.d), which is how an IPv4 client appears on a dual-stack
+ * socket, is rendered as plain "a.b.c.d" so RemoteAddr stays IPv4 for
+ * IPv4 clients — preserving rate-limit keys, Host-guard and access-log
+ * semantics across the dual-stack switch. (v0.21.0) */
+static inline void amalgame_net_http_peer_str(
+        struct sockaddr_storage* ss, char* out, size_t outn) {
+    char ip[64]; ip[0] = '\0'; unsigned pport = 0;
+    if (ss->ss_family == AF_INET6) {
+        struct sockaddr_in6* s6 = (struct sockaddr_in6*)ss;
+        pport = ntohs(s6->sin6_port);
+        if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+            struct in_addr a4;
+            memcpy(&a4, &s6->sin6_addr.s6_addr[12], 4);
+            inet_ntop(AF_INET, &a4, ip, sizeof(ip));
+        } else {
+            inet_ntop(AF_INET6, &s6->sin6_addr, ip, sizeof(ip));
+        }
+    } else if (ss->ss_family == AF_INET) {
+        struct sockaddr_in* s4 = (struct sockaddr_in*)ss;
+        pport = ntohs(s4->sin_port);
+        inet_ntop(AF_INET, &s4->sin_addr, ip, sizeof(ip));
+    }
+    snprintf(out, outn, "%s:%u", ip, pport);
+}
+
 /* ────────────────────────────────────────────────────────────────
  * AmalgameH2Conn — one h2c connection.
  * ──────────────────────────────────────────────────────────────── */
@@ -1896,22 +1965,9 @@ static inline AmalgameH1Server* Amalgame_Net_Http_H1Server_Listen(i64 port, i64 
         (AmalgameH1Server*)GC_MALLOC(sizeof(AmalgameH1Server));
     s->fd = -1; s->listening = 0; s->port = port;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* v0.21.0: dual-stack (IPv6 + IPv4) listener; IPv4-only fallback. */
+    int fd = amalgame_net_http_listen_dual(port, backlog);
     if (fd < 0) return s;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    amalgame_net_http_set_reuseport(fd);
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
-        close(fd);
-        return s;
-    }
     s->fd = fd;
     s->listening = 1;
     Amalgame_Net_Http_InstallShutdownSignals();
@@ -1927,20 +1983,17 @@ static inline code_bool Amalgame_Net_Http_H1Server_IsListening(
 static inline AmalgameH1Conn* Amalgame_Net_Http_H1Server_Accept(
         AmalgameH1Server* s) {
     if (!s || !s->listening || s->fd < 0) return NULL;
-    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
-    int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
+    struct sockaddr_storage ss; socklen_t alen = sizeof(ss);
+    int cfd = accept(s->fd, (struct sockaddr*)&ss, &alen);
     if (cfd < 0) return NULL;
     AmalgameH1Conn* c =
         (AmalgameH1Conn*)GC_MALLOC(sizeof(AmalgameH1Conn));
     memset(c, 0, sizeof(*c));
     c->fd = cfd;
-    /* v0.7.0: capture peer "ip:port" into a stack-NUL-terminated
-     * buffer. inet_ntoa is fine for IPv4 (sockaddr_in); a v0.8.x
-     * extension can switch to inet_ntop for IPv6 once sockaddr_in6
-     * is plumbed through the rest of the server stack. */
-    snprintf(c->remote_addr, sizeof(c->remote_addr),
-             "%s:%u", inet_ntoa(addr.sin_addr),
-             (unsigned) ntohs(addr.sin_port));
+    /* v0.21.0: capture peer "ip:port"; v4-mapped IPv6 (an IPv4 client on
+     * the dual-stack socket) is normalized back to plain IPv4 so
+     * RemoteAddr semantics are unchanged for IPv4 clients. */
+    amalgame_net_http_peer_str(&ss, c->remote_addr, sizeof(c->remote_addr));
     return c;
 }
 
@@ -2715,20 +2768,9 @@ static inline AmalgameHttpsH1Server* Amalgame_Net_Http_HttpsH1Server_Listen(
     memset(s, 0, sizeof(*s));
     s->port = port; s->fd = -1;
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* v0.21.0: dual-stack (IPv6 + IPv4) listener; IPv4-only fallback. */
+    int fd = amalgame_net_http_listen_dual(port, backlog);
     if (fd < 0) return s;
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    amalgame_net_http_set_reuseport(fd);
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port        = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
-        listen(fd, (backlog > 0 ? (int)backlog : 64)) < 0) {
-        close(fd); return s;
-    }
     s->fd = fd;
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
@@ -2791,7 +2833,7 @@ static inline code_bool Amalgame_Net_Http_HttpsH1Server_AddSni(
 static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
         AmalgameHttpsH1Server* s) {
     if (!s || !s->listening || s->fd < 0) return NULL;
-    struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+    struct sockaddr_storage addr; socklen_t alen = sizeof(addr);
     int cfd = accept(s->fd, (struct sockaddr*)&addr, &alen);
     if (cfd < 0) return NULL;
     /* Bound the TLS handshake with a recv/send timeout. SSL_accept runs
@@ -2845,11 +2887,8 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
     memset(c, 0, sizeof(*c));
     c->fd  = cfd;
     c->ssl = ssl;
-    char ipbuf[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &addr.sin_addr, ipbuf, sizeof(ipbuf))) {
-        snprintf(c->remote_addr, sizeof(c->remote_addr),
-                 "%s:%u", ipbuf, (unsigned) ntohs(addr.sin_port));
-    }
+    /* v0.21.0: dual-stack peer; v4-mapped IPv6 normalized back to IPv4. */
+    amalgame_net_http_peer_str(&addr, c->remote_addr, sizeof(c->remote_addr));
     return c;
 }
 
@@ -3265,7 +3304,7 @@ static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
             (i64) ctx->srv->fd, 1000);
         if (!ready) continue;
 
-        struct sockaddr_in addr;
+        struct sockaddr_storage addr;
         socklen_t alen = sizeof(addr);
         /* accept4 needs _GNU_SOURCE; we plain-accept + fcntl-after
          * so the build doesn't depend on per-file feature macros.
@@ -3292,9 +3331,8 @@ static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
         memset(c, 0, sizeof(*c));
         c->fd = cfd;
         c->async_io = 1;
-        snprintf(c->remote_addr, sizeof(c->remote_addr),
-                 "%s:%u", inet_ntoa(addr.sin_addr),
-                 (unsigned) ntohs(addr.sin_port));
+        /* v0.21.0: dual-stack peer; v4-mapped IPv6 normalized to IPv4. */
+        amalgame_net_http_peer_str(&addr, c->remote_addr, sizeof(c->remote_addr));
 
         /* FiberSpawn passes arg as i64 — round-trip the conn pointer
          * through (i64)(intptr_t) to preserve all bits. */

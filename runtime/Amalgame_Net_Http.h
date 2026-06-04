@@ -1664,6 +1664,39 @@ static int amalgame_h1_send_all(AmalgameH1Conn* c, const void* buf, size_t n) {
 /* ── parse one HTTP/1.1 request off the wire ─────────────────────
  * Returns 1 on success, 0 on clean peer close, -1 on parse error.
  * Caller owns the conn struct; we fill in method/path/headers/body. */
+/* Request-framing safety (anti request-smuggling). Returns 1 if the parsed
+ * header set is unambiguously framable, 0 if it must be rejected. Pulled
+ * out of amalgame_h1_parse_request so it can be unit-tested. RFC 7230
+ * §3.3.3:
+ *   - Content-Length AND Transfer-Encoding together → reject (CL.TE/TE.CL).
+ *   - Any Transfer-Encoding on a request → reject (this server doesn't
+ *     decode chunked request bodies; honoring CL/0 would leave the chunk
+ *     framing on the wire and desync the next request).
+ *   - Conflicting duplicate Content-Length → reject (CL.CL).
+ *   - Non-numeric Content-Length → reject (atoi() would mis-frame). */
+static inline int amalgame_h1_framing_ok(const AmalgameH1Header* headers, int count) {
+    int cl_count = 0, te_count = 0;
+    const char* cl_val = NULL;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(headers[i].name, "content-length") == 0) {
+            if (cl_count > 0 && cl_val && strcmp(cl_val, headers[i].value) != 0) return 0;
+            cl_val = headers[i].value;
+            cl_count++;
+        } else if (strcmp(headers[i].name, "transfer-encoding") == 0) {
+            te_count++;
+        }
+    }
+    if (te_count > 0 && cl_count > 0) return 0;
+    if (te_count > 0) return 0;
+    if (cl_val) {
+        if (cl_val[0] == '\0') return 0;
+        for (const char* p = cl_val; *p; p++) {
+            if (*p < '0' || *p > '9') return 0;
+        }
+    }
+    return 1;
+}
+
 static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     char* buf = (char*)GC_MALLOC_ATOMIC(AMALGAME_H1_RECV_BUF + 1);
     int total = 0;
@@ -1704,6 +1737,12 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     int meth_len = (int)(sp1 - buf);
     int targ_len = (int)(sp2 - sp1 - 1);
     int vers_len = (int)(eol - sp2 - 1);
+
+    /* Strict request line: reject empty method / target / version. This
+     * catches double-space request lines ("GET  /x HTTP/1.1" → empty
+     * target) that strict proxies and this server could frame
+     * differently — a request-line desync vector. */
+    if (meth_len == 0 || targ_len == 0 || vers_len == 0) return -1;
 
     /* Per-conn URL cap. Same fallback rule. */
     if (c->config && c->config->max_url_bytes > 0
@@ -1763,6 +1802,9 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
         }
         line = eol2 + 2;
     }
+
+    /* ── Anti-smuggling header validation (RFC 7230 §3.3.3) ─────── */
+    if (!amalgame_h1_framing_ok(c->headers, c->header_count)) return -1;
 
     /* ── Body — only if Content-Length present ─────────────────── */
     int content_length = 0;
@@ -3962,10 +4004,35 @@ static inline int amalgame_ws_pick_subprotocol(const char* offered,
  * offers a Sec-WebSocket-Protocol the server supports, the first match
  * is echoed in the 101 and stored on the conn; otherwise the header is
  * omitted (RFC 6455 — do NOT fail the handshake). */
+/* Exact-match origin allow-list check (case-insensitive). Returns 1 iff
+ * `origin` equals one of the comma-separated entries in `csv` (surrounding
+ * spaces ignored). An empty/absent Origin never matches a non-empty list.
+ * Used to defend the WebSocket handshake against Cross-Site WebSocket
+ * Hijacking — browsers always send a truthful Origin a cross-site page
+ * cannot forge. */
+static inline int amalgame_ws_origin_allowed(const char* origin, const char* csv) {
+    if (!origin || !origin[0] || !csv) return 0;
+    size_t olen = strlen(origin);
+    const char* p = csv;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        const char* start = p;
+        while (*p && *p != ',') p++;
+        int len = (int)(p - start);
+        while (len > 0 && start[len - 1] == ' ') len--;
+        if (len > 0 && (size_t)len == olen &&
+            strncasecmp(origin, start, (size_t)len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static inline AmalgameWsConn* amalgame_ws_do_upgrade_ex(int cfd, SSL* ssl,
-        const char* server_protos) {
+        const char* server_protos, const char* allowed_origins) {
     char key[256] = {0};
     char offered[256] = {0};
+    char origin[256] = {0};
     int seen_upgrade = 0;
     char line[1024];
     int rv;
@@ -3980,6 +4047,10 @@ static inline AmalgameWsConn* amalgame_ws_do_upgrade_ex(int cfd, SSL* ssl,
             const char* v = line + 23;
             while (*v == ' ' || *v == '\t') v++;
             strncpy(offered, v, sizeof(offered) - 1);
+        } else if (strncasecmp(line, "Origin:", 7) == 0) {
+            const char* v = line + 7;
+            while (*v == ' ' || *v == '\t') v++;
+            strncpy(origin, v, sizeof(origin) - 1);
         } else if (strncasecmp(line, "Upgrade:", 8) == 0) {
             const char* p = line;
             while (*p) {
@@ -3996,6 +4067,18 @@ static inline AmalgameWsConn* amalgame_ws_do_upgrade_ex(int cfd, SSL* ssl,
         const char* bad = "HTTP/1.1 400 Bad Request\r\n"
                           "Content-Length: 0\r\nConnection: close\r\n\r\n";
         amalgame_ws_write_full(cfd, ssl, bad, strlen(bad));
+        goto fail;
+    }
+
+    /* Origin allow-list (anti Cross-Site WebSocket Hijacking). Only
+     * enforced when the caller configured a non-empty list. The browser
+     * sends a truthful Origin that a malicious cross-site page cannot
+     * forge, so an off-list (or absent) Origin → 403, no upgrade. */
+    if (allowed_origins && allowed_origins[0] &&
+        !amalgame_ws_origin_allowed(origin, allowed_origins)) {
+        const char* forbidden = "HTTP/1.1 403 Forbidden\r\n"
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+        amalgame_ws_write_full(cfd, ssl, forbidden, strlen(forbidden));
         goto fail;
     }
 
@@ -4038,9 +4121,9 @@ fail:
     return NULL;
 }
 
-/* Legacy entry — no subprotocol negotiation. */
+/* Legacy entry — no subprotocol negotiation, no origin restriction. */
 static inline AmalgameWsConn* amalgame_ws_do_upgrade(int cfd, SSL* ssl) {
-    return amalgame_ws_do_upgrade_ex(cfd, ssl, NULL);
+    return amalgame_ws_do_upgrade_ex(cfd, ssl, NULL, NULL);
 }
 
 /* Accept one connection + perform WS handshake (raw ws://). */
@@ -4110,7 +4193,43 @@ static inline i64 Amalgame_Net_Http_Ws_ServeWithProtocols(i64 port,
         struct sockaddr_in addr; socklen_t alen = sizeof(addr);
         int cfd = accept(srv->fd, (struct sockaddr*)&addr, &alen);
         if (cfd < 0) continue;
-        AmalgameWsConn* conn = amalgame_ws_do_upgrade_ex(cfd, NULL, protocols);
+        AmalgameWsConn* conn = amalgame_ws_do_upgrade_ex(cfd, NULL, protocols, NULL);
+        if (!conn) continue;
+        AmalgameClosure_call1(handler, (void*)conn);
+        Amalgame_Net_Http_WsConn_Close(conn);
+    }
+    Amalgame_Net_Http_WsServer_Close(srv);
+    return 0;
+}
+
+/* v0.18.0: Ws.ServeWithOrigins(port, csv, handler) — single-thread
+ * WebSocket that rejects (403) any handshake whose Origin header is not in
+ * the comma-separated allow-list. Defense against Cross-Site WebSocket
+ * Hijacking (CSWSH): unlike fetch/XHR, the WS handshake is not gated by
+ * the browser's CORS check, so a cross-site page can open a socket to an
+ * authenticated endpoint — but it cannot forge the Origin the browser
+ * stamps, which this list verifies. Pass exact origins
+ * ("https://app.example.com,https://admin.example.com"). */
+static inline i64 Amalgame_Net_Http_Ws_ServeWithOrigins(i64 port,
+        code_string origins, AmalgameClosure* handler) {
+    if (!handler) {
+        fprintf(stderr, "Ws.ServeWithOrigins: handler is NULL\n");
+        return -1;
+    }
+    AmalgameWsServer* srv = Amalgame_Net_Http_WsServer_Listen(port, 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Ws.ServeWithOrigins: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    fprintf(stdout, "Ws.ServeWithOrigins: listening on :%lld (WebSocket)\n",
+            (long long)port);
+    fflush(stdout);
+    while (srv->listening && !amalgame_net_http_stopping) {
+        struct sockaddr_in addr; socklen_t alen = sizeof(addr);
+        int cfd = accept(srv->fd, (struct sockaddr*)&addr, &alen);
+        if (cfd < 0) continue;
+        AmalgameWsConn* conn = amalgame_ws_do_upgrade_ex(cfd, NULL, NULL, origins);
         if (!conn) continue;
         AmalgameClosure_call1(handler, (void*)conn);
         Amalgame_Net_Http_WsConn_Close(conn);

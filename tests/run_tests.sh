@@ -410,6 +410,62 @@ else
     exit 1
 fi
 
+# ── v0.18.0: security — request framing (anti-smuggling) + WS origin ──
+echo -e "\n── Security (framing_ok + ws_origin_allowed) ──"
+cat > "$BUILD_DIR/security_smoke.c" <<'EOF'
+#include "Amalgame_Net_Http.h"
+#include <stdio.h>
+#include <string.h>
+static int fails = 0;
+static void check(int cond, const char* label) {
+    if (cond) printf("[PASS] %s\n", label);
+    else { printf("[FAIL] %s\n", label); fails++; }
+}
+int main(void) {
+    /* G8 — request framing / anti request-smuggling */
+    AmalgameH1Header ok2[]   = { {(char*)"content-length",(char*)"5"}, {(char*)"host",(char*)"x"} };
+    AmalgameH1Header clte[]  = { {(char*)"content-length",(char*)"5"}, {(char*)"transfer-encoding",(char*)"chunked"} };
+    AmalgameH1Header te[]    = { {(char*)"transfer-encoding",(char*)"chunked"} };
+    AmalgameH1Header dupd[]  = { {(char*)"content-length",(char*)"5"}, {(char*)"content-length",(char*)"6"} };
+    AmalgameH1Header dups[]  = { {(char*)"content-length",(char*)"5"}, {(char*)"content-length",(char*)"5"} };
+    AmalgameH1Header badcl[] = { {(char*)"content-length",(char*)"5abc"} };
+    AmalgameH1Header none1[] = { {(char*)"host",(char*)"x"} };
+    check(amalgame_h1_framing_ok(ok2, 2)   == 1, "CL only -> ok");
+    check(amalgame_h1_framing_ok(clte, 2)  == 0, "CL+TE -> reject (smuggling)");
+    check(amalgame_h1_framing_ok(te, 1)    == 0, "TE alone -> reject");
+    check(amalgame_h1_framing_ok(dupd, 2)  == 0, "conflicting dup CL -> reject");
+    check(amalgame_h1_framing_ok(dups, 2)  == 1, "identical dup CL -> ok");
+    check(amalgame_h1_framing_ok(badcl, 1) == 0, "non-numeric CL -> reject");
+    check(amalgame_h1_framing_ok(none1, 1) == 1, "no CL/TE -> ok");
+
+    /* G4 — WebSocket origin allow-list (anti CSWSH) */
+    const char* list = "https://app.example.com, https://admin.example.com";
+    check(amalgame_ws_origin_allowed("https://app.example.com", list)   == 1, "listed origin -> allow");
+    check(amalgame_ws_origin_allowed("https://admin.example.com", list) == 1, "2nd listed origin -> allow");
+    check(amalgame_ws_origin_allowed("https://evil.example.com", list)  == 0, "off-list origin -> deny");
+    check(amalgame_ws_origin_allowed("", list)                          == 0, "absent origin -> deny");
+    check(amalgame_ws_origin_allowed("https://app.example.com.evil.com", list) == 0, "suffix-extension -> deny");
+    check(amalgame_ws_origin_allowed("HTTPS://APP.EXAMPLE.COM", list)    == 1, "case-insensitive -> allow");
+
+    if (fails == 0) { printf("PASS\n"); return 0; }
+    printf("FAIL (%d)\n", fails); return 1;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/security_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/security_smoke" 2>&1 | head -8
+if [ ! -x "$BUILD_DIR/security_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (security smoke build)"
+    exit 1
+fi
+SEC_OUT=$("$BUILD_DIR/security_smoke")
+echo "$SEC_OUT"
+if echo "$SEC_OUT" | grep -q "^PASS$"; then
+    echo -e "${GREEN}PASS${NC} (request framing + WS origin)"
+else
+    echo -e "${RED}FAIL${NC} (security smoke)"
+    exit 1
+fi
+
 # ── End-to-end (server + client as separate processes) ────────────
 echo -e "\n── End-to-end test (server + client) ──"
 build_test tests/server_test.am "$BUILD_DIR/server_test" || { echo "server build failed"; exit 1; }

@@ -1,0 +1,96 @@
+// Security hardening tests (v0.19.0): upload filename sanitization (G12),
+// open-redirect-safe RedirectLocal (G15), SSRF HostIsPublic (G16).
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+
+public class Program {
+    static int expect(bool cond, string label) {
+        if (cond) { Console.WriteLine("[PASS] " + label); return 0 }
+        Console.WriteLine("[FAIL] " + label); return 1
+    }
+
+    static UploadedFile fileNamed(string name) {
+        let f: UploadedFile = new UploadedFile()
+        f.Filename = name
+        return f
+    }
+
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-net-http — hardening tests")
+        var failed: int = 0
+
+        // ── G12: UploadedFile.SafeFilename ───────────────────
+        failed = failed + Program.expect(
+            Program.fileNamed("photo.png").SafeFilename() == "photo.png",
+            "safe filename kept")
+        failed = failed + Program.expect(
+            Program.fileNamed("../../etc/passwd").SafeFilename() == "passwd",
+            "traversal stripped to basename")
+        failed = failed + Program.expect(
+            Program.fileNamed("/etc/cron.d/x").SafeFilename() == "x",
+            "absolute path stripped")
+        failed = failed + Program.expect(
+            Program.fileNamed("..\\..\\win.ini").SafeFilename() == "win.ini",
+            "backslash traversal stripped")
+        failed = failed + Program.expect(
+            Program.fileNamed(".bashrc").SafeFilename() == "bashrc",
+            "leading dot dropped")
+        failed = failed + Program.expect(
+            Program.fileNamed("a b;rm -rf*.txt").SafeFilename() == "a_b_rm_-rf_.txt",
+            "unsafe chars replaced")
+        failed = failed + Program.expect(
+            Program.fileNamed("..").SafeFilename() == "upload",
+            "dot-dot → upload fallback")
+        failed = failed + Program.expect(
+            Program.fileNamed("IMG.JPG").Extension() == ".jpg",
+            "extension lower-cased")
+
+        // ── G15: HttpResponse.RedirectLocal ──────────────────
+        let r1: HttpResponse = HttpResponse.New().RedirectLocal("/dashboard", false)
+        failed = failed + Program.expect(
+            r1.StatusCode == 302 && r1.Headers.Get("Location") == "/dashboard",
+            "local path allowed")
+        let r2: HttpResponse = HttpResponse.New().RedirectLocal("//evil.com/x", false)
+        failed = failed + Program.expect(
+            r2.Headers.Get("Location") == "/",
+            "scheme-relative //host → /")
+        let r3: HttpResponse = HttpResponse.New().RedirectLocal("https://evil.com", false)
+        failed = failed + Program.expect(
+            r3.Headers.Get("Location") == "/",
+            "absolute URL → /")
+        let r4: HttpResponse = HttpResponse.New().RedirectLocal("/a\r\nSet-Cookie: x=1", false)
+        failed = failed + Program.expect(
+            r4.Headers.Get("Location") == "/",
+            "CRLF in target → /")
+
+        // ── G16: HttpClient.HostIsPublic (IP literals, no DNS) ──
+        failed = failed + Program.expect(
+            HttpClient.HostIsPublic("8.8.8.8"),
+            "public IPv4 allowed")
+        failed = failed + Program.expect(
+            !HttpClient.HostIsPublic("127.0.0.1"),
+            "loopback blocked")
+        failed = failed + Program.expect(
+            !HttpClient.HostIsPublic("10.0.0.5"),
+            "private 10/8 blocked")
+        failed = failed + Program.expect(
+            !HttpClient.HostIsPublic("192.168.1.1"),
+            "private 192.168/16 blocked")
+        failed = failed + Program.expect(
+            !HttpClient.HostIsPublic("169.254.169.254"),
+            "cloud metadata endpoint blocked")
+        failed = failed + Program.expect(
+            !HttpClient.HostIsPublic("::1"),
+            "IPv6 loopback blocked")
+
+        if (failed == 0) {
+            Console.WriteLine("[PASS] hardening suite")
+        } else {
+            Console.WriteLine("[FAIL] hardening suite (" + String_FromInt(failed) + ")")
+        }
+    }
+}

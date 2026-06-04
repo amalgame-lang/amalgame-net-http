@@ -140,6 +140,17 @@ else
     exit 1
 fi
 
+# ── Security hardening: SafeFilename / RedirectLocal / HostIsPublic ──
+echo -e "\n── hardening (G12/G15/G16) ──"
+if build_test tests/hardening_test.am "$BUILD_DIR/hardening_test"; then
+    HOUT="$("$BUILD_DIR/hardening_test")"
+    echo "$HOUT"
+    echo "$HOUT" | grep -q "\[FAIL\]" && { echo -e "${RED}FAIL${NC} (hardening)"; exit 1; }
+else
+    echo -e "${RED}FAIL${NC} (hardening test build)"
+    exit 1
+fi
+
 # ── HttpServerConfig C smoke (no sockets, no AM) ──────────────────
 # The class is a C-struct backed by stdlib.functions; testing it
 # from AM requires the full `amc package add` flow (the manifest

@@ -13,7 +13,10 @@
 //   if (req.IsMultipart()) {
 //     let mp = Multipart.Parse(req)
 //     let avatar = mp.File("avatar")     // UploadedFile or null
-//     if (avatar != null) { avatar.SaveTo("/uploads/" + avatar.Filename) }
+//     // Use SaveToDir (size cap + sanitized basename) — NOT
+//     // SaveTo("/uploads/" + avatar.Filename), whose raw Filename is
+//     // attacker-controlled and can traverse ("../../etc/...").
+//     if (avatar != null) { avatar.SaveToDir("/uploads", 5 * 1024 * 1024) }
 //     let note = mp.Field("note")        // text field
 //   }
 
@@ -45,8 +48,71 @@ public class UploadedFile {
     // use Bytes()/SaveTo for binary content.
     public string Text() { return Multipart.bytesToString(this.Data) }
 
+    // A filesystem-safe basename derived from the client Filename:
+    // directory components (`/`, `\`) and any leading dots are stripped,
+    // and every character outside [A-Za-z0-9._-] becomes '_'. Never
+    // empty (falls back to "upload"), never "." / "..". ALWAYS build an
+    // upload path from this, never from the raw Filename — otherwise a
+    // crafted filename ("../../etc/cron.d/x", "/etc/passwd", ".bashrc")
+    // escapes the upload directory or writes a hidden file.
+    public string SafeFilename() {
+        var b: string = this.Filename
+        let s1: int = String_LastIndexOf(b, "/")
+        if (s1 >= 0) { b = String_Substring(b, s1 + 1, String_Length(b) - s1 - 1) }
+        let s2: int = String_LastIndexOf(b, "\\")
+        if (s2 >= 0) { b = String_Substring(b, s2 + 1, String_Length(b) - s2 - 1) }
+        // Drop leading dots so we never emit "." / ".." / ".hidden".
+        var start: int = 0
+        while (start < String_Length(b) && String_CharAt1(b, start) == ".") {
+            start = start + 1
+        }
+        b = String_Substring(b, start, String_Length(b) - start)
+        var out: string = ""
+        let n: int = String_Length(b)
+        var i: int = 0
+        while (i < n) {
+            let ch: string = String_CharAt1(b, i)
+            if (UploadedFile.isSafeChar(ch)) { out = out + ch } else { out = out + "_" }
+            i = i + 1
+        }
+        if (String_Length(out) == 0) { return "upload" }
+        return out
+    }
+
+    // Lower-cased extension of the SAFE filename, including the dot
+    // (".png"); "" if none. Use with an allow-list:
+    //   if (f.Extension() == ".png" || f.Extension() == ".jpg") { … }
+    public string Extension() {
+        let f: string = this.SafeFilename()
+        let dot: int = String_LastIndexOf(f, ".")
+        if (dot < 0) { return "" }
+        return String_ToLower(String_Substring(f, dot, String_Length(f) - dot))
+    }
+
+    // Safe save: rejects (false) an over-`maxBytes` upload (0 = no cap),
+    // derives a sanitized basename, and writes it into `dir`. This is the
+    // path-traversal-safe counterpart to SaveTo — prefer it for any
+    // client upload.
+    public bool SaveToDir(string dir, int maxBytes) {
+        if (maxBytes > 0 && this.Data.Count() > maxBytes) { return false }
+        var d: string = dir
+        if (String_Length(d) > 0
+            && String_CharAt1(d, String_Length(d) - 1) != "/") {
+            d = d + "/"
+        }
+        return this.SaveTo(d + this.SafeFilename())
+    }
+
+    // [A-Za-z0-9._-] — the only characters kept verbatim in SafeFilename.
+    static bool isSafeChar(string ch) {
+        let safe: string = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+        return String_IndexOf(safe, ch) >= 0
+    }
+
     // Write the raw bytes to `path` (binary, "wb"). Returns false on
-    // open failure. The only file-writing FFI in the package.
+    // open failure. The only file-writing FFI in the package. NOTE:
+    // `path` is used verbatim — for client uploads use SaveToDir, which
+    // sanitizes the filename and caps the size.
     public bool SaveTo(string path) {
         var ok: bool = false
         let n: int = this.Data.Count()

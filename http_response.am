@@ -141,6 +141,33 @@ public class HttpResponse {
         return this
     }
 
+    // Open-redirect-safe redirect. Only a same-origin *path* is allowed:
+    // the target must start with a single "/" (NOT "//host" or "/\host",
+    // which browsers treat as scheme-relative → external), must carry no
+    // scheme ("://"), and no CR/LF. Anything else is replaced with "/".
+    // Use this whenever the target derives from user input (?next=…,
+    // Referer, a form field): plain Redirect() trusts its argument
+    // verbatim and becomes an open redirect when fed attacker data.
+    public HttpResponse RedirectLocal(string path, bool permanent) {
+        var target: string = path
+        if (!HttpResponse.isLocalPath(target)) { target = "/" }
+        return this.Redirect(target, permanent)
+    }
+
+    static bool isLocalPath(string p) {
+        if (String_Length(p) == 0) { return false }
+        if (String_CharAt1(p, 0) != "/") { return false }
+        // Reject scheme-relative "//host" / "/\host".
+        if (String_Length(p) >= 2) {
+            let c1: string = String_CharAt1(p, 1)
+            if (c1 == "/" || c1 == "\\") { return false }
+        }
+        // Reject an embedded scheme and CR/LF header injection.
+        if (String_IndexOf(p, "://") >= 0) { return false }
+        if (String_IndexOf(p, "\r") >= 0 || String_IndexOf(p, "\n") >= 0) { return false }
+        return true
+    }
+
     public HttpResponse SetCookie(Cookie c) {
         this.Headers.Set("Set-Cookie", c.ToHeader())
         return this

@@ -737,6 +737,63 @@ else
 fi
 
 
+# ── H2 client over TLS smoke (v0.24.0: H2Client.ConnectTls ↔ HttpsServer)
+echo -e "\n── H2 client over TLS smoke (ConnectTls ↔ HttpsServer) ──"
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "openssl not found — skipping TLS client smoke"
+else
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$BUILD_DIR/g.key" -out "$BUILD_DIR/g.crt" \
+        -days 2 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+    cat > "$BUILD_DIR/h2tls_smoke.c" <<EOF
+#define GC_THREADS
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <gc.h>
+#include "Amalgame_Net_Http.h"
+static int PORT=50104;
+static void* st(void* a){ (void)a;
+    AmalgameHttpsServer* s = Amalgame_Net_Http_HttpsServer_Listen((i64)PORT, "$BUILD_DIR/g.crt", "$BUILD_DIR/g.key", 16);
+    if(!Amalgame_Net_Http_HttpsServer_IsListening(s)) return NULL;
+    AmalgameH2Conn* conn = Amalgame_Net_Http_HttpsServer_Accept(s);
+    if(!conn) return NULL;
+    if(Amalgame_Net_Http_H2Conn_NextRequest(conn)<=0) return NULL;
+    i64 blen = Amalgame_Net_Http_H2Conn_BodyLen(conn);
+    AmalgameList* reply = AmalgameList_new();
+    for(i64 i=0;i<blen;i++) AmalgameList_add(reply,(void*)(intptr_t)(int)Amalgame_Net_Http_H2Conn_BodyByteAt(conn,i));
+    Amalgame_Net_Http_H2Conn_RespondGrpc(conn, reply, 0, "ok");
+    return NULL;
+}
+int main(void){
+    GC_INIT();
+    pthread_t th; GC_pthread_create(&th,NULL,st,NULL);
+    usleep(500000);
+    AmalgameH2Client* c = Amalgame_Net_Http_H2Client_ConnectTls("localhost",(i64)PORT,(i64)1);
+    if(!Amalgame_Net_Http_H2Client_IsConnected(c)){ printf("connect fail\n"); return 1; }
+    static const unsigned char body[5]={0x00,0xFF,0x00,'h','i'};
+    AmalgameList* bl = AmalgameList_new();
+    for(int i=0;i<5;i++) AmalgameList_add(bl,(void*)(intptr_t)(int)body[i]);
+    i64 status = Amalgame_Net_Http_H2Client_Unary(c, "/echo.Echo/Ping", bl, "application/grpc");
+    i64 gs = Amalgame_Net_Http_H2Client_GrpcStatus(c);
+    i64 rl = Amalgame_Net_Http_H2Client_BodyLen(c);
+    int ok=(rl==5); for(i64 i=0;i<rl&&ok;i++) if(Amalgame_Net_Http_H2Client_BodyByteAt(c,i)!=(i64)body[i]) ok=0;
+    GC_pthread_join(th,NULL);
+    printf("h2tls: status=%lld grpc-status=%lld body_ok=%d\n",(long long)status,(long long)gs,ok);
+    return ((status==200)&&(gs==0)&&ok)?0:1;
+}
+EOF
+    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2tls_smoke.c" \
+        -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/h2tls_smoke" 2>&1 | head -6
+    if [ ! -x "$BUILD_DIR/h2tls_smoke" ]; then echo -e "${RED}FAIL${NC} (TLS client smoke build)"; exit 1; fi
+    if "$BUILD_DIR/h2tls_smoke"; then
+        echo -e "${GREEN}PASS${NC} (H2Client.ConnectTls round-trips over TLS)"
+    else
+        echo -e "${RED}FAIL${NC} (TLS client round-trip)"; exit 1
+    fi
+fi
+
+
 # ── Http1.ServeAsync smoke (v0.9.1, Linux epoll) ──────────────────
 # Verifies:
 #   1. Link path — Amalgame_Net_Http.h #includes Amalgame_Async.h,

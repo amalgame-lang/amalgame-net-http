@@ -831,6 +831,13 @@ static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
 
 typedef struct AmalgameH2Client {
     int fd;
+#ifdef AMALGAME_HAS_OPENSSL
+    SSL*     ssl;            /* v0.24.0: non-NULL → TLS (h2) client */
+    SSL_CTX* ssl_ctx;
+#else
+    void*    ssl;
+    void*    ssl_ctx;
+#endif
     nghttp2_session* session;
     const unsigned char* req_body; size_t req_len, req_off;   /* request body source */
     int32_t  resp_status;
@@ -936,6 +943,61 @@ static inline AmalgameH2Client* Amalgame_Net_Http_H2Client_ConnectH2c(code_strin
     c->fd = fd;
     return c;
 }
+
+/* Connect over TLS (ALPN h2). `insecure != 0` skips certificate +
+ * hostname verification (self-signed / dev). Otherwise the system trust
+ * store is used and the hostname is checked. (v0.24.0) */
+static inline AmalgameH2Client* Amalgame_Net_Http_H2Client_ConnectTls(
+        code_string host, i64 port, i64 insecure) {
+    AmalgameH2Client* c = (AmalgameH2Client*) GC_MALLOC(sizeof(AmalgameH2Client));
+    memset(c, 0, sizeof(*c));
+    c->fd = -1; c->resp_status = -1; c->resp_grpc_status[0] = 0;
+#ifdef AMALGAME_HAS_OPENSSL
+    int fd = amalgame_h2c_dial(host ? host : "", (int) port);
+    if (fd < 0) return c;
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { close(fd); return c; }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    if (insecure) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    } else {
+        SSL_CTX_set_default_verify_paths(ctx);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    }
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); close(fd); return c; }
+    SSL_set_fd(ssl, fd);
+    if (host && host[0]) {
+        SSL_set_tlsext_host_name(ssl, host);                 /* SNI */
+        if (!insecure) {
+            X509_VERIFY_PARAM* vp = SSL_get0_param(ssl);
+            X509_VERIFY_PARAM_set1_host(vp, host, 0);
+        }
+    }
+    /* ALPN: advertise just h2 (required for gRPC over TLS). */
+    static const unsigned char alpn_h2[] = { 2, 'h', '2' };
+    SSL_set_alpn_protos(ssl, alpn_h2, sizeof(alpn_h2));
+    if (SSL_connect(ssl) != 1) {
+        if (getenv("AMALGAME_TLS_DEBUG")) ERR_print_errors_fp(stderr);
+        ERR_clear_error(); SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return c;
+    }
+    c->ssl = ssl; c->ssl_ctx = ctx;
+    nghttp2_session_callbacks* cb;
+    nghttp2_session_callbacks_new(&cb);
+    nghttp2_session_callbacks_set_on_header_callback(cb, amalgame_h2c_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, amalgame_h2c_on_data);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cb, amalgame_h2c_on_close);
+    nghttp2_session_client_new(&c->session, cb, c);
+    nghttp2_session_callbacks_del(cb);
+    nghttp2_settings_entry iv[1] = { { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 } };
+    nghttp2_submit_settings(c->session, NGHTTP2_FLAG_NONE, iv, 1);
+    c->fd = fd;
+#else
+    (void) host; (void) port; (void) insecure;
+#endif
+    return c;
+}
+
 static inline code_bool Amalgame_Net_Http_H2Client_IsConnected(AmalgameH2Client* c) {
     return (c && c->fd >= 0 && c->session) ? 1 : 0;
 }
@@ -976,10 +1038,24 @@ static inline i64 Amalgame_Net_Http_H2Client_Unary(AmalgameH2Client* c, code_str
         const uint8_t* out; ssize_t ol;
         while ((ol = nghttp2_session_mem_send(c->session, &out)) > 0) {
             ssize_t off = 0;
-            while (off < ol) { ssize_t w = send(c->fd, out + off, (size_t)(ol - off), 0); if (w <= 0) { c->done = 1; break; } off += w; }
+            while (off < ol) {
+                ssize_t w;
+#ifdef AMALGAME_HAS_OPENSSL
+                if (c->ssl) w = SSL_write(c->ssl, out + off, (int)(ol - off));
+                else
+#endif
+                    w = send(c->fd, out + off, (size_t)(ol - off), 0);
+                if (w <= 0) { c->done = 1; break; }
+                off += w;
+            }
         }
         if (c->done) break;
-        ssize_t r = recv(c->fd, buf, sizeof(buf), 0);
+        ssize_t r;
+#ifdef AMALGAME_HAS_OPENSSL
+        if (c->ssl) r = SSL_read(c->ssl, buf, sizeof(buf));
+        else
+#endif
+            r = recv(c->fd, buf, sizeof(buf), 0);
         if (r <= 0) break;
         if (nghttp2_session_mem_recv(c->session, buf, (size_t) r) < 0) break;
     }
@@ -1008,6 +1084,10 @@ static inline code_string Amalgame_Net_Http_H2Client_ContentType(AmalgameH2Clien
 static inline void Amalgame_Net_Http_H2Client_Close(AmalgameH2Client* c) {
     if (!c) return;
     if (c->session) { nghttp2_session_del(c->session); c->session = NULL; }
+#ifdef AMALGAME_HAS_OPENSSL
+    if (c->ssl) { SSL_shutdown(c->ssl); SSL_free(c->ssl); c->ssl = NULL; }
+    if (c->ssl_ctx) { SSL_CTX_free(c->ssl_ctx); c->ssl_ctx = NULL; }
+#endif
     if (c->fd >= 0) { close(c->fd); c->fd = -1; }
 }
 
@@ -1795,6 +1875,9 @@ static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
 typedef struct AmalgameH2Client { int fd; } AmalgameH2Client;
 static inline AmalgameH2Client* Amalgame_Net_Http_H2Client_ConnectH2c(code_string h, i64 p) {
     (void)h; (void)p; return NULL;
+}
+static inline AmalgameH2Client* Amalgame_Net_Http_H2Client_ConnectTls(code_string h, i64 p, i64 ins) {
+    (void)h; (void)p; (void)ins; return NULL;
 }
 static inline code_bool Amalgame_Net_Http_H2Client_IsConnected(AmalgameH2Client* c) { (void)c; return 0; }
 static inline i64 Amalgame_Net_Http_H2Client_Unary(AmalgameH2Client* c, code_string path,

@@ -384,6 +384,13 @@ typedef struct AmalgameH2Conn {
     char*     resp_body;
     int32_t   resp_body_len;
     int32_t   resp_body_off;
+
+    /* gRPC response mode (v0.22.0): when grpc_mode != 0 the data source
+     * callback closes the DATA without END_STREAM and submits the
+     * grpc-status / grpc-message HTTP/2 *trailers* (mandatory for gRPC). */
+    int32_t   grpc_mode;
+    int32_t   grpc_status;
+    char*     grpc_message;
 } AmalgameH2Conn;
 
 typedef struct AmalgameH2Server {
@@ -557,6 +564,43 @@ static ssize_t amalgame_h2_data_source_cb(nghttp2_session* sess,
     return (ssize_t)copy;
 }
 
+/* gRPC data source (v0.22.0): identical streaming of resp_body, but at
+ * EOF it does NOT end the stream — it sets NGHTTP2_DATA_FLAG_NO_END_STREAM
+ * and submits the trailing HEADERS (grpc-status / grpc-message), which
+ * is how gRPC signals the call result. Per the nghttp2 contract,
+ * nghttp2_submit_trailer is called from inside this callback when
+ * NO_END_STREAM is set. */
+static ssize_t amalgame_h2_grpc_data_cb(nghttp2_session* sess,
+                                        int32_t stream_id,
+                                        uint8_t* buf, size_t length,
+                                        uint32_t* data_flags,
+                                        nghttp2_data_source* source,
+                                        void* user) {
+    (void)source;
+    AmalgameH2Conn* c = (AmalgameH2Conn*)user;
+    int32_t remaining = c->resp_body_len - c->resp_body_off;
+    if (remaining > 0) {
+        size_t copy = (size_t)remaining < length ? (size_t)remaining : length;
+        memcpy(buf, c->resp_body + c->resp_body_off, copy);
+        c->resp_body_off += (int32_t)copy;
+        return (ssize_t)copy;
+    }
+    /* All body bytes sent — emit the gRPC trailers and end the stream. */
+    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+    char st[12];
+    snprintf(st, sizeof(st), "%d", c->grpc_status);
+    const char* gm = c->grpc_message ? c->grpc_message : "";
+    nghttp2_nv tr[2] = {
+        { (uint8_t*)"grpc-status",  (uint8_t*)st,
+          11, strlen(st), NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)"grpc-message", (uint8_t*)gm,
+          12, strlen(gm), NGHTTP2_NV_FLAG_NONE },
+    };
+    nghttp2_submit_trailer(sess, stream_id, tr, 2);
+    return 0;
+}
+
 /* ── Public API (real path) ───────────────────────────── */
 
 static inline AmalgameH2Conn* Amalgame_Net_Http_H2Conn_NewFromFd(i64 fd) {
@@ -658,6 +702,59 @@ static inline code_string Amalgame_Net_Http_H2Conn_Body(AmalgameH2Conn* c) {
 }
 static inline i64 Amalgame_Net_Http_H2Conn_BodyLen(AmalgameH2Conn* c) {
     return (c && c->body) ? (i64)c->body_len : 0;
+}
+/* Binary-safe single-byte request-body access (v0.22.0): the body
+ * buffer may contain embedded NUL bytes (protobuf / gRPC / binary
+ * uploads), which H2Conn_Body's NUL-terminated string view truncates.
+ * Returns the byte at index i (0..255), or -1 out of range. */
+static inline i64 Amalgame_Net_Http_H2Conn_BodyByteAt(AmalgameH2Conn* c, i64 i) {
+    if (!c || !c->body || i < 0 || i >= (i64)c->body_len) return -1;
+    return (i64)(unsigned char)c->body[i];
+}
+
+/* Submit a gRPC response (v0.22.0): :status 200 + content-type
+ * application/grpc, a binary-safe body taken from an AmalgameList<int>
+ * of bytes, and the grpc-status / grpc-message HTTP/2 trailers (emitted
+ * by amalgame_h2_grpc_data_cb once the body is flushed). This is what
+ * makes the stack able to serve real gRPC — H2Conn_Respond can express
+ * neither trailers nor a binary body. */
+static inline void Amalgame_Net_Http_H2Conn_RespondGrpc(AmalgameH2Conn* c,
+                                                        AmalgameList* body,
+                                                        i64 grpc_status,
+                                                        code_string grpc_message) {
+    if (!c || !c->session) return;
+    int n = body ? AmalgameList_count(body) : 0;
+    if (n < 0) n = 0;
+    char* bb = (char*)GC_MALLOC_ATOMIC((size_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        unsigned int b = (unsigned int)(intptr_t) AmalgameList_get(body, i);
+        bb[i] = (char)(b & 0xFFu);
+    }
+    c->resp_body = bb;
+    c->resp_body_len = (int32_t)n;
+    c->resp_body_off = 0;
+    c->grpc_mode = 1;
+    c->grpc_status = (int32_t)grpc_status;
+    if (grpc_message && grpc_message[0]) {
+        size_t ml = strlen(grpc_message);
+        char* m = (char*)GC_MALLOC_ATOMIC(ml + 1);
+        memcpy(m, grpc_message, ml + 1);
+        c->grpc_message = m;
+    } else {
+        c->grpc_message = NULL;
+    }
+
+    nghttp2_nv hdrs[2] = {
+        { (uint8_t*)":status",      (uint8_t*)"200",
+          7, 3, NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)"content-type", (uint8_t*)"application/grpc",
+          12, 16, NGHTTP2_NV_FLAG_NONE },
+    };
+    nghttp2_data_provider dp;
+    dp.source.ptr = c;
+    dp.read_callback = amalgame_h2_grpc_data_cb;
+    nghttp2_submit_response(c->session, c->current_stream, hdrs, 2, &dp);
+    nghttp2_session_send(c->session);
 }
 
 /* Submit response. content_type may be "" (defaults to text/plain). */
@@ -1488,10 +1585,18 @@ static inline code_string Amalgame_Net_Http_H2Conn_Body(AmalgameH2Conn* c) {
 static inline i64 Amalgame_Net_Http_H2Conn_BodyLen(AmalgameH2Conn* c) {
     (void)c; return 0;
 }
+static inline i64 Amalgame_Net_Http_H2Conn_BodyByteAt(AmalgameH2Conn* c, i64 i) {
+    (void)c; (void)i; return -1;
+}
 static inline void Amalgame_Net_Http_H2Conn_Respond(AmalgameH2Conn* c,
                                                      i64 s, code_string ct,
                                                      code_string b) {
     (void)c; (void)s; (void)ct; (void)b;
+}
+static inline void Amalgame_Net_Http_H2Conn_RespondGrpc(AmalgameH2Conn* c,
+                                                        AmalgameList* body,
+                                                        i64 gs, code_string gm) {
+    (void)c; (void)body; (void)gs; (void)gm;
 }
 static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
     (void)c;

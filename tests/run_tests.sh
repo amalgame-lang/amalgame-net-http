@@ -680,6 +680,63 @@ else
 fi
 
 
+# ── H2 client smoke (v0.23.0: H2Client.Unary ↔ H2Server) ──────────
+# The net-http H2 CLIENT (H2Client.Unary) talks to the net-http H2
+# SERVER (H2Server + RespondGrpc) over TCP — both are package primitives.
+# Sends a binary body (NUL/0xFF) and checks status + content-type +
+# the grpc-status trailer + a byte-exact binary echo.
+echo -e "\n── H2 client smoke (H2Client.Unary ↔ H2Server) ──"
+cat > "$BUILD_DIR/h2client_smoke.c" <<'EOF'
+#define GC_THREADS
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <gc.h>
+#include "Amalgame_Net_Http.h"
+static int PORT=50092;
+static void* server_thread(void* a){ (void)a;
+    AmalgameH2Server* s = Amalgame_Net_Http_H2Server_Listen((i64)PORT, 16);
+    if(!Amalgame_Net_Http_H2Server_IsListening(s)) return NULL;
+    AmalgameH2Conn* conn = Amalgame_Net_Http_H2Server_Accept(s);
+    if(!conn) return NULL;
+    if(Amalgame_Net_Http_H2Conn_NextRequest(conn)<=0) return NULL;
+    i64 blen = Amalgame_Net_Http_H2Conn_BodyLen(conn);
+    AmalgameList* reply = AmalgameList_new();
+    for(i64 i=0;i<blen;i++) AmalgameList_add(reply,(void*)(intptr_t)(int)Amalgame_Net_Http_H2Conn_BodyByteAt(conn,i));
+    Amalgame_Net_Http_H2Conn_RespondGrpc(conn, reply, 0, "ok");
+    return NULL;
+}
+int main(void){
+    GC_INIT();
+    pthread_t th; GC_pthread_create(&th,NULL,server_thread,NULL);
+    usleep(400000);
+    AmalgameH2Client* c = Amalgame_Net_Http_H2Client_ConnectH2c("127.0.0.1",(i64)PORT);
+    if(!Amalgame_Net_Http_H2Client_IsConnected(c)){ printf("client connect fail\n"); return 1; }
+    static const unsigned char body[6]={0x00,0x07,0xFF,0x00,'h','i'};
+    AmalgameList* bl = AmalgameList_new();
+    for(int i=0;i<6;i++) AmalgameList_add(bl,(void*)(intptr_t)(int)body[i]);
+    i64 status = Amalgame_Net_Http_H2Client_Unary(c, "/echo.Echo/Ping", bl, "application/grpc");
+    i64 gs = Amalgame_Net_Http_H2Client_GrpcStatus(c);
+    const char* ct = Amalgame_Net_Http_H2Client_ContentType(c);
+    i64 rl = Amalgame_Net_Http_H2Client_BodyLen(c);
+    int body_ok=(rl==6); for(i64 i=0;i<rl&&body_ok;i++) if(Amalgame_Net_Http_H2Client_BodyByteAt(c,i)!=(i64)body[i]) body_ok=0;
+    GC_pthread_join(th,NULL);
+    int ok=(status==200)&&!strcmp(ct,"application/grpc")&&(gs==0)&&body_ok;
+    printf("h2client: status=%lld grpc-status=%lld body_ok=%d\n",(long long)status,(long long)gs,body_ok);
+    return ok?0:1;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2client_smoke.c" \
+    -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/h2client_smoke" 2>&1 | head -8
+if [ ! -x "$BUILD_DIR/h2client_smoke" ]; then echo -e "${RED}FAIL${NC} (H2 client smoke build)"; exit 1; fi
+if "$BUILD_DIR/h2client_smoke"; then
+    echo -e "${GREEN}PASS${NC} (H2Client.Unary round-trips status + grpc trailer + binary body)"
+else
+    echo -e "${RED}FAIL${NC} (H2 client round-trip)"; exit 1
+fi
+
+
 # ── Http1.ServeAsync smoke (v0.9.1, Linux epoll) ──────────────────
 # Verifies:
 #   1. Link path — Amalgame_Net_Http.h #includes Amalgame_Async.h,

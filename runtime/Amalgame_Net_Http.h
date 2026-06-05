@@ -46,6 +46,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>          /* v0.23.0: getaddrinfo for the H2 client dial */
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
@@ -819,6 +820,195 @@ static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
         c->fd = -1;
     }
     c->want_close = 1;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * AmalgameH2Client — synchronous HTTP/2 (h2c) client (v0.23.0).
+ * Mirror of the server path: one unary request/response per call, with
+ * binary-safe body collection and grpc-status/grpc-message trailer
+ * capture — enough to drive a gRPC client (amalgame-net-grpc).
+ * ──────────────────────────────────────────────────────────────── */
+
+typedef struct AmalgameH2Client {
+    int fd;
+    nghttp2_session* session;
+    const unsigned char* req_body; size_t req_len, req_off;   /* request body source */
+    int32_t  resp_status;
+    char*    resp_body; int32_t resp_body_len; int32_t resp_body_cap;
+    char     resp_content_type[128];
+    char     resp_grpc_status[16];
+    char     resp_grpc_message[256];
+    int32_t  done;
+} AmalgameH2Client;
+
+static void amalgame_h2c_append(AmalgameH2Client* c, const uint8_t* d, size_t n) {
+    if ((int)(c->resp_body_len + (int)n) > c->resp_body_cap) {
+        int nc = c->resp_body_cap > 0 ? c->resp_body_cap * 2 : 1024;
+        while (nc < c->resp_body_len + (int)n) nc *= 2;
+        char* nb = (char*) GC_MALLOC_ATOMIC((size_t) nc);
+        if (c->resp_body_len > 0) memcpy(nb, c->resp_body, (size_t) c->resp_body_len);
+        c->resp_body = nb; c->resp_body_cap = nc;
+    }
+    memcpy(c->resp_body + c->resp_body_len, d, n);
+    c->resp_body_len += (int) n;
+}
+
+static int amalgame_h2c_on_header(nghttp2_session* s, const nghttp2_frame* f,
+                                  const uint8_t* name, size_t nl,
+                                  const uint8_t* val, size_t vl,
+                                  uint8_t flags, void* user) {
+    (void) s; (void) f; (void) flags;
+    AmalgameH2Client* c = (AmalgameH2Client*) user;
+    if (nl == 7 && memcmp(name, ":status", 7) == 0) {
+        char b[8]; size_t k = vl < 7 ? vl : 7; memcpy(b, val, k); b[k] = 0;
+        c->resp_status = atoi(b);
+    } else if (nl == 12 && memcmp(name, "content-type", 12) == 0) {
+        size_t k = vl < sizeof(c->resp_content_type) - 1 ? vl : sizeof(c->resp_content_type) - 1;
+        memcpy(c->resp_content_type, val, k); c->resp_content_type[k] = 0;
+    } else if (nl == 11 && memcmp(name, "grpc-status", 11) == 0) {
+        size_t k = vl < sizeof(c->resp_grpc_status) - 1 ? vl : sizeof(c->resp_grpc_status) - 1;
+        memcpy(c->resp_grpc_status, val, k); c->resp_grpc_status[k] = 0;
+    } else if (nl == 12 && memcmp(name, "grpc-message", 12) == 0) {
+        size_t k = vl < sizeof(c->resp_grpc_message) - 1 ? vl : sizeof(c->resp_grpc_message) - 1;
+        memcpy(c->resp_grpc_message, val, k); c->resp_grpc_message[k] = 0;
+    }
+    return 0;
+}
+static int amalgame_h2c_on_data(nghttp2_session* s, uint8_t flags, int32_t sid,
+                                const uint8_t* data, size_t len, void* user) {
+    (void) s; (void) flags; (void) sid;
+    amalgame_h2c_append((AmalgameH2Client*) user, data, len);
+    return 0;
+}
+static int amalgame_h2c_on_close(nghttp2_session* s, int32_t sid, uint32_t ec, void* user) {
+    (void) s; (void) sid; (void) ec;
+    ((AmalgameH2Client*) user)->done = 1;
+    return 0;
+}
+static ssize_t amalgame_h2c_req_read(nghttp2_session* s, int32_t sid, uint8_t* buf,
+                                     size_t length, uint32_t* data_flags,
+                                     nghttp2_data_source* src, void* user) {
+    (void) s; (void) sid; (void) src; (void) user;
+    AmalgameH2Client* c = (AmalgameH2Client*) ((nghttp2_data_source*) src)->ptr;
+    size_t rem = c->req_len - c->req_off;
+    size_t cp = rem < length ? rem : length;
+    if (cp > 0) { memcpy(buf, c->req_body + c->req_off, cp); c->req_off += cp; }
+    if (c->req_off >= c->req_len) *data_flags |= NGHTTP2_DATA_FLAG_EOF;   /* END_STREAM */
+    return (ssize_t) cp;
+}
+
+static int amalgame_h2c_dial(const char* host, int port) {
+    char ps[16]; snprintf(ps, sizeof(ps), "%d", port);
+    struct addrinfo hints; memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = NULL;
+    if (getaddrinfo(host, ps, &hints, &res) != 0 || !res) return -1;
+    int fd = -1;
+    for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
+        fd = (int) socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd); fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+/* Connect to an h2c server. Returns a client handle (check
+ * H2Client_IsConnected) — never NULL so AM stays null-guard-free. */
+static inline AmalgameH2Client* Amalgame_Net_Http_H2Client_ConnectH2c(code_string host, i64 port) {
+    AmalgameH2Client* c = (AmalgameH2Client*) GC_MALLOC(sizeof(AmalgameH2Client));
+    memset(c, 0, sizeof(*c));
+    c->fd = -1; c->resp_status = -1; c->resp_grpc_status[0] = 0;
+    int fd = amalgame_h2c_dial(host ? host : "", (int) port);
+    if (fd < 0) return c;
+    struct timeval to; to.tv_sec = 30; to.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof(to));
+    nghttp2_session_callbacks* cb;
+    nghttp2_session_callbacks_new(&cb);
+    nghttp2_session_callbacks_set_on_header_callback(cb, amalgame_h2c_on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, amalgame_h2c_on_data);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cb, amalgame_h2c_on_close);
+    nghttp2_session_client_new(&c->session, cb, c);
+    nghttp2_session_callbacks_del(cb);
+    nghttp2_settings_entry iv[1] = { { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 } };
+    nghttp2_submit_settings(c->session, NGHTTP2_FLAG_NONE, iv, 1);
+    c->fd = fd;
+    return c;
+}
+static inline code_bool Amalgame_Net_Http_H2Client_IsConnected(AmalgameH2Client* c) {
+    return (c && c->fd >= 0 && c->session) ? 1 : 0;
+}
+
+/* One unary request: POST `path` with content-type + `te: trailers` and
+ * a binary-safe body (from a List<int>); drives the session until the
+ * stream closes; collects status + body + grpc trailers. Returns the
+ * HTTP :status (or -1 on transport error). */
+static inline i64 Amalgame_Net_Http_H2Client_Unary(AmalgameH2Client* c, code_string path,
+                                                   AmalgameList* body, code_string content_type) {
+    if (!c || c->fd < 0 || !c->session) return -1;
+    int n = body ? AmalgameList_count(body) : 0; if (n < 0) n = 0;
+    unsigned char* rb = (unsigned char*) GC_MALLOC_ATOMIC((size_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) {
+        unsigned int b = (unsigned int)(intptr_t) AmalgameList_get(body, i);
+        rb[i] = (unsigned char)(b & 0xFFu);
+    }
+    c->req_body = rb; c->req_len = (size_t) n; c->req_off = 0;
+    c->done = 0; c->resp_body_len = 0; c->resp_status = -1;
+    c->resp_grpc_status[0] = 0; c->resp_grpc_message[0] = 0; c->resp_content_type[0] = 0;
+
+    const char* ct = (content_type && content_type[0]) ? content_type : "application/grpc";
+    const char* p  = (path && path[0]) ? path : "/";
+    nghttp2_data_provider dp; dp.source.ptr = c; dp.read_callback = amalgame_h2c_req_read;
+    nghttp2_nv hdrs[6] = {
+        { (uint8_t*)":method",      (uint8_t*)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)":scheme",      (uint8_t*)"http", 7, 4, NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)":path",        (uint8_t*)p, 5, strlen(p), NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)":authority",   (uint8_t*)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)"te",           (uint8_t*)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE },
+        { (uint8_t*)"content-type", (uint8_t*)ct, 12, strlen(ct), NGHTTP2_NV_FLAG_NONE },
+    };
+    nghttp2_submit_request(c->session, NULL, hdrs, 6, &dp, NULL);
+
+    unsigned char buf[16384];
+    int guard = 0;
+    while (!c->done && guard++ < 1000000) {
+        const uint8_t* out; ssize_t ol;
+        while ((ol = nghttp2_session_mem_send(c->session, &out)) > 0) {
+            ssize_t off = 0;
+            while (off < ol) { ssize_t w = send(c->fd, out + off, (size_t)(ol - off), 0); if (w <= 0) { c->done = 1; break; } off += w; }
+        }
+        if (c->done) break;
+        ssize_t r = recv(c->fd, buf, sizeof(buf), 0);
+        if (r <= 0) break;
+        if (nghttp2_session_mem_recv(c->session, buf, (size_t) r) < 0) break;
+    }
+    return (i64) c->resp_status;
+}
+static inline i64 Amalgame_Net_Http_H2Client_Status(AmalgameH2Client* c) {
+    return c ? (i64) c->resp_status : -1;
+}
+static inline i64 Amalgame_Net_Http_H2Client_BodyLen(AmalgameH2Client* c) {
+    return (c && c->resp_body) ? (i64) c->resp_body_len : 0;
+}
+static inline i64 Amalgame_Net_Http_H2Client_BodyByteAt(AmalgameH2Client* c, i64 i) {
+    if (!c || !c->resp_body || i < 0 || i >= (i64) c->resp_body_len) return -1;
+    return (i64)(unsigned char) c->resp_body[i];
+}
+/* gRPC status from the trailer, or -1 if none was sent. */
+static inline i64 Amalgame_Net_Http_H2Client_GrpcStatus(AmalgameH2Client* c) {
+    return (c && c->resp_grpc_status[0]) ? (i64) atoi(c->resp_grpc_status) : -1;
+}
+static inline code_string Amalgame_Net_Http_H2Client_GrpcMessage(AmalgameH2Client* c) {
+    return (c && c->resp_grpc_message[0]) ? c->resp_grpc_message : "";
+}
+static inline code_string Amalgame_Net_Http_H2Client_ContentType(AmalgameH2Client* c) {
+    return (c && c->resp_content_type[0]) ? c->resp_content_type : "";
+}
+static inline void Amalgame_Net_Http_H2Client_Close(AmalgameH2Client* c) {
+    if (!c) return;
+    if (c->session) { nghttp2_session_del(c->session); c->session = NULL; }
+    if (c->fd >= 0) { close(c->fd); c->fd = -1; }
 }
 
 /* ── H2Server — minimal TCP listener for h2c ───────────── */
@@ -1601,6 +1791,23 @@ static inline void Amalgame_Net_Http_H2Conn_RespondGrpc(AmalgameH2Conn* c,
 static inline void Amalgame_Net_Http_H2Conn_Close(AmalgameH2Conn* c) {
     (void)c;
 }
+/* H2Client stubs (no nghttp2). */
+typedef struct AmalgameH2Client { int fd; } AmalgameH2Client;
+static inline AmalgameH2Client* Amalgame_Net_Http_H2Client_ConnectH2c(code_string h, i64 p) {
+    (void)h; (void)p; return NULL;
+}
+static inline code_bool Amalgame_Net_Http_H2Client_IsConnected(AmalgameH2Client* c) { (void)c; return 0; }
+static inline i64 Amalgame_Net_Http_H2Client_Unary(AmalgameH2Client* c, code_string path,
+                                                   AmalgameList* body, code_string ct) {
+    (void)c; (void)path; (void)body; (void)ct; return -1;
+}
+static inline i64 Amalgame_Net_Http_H2Client_Status(AmalgameH2Client* c) { (void)c; return -1; }
+static inline i64 Amalgame_Net_Http_H2Client_BodyLen(AmalgameH2Client* c) { (void)c; return 0; }
+static inline i64 Amalgame_Net_Http_H2Client_BodyByteAt(AmalgameH2Client* c, i64 i) { (void)c; (void)i; return -1; }
+static inline i64 Amalgame_Net_Http_H2Client_GrpcStatus(AmalgameH2Client* c) { (void)c; return -1; }
+static inline code_string Amalgame_Net_Http_H2Client_GrpcMessage(AmalgameH2Client* c) { (void)c; return ""; }
+static inline code_string Amalgame_Net_Http_H2Client_ContentType(AmalgameH2Client* c) { (void)c; return ""; }
+static inline void Amalgame_Net_Http_H2Client_Close(AmalgameH2Client* c) { (void)c; }
 static inline AmalgameH2Server* Amalgame_Net_Http_H2Server_Listen(i64 p, i64 b) {
     (void)b;
     (void)p; return NULL;

@@ -582,6 +582,104 @@ else
 fi
 
 
+# ── gRPC-over-H2 smoke (v0.22.0: trailers + binary body) ──────────
+# A real nghttp2 CLIENT drives the actual net-http H2 server over a
+# socketpair: POST a binary request body (with NUL/0xFF), the server
+# reads it via H2Conn_BodyByteAt and answers with H2Conn_RespondGrpc,
+# and the client must see :status 200 + content-type application/grpc
+# + the grpc-status/grpc-message HTTP/2 TRAILERS + a byte-exact body.
+echo -e "\n── gRPC-over-H2 smoke (trailers + binary body) ──"
+cat > "$BUILD_DIR/grpc_h2_smoke.c" <<'EOF'
+#define GC_THREADS
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <nghttp2/nghttp2.h>
+#include <gc.h>
+#include "Amalgame_Net_Http.h"
+static int SP[2];
+static void* server_thread(void* a){ (void)a;
+    AmalgameH2Conn* conn = Amalgame_Net_Http_H2Conn_NewFromFd((i64)SP[0]);
+    i64 sid = Amalgame_Net_Http_H2Conn_NextRequest(conn);
+    if (sid <= 0) return NULL;
+    i64 blen = Amalgame_Net_Http_H2Conn_BodyLen(conn);
+    AmalgameList* reply = AmalgameList_new();
+    for (i64 i=0;i<blen;i++){ i64 by = Amalgame_Net_Http_H2Conn_BodyByteAt(conn, i);
+        AmalgameList_add(reply, (void*)(intptr_t)(int)by); }
+    Amalgame_Net_Http_H2Conn_RespondGrpc(conn, reply, 0, "ok");
+    return NULL;
+}
+static const unsigned char* g_reqbody; static size_t g_reqlen, g_reqoff;
+static char g_status[16], g_ctype[64], g_grpc_status[16], g_grpc_message[64];
+static unsigned char g_respbody[256]; static size_t g_resplen;
+static ssize_t req_data_cb(nghttp2_session*s,int32_t id,uint8_t*buf,size_t len,uint32_t*flags,nghttp2_data_source*src,void*u){
+    (void)s;(void)id;(void)src;(void)u; size_t rem=g_reqlen-g_reqoff, cp=rem<len?rem:len;
+    memcpy(buf,g_reqbody+g_reqoff,cp); g_reqoff+=cp; if(g_reqoff>=g_reqlen)*flags|=NGHTTP2_DATA_FLAG_EOF; return (ssize_t)cp; }
+static int on_header(nghttp2_session*s,const nghttp2_frame*f,const uint8_t*n,size_t nl,const uint8_t*v,size_t vl,uint8_t fl,void*u){
+    (void)s;(void)f;(void)fl;(void)u;
+    if(nl==7&&!memcmp(n,":status",7)) snprintf(g_status,sizeof g_status,"%.*s",(int)vl,v);
+    else if(nl==12&&!memcmp(n,"content-type",12)) snprintf(g_ctype,sizeof g_ctype,"%.*s",(int)vl,v);
+    else if(nl==11&&!memcmp(n,"grpc-status",11)) snprintf(g_grpc_status,sizeof g_grpc_status,"%.*s",(int)vl,v);
+    else if(nl==12&&!memcmp(n,"grpc-message",12)) snprintf(g_grpc_message,sizeof g_grpc_message,"%.*s",(int)vl,v);
+    return 0; }
+static int on_data(nghttp2_session*s,uint8_t fl,int32_t id,const uint8_t*d,size_t len,void*u){
+    (void)s;(void)fl;(void)id;(void)u; for(size_t i=0;i<len&&g_resplen<sizeof g_respbody;i++) g_respbody[g_resplen++]=d[i]; return 0; }
+int main(void){
+    GC_INIT();
+    if(socketpair(AF_UNIX,SOCK_STREAM,0,SP)!=0) return 2;
+    pthread_t th; GC_pthread_create(&th,NULL,server_thread,NULL);
+    nghttp2_session_callbacks*cb; nghttp2_session_callbacks_new(&cb);
+    nghttp2_session_callbacks_set_on_header_callback(cb,on_header);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb,on_data);
+    nghttp2_session* sess; nghttp2_session_client_new(&sess,cb,NULL);
+    nghttp2_session_callbacks_del(cb);
+    nghttp2_settings_entry iv[1]={{NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,100}};
+    nghttp2_submit_settings(sess,NGHTTP2_FLAG_NONE,iv,1);
+    static const unsigned char body[7]={0x00,0x01,0xFF,0x00,0x42,0x00,0x80};
+    g_reqbody=body; g_reqlen=sizeof body; g_reqoff=0;
+    nghttp2_data_provider dp; dp.source.ptr=NULL; dp.read_callback=req_data_cb;
+    nghttp2_nv hdrs[]={
+        {(uint8_t*)":method",(uint8_t*)"POST",7,4,NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)":scheme",(uint8_t*)"http",7,4,NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)":path",(uint8_t*)"/echo.Echo/Ping",5,15,NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)":authority",(uint8_t*)"localhost",10,9,NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)"te",(uint8_t*)"trailers",2,8,NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t*)"content-type",(uint8_t*)"application/grpc",12,16,NGHTTP2_NV_FLAG_NONE} };
+    nghttp2_submit_request(sess,NULL,hdrs,6,&dp,NULL);
+    unsigned char buf[16384];
+    for(int it=0;it<200;it++){
+        const uint8_t* out; ssize_t ol;
+        while((ol=nghttp2_session_mem_send(sess,&out))>0) send(SP[1],out,(size_t)ol,0);
+        ssize_t n=recv(SP[1],buf,sizeof buf,0); if(n<=0) break;
+        if(nghttp2_session_mem_recv(sess,buf,(size_t)n)<0) break;
+        if(g_grpc_status[0]){ const uint8_t* o2; ssize_t l2;
+            while((l2=nghttp2_session_mem_send(sess,&o2))>0) send(SP[1],o2,(size_t)l2,0); break; }
+    }
+    GC_pthread_join(th,NULL); nghttp2_session_del(sess);
+    int body_ok=(g_resplen==sizeof body)&&!memcmp(g_respbody,body,sizeof body);
+    int ok=!strcmp(g_status,"200")&&!strcmp(g_ctype,"application/grpc")
+          &&!strcmp(g_grpc_status,"0")&&!strcmp(g_grpc_message,"ok")&&body_ok;
+    printf("grpc_h2: status=%s ctype=%s grpc-status=%s grpc-message=%s body_ok=%d\n",
+           g_status,g_ctype,g_grpc_status,g_grpc_message,body_ok);
+    return ok?0:1;
+}
+EOF
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/grpc_h2_smoke.c" \
+    -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/grpc_h2_smoke" 2>&1 | head -8
+if [ ! -x "$BUILD_DIR/grpc_h2_smoke" ]; then
+    echo -e "${RED}FAIL${NC} (gRPC-over-H2 smoke build)"
+    exit 1
+fi
+if "$BUILD_DIR/grpc_h2_smoke"; then
+    echo -e "${GREEN}PASS${NC} (gRPC trailers + binary body over real nghttp2 client)"
+else
+    echo -e "${RED}FAIL${NC} (gRPC-over-H2 round-trip)"
+    exit 1
+fi
+
+
 # ── Http1.ServeAsync smoke (v0.9.1, Linux epoll) ──────────────────
 # Verifies:
 #   1. Link path — Amalgame_Net_Http.h #includes Amalgame_Async.h,

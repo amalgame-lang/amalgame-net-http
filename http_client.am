@@ -17,7 +17,10 @@ import Amalgame.String
 // stays a single static-inline call away.
 @c {
     #include "Amalgame_Tls.h"
-    #include <netdb.h>
+    #ifndef _WIN32
+      #include <netdb.h>   /* getaddrinfo; on Windows it comes from
+                            * winsock2/ws2tcpip via Amalgame_Tls.h */
+    #endif
     #include <string.h>
 }
 

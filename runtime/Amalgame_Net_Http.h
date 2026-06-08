@@ -43,15 +43,31 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>          /* v0.23.0: getaddrinfo for the H2 client dial */
-#include <unistd.h>
-#include <errno.h>
-#include <stdio.h>
-#include <signal.h>     /* v0.8.0: graceful SIGTERM/SIGINT shutdown */
-#include <fcntl.h>
+#ifdef _WIN32
+  /* Windows: the BSD-socket API lives in Winsock2. ws2tcpip.h adds
+   * getaddrinfo + socklen_t. The POSIX→Winsock shim (wrappers + macro
+   * aliases) is installed further down, AFTER the nghttp2/openssl
+   * probes, so it can't disturb those system headers. */
+  #ifndef WIN32_LEAN_AND_MEAN
+  #  define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #include <errno.h>
+  #include <stdio.h>
+  #include <signal.h>     /* v0.8.0: graceful shutdown (SIGINT/SIGTERM) */
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <netdb.h>        /* v0.23.0: getaddrinfo for the H2 client dial */
+  #include <unistd.h>
+  #include <errno.h>
+  #include <stdio.h>
+  #include <signal.h>       /* v0.8.0: graceful SIGTERM/SIGINT shutdown */
+  #include <fcntl.h>
+#endif
 /* v0.9.1: Http1.ServeAsync uses amalgame-async for I/O parking.
  * Declared as a [dependencies] entry in amalgame.toml so users
  * of net-http v0.9.1+ automatically pick up async v0.2.0+. */
@@ -101,6 +117,126 @@ extern int GC_pthread_create(pthread_t* new_thread,
 #    include "/opt/homebrew/opt/openssl@3/include/openssl/err.h"
 #  endif
 #endif
+
+#if defined(_WIN32) && !defined(AMALGAME_WIN_SOCK_SHIM)
+#define AMALGAME_WIN_SOCK_SHIM 1
+/* ── POSIX-socket → Winsock2 compatibility shim (Windows only) ──────
+ * Shared across the Amalgame networking packages (net-http, tls): the
+ * AMALGAME_WIN_SOCK_SHIM guard makes the first-included header define it
+ * and the others reuse it, so a TU pulling several net headers has one
+ * copy of the wrappers and one set of aliases.
+ *
+ * The BSD-socket code is written for POSIX. On Windows the calls exist
+ * in Winsock2 under the same names, but: errors land in WSAGetLastError()
+ * (not errno), close() must be closesocket(), and non-blocking is
+ * ioctlsocket(FIONBIO) (not fcntl). We wrap each socket call so it sets
+ * `errno` from a translated WSA error, then alias the POSIX names to the
+ * wrappers — so all the errno/EAGAIN/EWOULDBLOCK handling works unchanged.
+ * Wrappers are defined BEFORE the macros so their bodies bind to the
+ * genuine Winsock functions. Placed AFTER each header's openssl/nghttp2
+ * probes, so the macros never rewrite a system header. */
+static inline int amsock_wsa2errno(int w) {
+    switch (w) {
+        case WSAEWOULDBLOCK:  return EWOULDBLOCK;
+        case WSAEINPROGRESS:  return EINPROGRESS;
+        case WSAEINTR:        return EINTR;
+        case WSAECONNRESET:   return ECONNRESET;
+        case WSAECONNABORTED: return ECONNABORTED;
+        case WSAENOTCONN:     return ENOTCONN;
+        case WSAETIMEDOUT:    return ETIMEDOUT;
+        case WSAEADDRINUSE:   return EADDRINUSE;
+        case WSAEINVAL:       return EINVAL;
+        case WSAEMFILE:       return EMFILE;
+        case WSAENOBUFS:      return ENOBUFS;
+        case 0:               return 0;
+        default:              return EIO;
+    }
+}
+static inline void amsock_wsa_init(void) {
+    static volatile LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) == 0) {
+        WSADATA wsa; (void) WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+}
+/* Run WSAStartup at load time so getaddrinfo()/socket() are usable
+ * before the first explicit call, on any thread. */
+__attribute__((constructor))
+static void amsock_wsa_ctor(void) { amsock_wsa_init(); }
+
+static inline int amsock_socket(int d, int t, int p) {
+    SOCKET s = socket(d, t, p);
+    if (s == INVALID_SOCKET) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return (int) s;
+}
+static inline int amsock_accept(int s, struct sockaddr* a, socklen_t* l) {
+    SOCKET c = accept((SOCKET) s, a, l);
+    if (c == INVALID_SOCKET) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return (int) c;
+}
+static inline int amsock_bind(int s, const struct sockaddr* a, socklen_t l) {
+    if (bind((SOCKET) s, a, l) == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return 0;
+}
+static inline int amsock_listen(int s, int b) {
+    if (listen((SOCKET) s, b) == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return 0;
+}
+static inline int amsock_connect(int s, const struct sockaddr* a, socklen_t l) {
+    if (connect((SOCKET) s, a, l) == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return 0;
+}
+static inline int amsock_setsockopt(int s, int lv, int o, const void* v, socklen_t l) {
+    if (setsockopt((SOCKET) s, lv, o, (const char*) v, l) == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return 0;
+}
+static inline int amsock_getsockopt(int s, int lv, int o, void* v, socklen_t* l) {
+    if (getsockopt((SOCKET) s, lv, o, (char*) v, l) == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return 0;
+}
+static inline int amsock_recv(int s, void* b, size_t n, int f) {
+    int r = recv((SOCKET) s, (char*) b, (int) n, f);
+    if (r == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return r;
+}
+static inline int amsock_send(int s, const void* b, size_t n, int f) {
+    int r = send((SOCKET) s, (const char*) b, (int) n, f);
+    if (r == SOCKET_ERROR) { errno = amsock_wsa2errno(WSAGetLastError()); return -1; }
+    return r;
+}
+static inline int amsock_shutdown(int s, int how) {
+    return shutdown((SOCKET) s, how);
+}
+static inline int amsock_close(int fd) {
+    return closesocket((SOCKET) fd);   /* every close() in this header is a socket */
+}
+static inline int amsock_set_nonblock(int fd) {
+    u_long m = 1; return ioctlsocket((SOCKET) fd, FIONBIO, &m);
+}
+
+#define socket(d, t, p)          amsock_socket((d), (t), (p))
+#define accept(s, a, l)          amsock_accept((s), (a), (l))
+#define bind(s, a, l)            amsock_bind((s), (a), (l))
+#define listen(s, b)             amsock_listen((s), (b))
+#define connect(s, a, l)         amsock_connect((s), (a), (l))
+#define setsockopt(s, lv, o, v, l) amsock_setsockopt((s), (lv), (o), (v), (l))
+#define getsockopt(s, lv, o, v, l) amsock_getsockopt((s), (lv), (o), (v), (l))
+#define recv(s, b, n, f)         amsock_recv((s), (b), (n), (f))
+#define send(s, b, n, f)         amsock_send((s), (b), (n), (f))
+#define shutdown(s, h)           amsock_shutdown((s), (h))
+#define close(fd)                amsock_close(fd)
+
+#ifndef SHUT_RD
+#  define SHUT_RD   SD_RECEIVE
+#  define SHUT_WR   SD_SEND
+#  define SHUT_RDWR SD_BOTH
+#endif
+#ifndef MSG_DONTWAIT
+#  define MSG_DONTWAIT 0   /* emulated via a non-blocking socket on Windows */
+#endif
+#ifndef MSG_NOSIGNAL
+#  define MSG_NOSIGNAL 0   /* no SIGPIPE on Windows */
+#endif
+#endif /* _WIN32 */
 
 /* ────────────────────────────────────────────────────────────────
  * Graceful shutdown (v0.8.0).
@@ -218,6 +354,14 @@ static void amalgame_net_http_unregister_listen_fd(int fd) {
 static inline void Amalgame_Net_Http_InstallShutdownSignals(void) {
     static int installed = 0;
     if (installed) return;
+#ifdef _WIN32
+    /* Windows has no sigaction/SIGPIPE. The CRT's signal() handles
+     * SIGINT (Ctrl-C) and SIGTERM; that's enough for the graceful-stop
+     * flag. Half-closed-socket writes return WSAECONNRESET rather than
+     * raising a signal, so there's nothing to ignore. */
+    signal(SIGINT,  amalgame_net_http_sig_handler);
+    signal(SIGTERM, amalgame_net_http_sig_handler);
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = amalgame_net_http_sig_handler;
@@ -227,6 +371,7 @@ static inline void Amalgame_Net_Http_InstallShutdownSignals(void) {
     /* SIGPIPE: writes to a half-closed socket would otherwise kill
      * the worker mid-handler.  We want EPIPE from write() instead. */
     signal(SIGPIPE, SIG_IGN);
+#endif
     installed = 1;
 }
 
@@ -3707,6 +3852,11 @@ static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
          * handler, not in the accept setup. */
         int cfd = accept(ctx->srv->fd, (struct sockaddr*)&addr, &alen);
         if (cfd >= 0) {
+#ifdef _WIN32
+            /* ioctlsocket(FIONBIO) is the Winsock non-blocking switch;
+             * there's no CLOEXEC concept (no fork+exec). */
+            amsock_set_nonblock(cfd);
+#else
             int fl = fcntl(cfd, F_GETFL, 0);
             if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
             /* Best-effort O_CLOEXEC — descriptors leaking into
@@ -3714,6 +3864,7 @@ static void* amalgame_h1_async_accept_fn(void* env, void* arg) {
              * correctness bug. */
             int fdfl = fcntl(cfd, F_GETFD, 0);
             if (fdfl >= 0) fcntl(cfd, F_SETFD, fdfl | FD_CLOEXEC);
+#endif
         }
         if (cfd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;

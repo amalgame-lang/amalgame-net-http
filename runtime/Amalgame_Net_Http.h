@@ -1289,6 +1289,13 @@ static inline void Amalgame_Net_Http_H2Server_Close(AmalgameH2Server* s) {
     s->fd = -1; s->listening = 0;
 }
 
+#endif /* AMALGAME_HAS_NGHTTP2 — the HttpServerConfig section below is
+        * protocol-agnostic (HTTP/1 uses it too) and MUST be defined
+        * whether or not nghttp2 is present. Without this split it lived
+        * inside the nghttp2 block, so a build without nghttp2 (e.g.
+        * Windows) left AmalgameNetHttpServerConfig undefined and every
+        * H1/stub reference to it failed. Reopened after the section. */
+
 /* ── HttpServerConfig — server-side tunables (v0.4.3+) ────────────
  * Snapshot of the per-server config, applied at accept time.
  *
@@ -1435,6 +1442,8 @@ static inline void Amalgame_Net_Http_HttpServerConfig_ClearTimeoutsOnFd(int fd) 
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
+
+#ifdef AMALGAME_HAS_NGHTTP2  /* reopen — HTTP/2 code resumes (needs nghttp2) */
 
 /* ── High-level entry point: Http2.Serve(port, handler) ──────────
  * Listens on `port`, accepts connections, drives the H2 protocol,

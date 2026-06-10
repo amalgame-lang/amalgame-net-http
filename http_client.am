@@ -20,8 +20,105 @@ import Amalgame.String
     #ifndef _WIN32
       #include <netdb.h>   /* getaddrinfo; on Windows it comes from
                             * winsock2/ws2tcpip via Amalgame_Tls.h */
+      #include <sys/socket.h>
     #endif
     #include <string.h>
+    #include <strings.h>   /* strncasecmp */
+    #include <stdio.h>     /* binary download → FILE* */
+    #include <stdlib.h>
+
+    /* v0.27.0 — binary-safe download-to-file plumbing. Reading a binary
+     * response into an AM string truncates at the first NUL; instead we
+     * stream the response body straight to a FILE* on disk. */
+    static long amnh_rd(AmalgameTlsStream* st, int fd, char* buf, long n) {
+        if (st) return (long) Amalgame_Tls_TlsStream_ReadBytes(st, buf, (i64) n);
+        return (long) recv(fd, buf, (size_t) n, 0);
+    }
+    static long amnh_wr(AmalgameTlsStream* st, int fd, const char* buf, long n) {
+        if (st) return (long) Amalgame_Tls_TlsStream_WriteBytes(st, (char*) buf, (i64) n);
+        return (long) send(fd, buf, (size_t) n, 0);
+    }
+    /* One request over `fd` (TLS-wrapped when isTls). Returns 0 = body
+     * written to outPath, 1 = redirect (*loc set, caller re-requests),
+     * <0 = error (incl. -100-status when status != 200). Handles
+     * Content-Length and read-until-close; refuses chunked (-7) since the
+     * GitHub release CDN serves Content-Length. */
+    static int amnh_dl_once(int fd, int isTls, const char* host,
+                            const char* req, const char* outPath, char** loc) {
+        AmalgameTlsStream* st = NULL;
+        if (isTls) {
+            AmalgameTlsConfig* cfg = Amalgame_Tls_TlsConfig_Default();
+            cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
+            AmalgameTlsContext* ctx = _amtls_new_ctx(cfg, false);
+            if (!ctx || !ctx->_ctx) return -2;
+            st = Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
+            if (st && st->_ssl && host) SSL_set_tlsext_host_name((SSL*) st->_ssl, host);
+            if (!st || !Amalgame_Tls_TlsStream_Handshake(st)) {
+                if (st) Amalgame_Tls_TlsStream_Close(st);
+                return -3;
+            }
+        }
+        long rlen = (long) strlen(req);
+        if (amnh_wr(st, fd, req, rlen) < 0) {
+            if (st) Amalgame_Tls_TlsStream_Close(st);
+            return -4;
+        }
+        char hdr[16384]; int hl = 0; int hdrEnd = -1;
+        while (hl < (int) sizeof(hdr) - 1) {
+            long rn = amnh_rd(st, fd, hdr + hl, (long) sizeof(hdr) - 1 - hl);
+            if (rn <= 0) break;
+            hl += (int) rn; hdr[hl] = 0;
+            char* p = strstr(hdr, "\r\n\r\n");
+            if (p) { hdrEnd = (int)(p - hdr) + 4; break; }
+        }
+        if (hdrEnd < 0) { if (st) Amalgame_Tls_TlsStream_Close(st); return -5; }
+        int status = 0;
+        { char* sp = strchr(hdr, ' '); if (sp) status = atoi(sp + 1); }
+        char* locp = NULL; char* clp = NULL; int chunked = 0;
+        { char* line = hdr;
+          while (line && line < hdr + hdrEnd) {
+            char* eol = strstr(line, "\r\n");
+            if (!eol || eol >= hdr + hdrEnd) break;
+            int len = (int)(eol - line);
+            if (len > 9  && strncasecmp(line, "location:", 9) == 0) locp = line + 9;
+            else if (len > 15 && strncasecmp(line, "content-length:", 15) == 0) clp = line + 15;
+            else if (len > 18 && strncasecmp(line, "transfer-encoding:", 18) == 0) {
+                if (strstr(line, "chunked")) chunked = 1;
+            }
+            line = eol + 2;
+          }
+        }
+        if (status >= 300 && status < 400 && locp) {
+            while (*locp == ' ') locp++;
+            char* e = strstr(locp, "\r\n");
+            int ll = e ? (int)(e - locp) : (int) strlen(locp);
+            char* out = (char*) GC_MALLOC(ll + 1);
+            memcpy(out, locp, ll); out[ll] = 0; *loc = out;
+            if (st) Amalgame_Tls_TlsStream_Close(st);
+            return 1;
+        }
+        if (status != 200) { if (st) Amalgame_Tls_TlsStream_Close(st); return -100 - status; }
+        if (chunked) { if (st) Amalgame_Tls_TlsStream_Close(st); return -7; }
+        FILE* fp = fopen(outPath, "wb");
+        if (!fp) { if (st) Amalgame_Tls_TlsStream_Close(st); return -6; }
+        long bodyHave = hl - hdrEnd;
+        if (bodyHave > 0) fwrite(hdr + hdrEnd, 1, (size_t) bodyHave, fp);
+        long contentLen = clp ? atol(clp) : -1;
+        long written = bodyHave;
+        char dlbuf[65536];
+        while (1) {
+            if (contentLen >= 0 && written >= contentLen) break;
+            long want = (long) sizeof(dlbuf);
+            if (contentLen >= 0 && contentLen - written < want) want = contentLen - written;
+            long rn = amnh_rd(st, fd, dlbuf, want);
+            if (rn <= 0) break;
+            fwrite(dlbuf, 1, (size_t) rn, fp);
+            written += rn;
+        }
+        fclose(fp);
+        if (st) Amalgame_Tls_TlsStream_Close(st);
+        return 0;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -189,6 +286,57 @@ public class HttpClient {
             }
         }
         return ok
+    }
+
+    // v0.27.0 — binary-safe download to a file on disk. Unlike Get (which
+    // reads the body into an AM string, truncating at the first NUL and
+    // capping at 1 MiB), this streams the response body straight to
+    // `path`, following up to 6 redirects (GitHub release URLs 302 to a
+    // CDN). Returns true on a 200 whose body was fully written. Pair with
+    // HttpResponse.File(path) to serve the cached file binary-safe.
+    //
+    //   if (HttpClient.DownloadToFile(assetUrl, cachePath)) { ... }
+    public static bool DownloadToFile(string url, string path) {
+        var cur: string = url
+        var hops: int = 0
+        while (hops < 6) {
+            let u: ParsedUrl = HttpClient.ParseUrl(cur)
+            if (u == null || String_Length(u.Host) == 0) { return false }
+            let isTls: bool = u.Scheme == "https"
+            var port: int = u.Port
+            if (port == 0) { if (isTls) { port = 443 } else { port = 80 } }
+            let crlf: string = String_FromByte(13) + "\n"
+            let req: string = "GET " + u.Path + " HTTP/1.1" + crlf
+                + "Host: " + u.Host + crlf
+                + "User-Agent: amalgame-net-http/0.27" + crlf
+                + "Accept: */*" + crlf
+                + "Connection: close" + crlf + crlf
+            let conn = TcpClient_Connect(u.Host, port)
+            if (!TcpClient_IsConnected(conn)) { return false }
+            var rc: int = -1
+            var location: string = ""
+            let reqC: string = req
+            let hostC: string = u.Host
+            let outC: string = path
+            var tlsFlag: int = 0
+            if (isTls) { tlsFlag = 1 }
+            @c {
+                int fd = conn ? conn->_fd : -1;
+                char* loc = 0;
+                rc = amnh_dl_once(fd, (int) tlsFlag, (const char*) hostC,
+                                  (const char*) reqC, (const char*) outC, &loc);
+                if (loc) location = loc;
+            }
+            TcpClient_Close(conn)
+            if (rc == 0) { return true }
+            if (rc == 1 && String_Length(location) > 0) {
+                cur = location
+                hops = hops + 1
+                continue
+            }
+            return false
+        }
+        return false
     }
 
     // Internal — parse URL, open socket (TCP or TLS), send request,

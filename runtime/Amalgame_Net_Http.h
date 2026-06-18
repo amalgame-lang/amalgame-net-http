@@ -285,9 +285,18 @@ static volatile sig_atomic_t amalgame_net_http_stopping = 0;
  * and each worker calls conn_release() exactly once on exit. */
 static long amalgame_net_http_active_conns = 0;
 static long amalgame_net_http_max_conns    = 0;   /* 0 = unlimited */
+/* Process-global request-body cap (bytes). 0 = use the compile-time
+ * AMALGAME_H1_MAX_BODY default. Set via Http1.SetMaxBodyBytes(n); applies
+ * to every accept loop (HTTP/1.1, HTTPS-H1) regardless of per-conn config,
+ * so a server (e.g. a WebDAV NAS) can lift the 8 MiB default without
+ * threading an HttpServerConfig through ServeHttps. */
+static long amalgame_net_http_max_body     = 0;   /* 0 = library default */
 
 static inline void Amalgame_Net_Http_Http1_SetMaxConnections(i64 n) {
     amalgame_net_http_max_conns = (long) n;
+}
+static inline void Amalgame_Net_Http_Http1_SetMaxBodyBytes(i64 n) {
+    amalgame_net_http_max_body = (long) n;
 }
 static inline i64 Amalgame_Net_Http_Http1_ActiveConnections(void) {
     return (i64) __sync_add_and_fetch(&amalgame_net_http_active_conns, 0);
@@ -2474,10 +2483,13 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
             break;
         }
     }
-    /* Body-size cap. Per-conn config (set by Http1.ServeWith)
-     * overrides the compile-time constant. Zero in config = use
-     * the library default (current behavior). */
+    /* Body-size cap. Precedence: per-conn config (Http1.ServeWith) >
+     * process-global (Http1.SetMaxBodyBytes) > compile-time constant.
+     * Zero at a level = fall through to the next. */
     int max_body = AMALGAME_H1_MAX_BODY;
+    if (amalgame_net_http_max_body > 0) {
+        max_body = (int)amalgame_net_http_max_body;
+    }
     if (c->config && c->config->max_body_bytes > 0) {
         max_body = (int)c->config->max_body_bytes;
     }

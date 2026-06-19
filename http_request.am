@@ -30,6 +30,11 @@ public class HttpRequest {
     // `Body`, fine for text/ASCII multipart).
     public BodyPtr:     int
     public BodyLen:     int
+    // v0.28.0: when the body was spooled to a temp file (large uploads,
+    // see Http1.SetBodySpoolThreshold), this is its path and `Body` is "".
+    // The handler owns the file — move it into place or delete it. "" when
+    // the body is in RAM at `Body`.
+    public BodyFile:    string
 
     public HttpRequest() {
         this.Method      = ""
@@ -43,6 +48,7 @@ public class HttpRequest {
         this.IsSecure    = false
         this.BodyPtr     = 0
         this.BodyLen     = 0
+        this.BodyFile    = ""
     }
 
     // Get a header value (case-insensitive lookup).
@@ -199,6 +205,9 @@ public class HttpRequest {
                  * parser can walk binary bytes (Body truncates at NUL). */
                 req->BodyPtr     = (i64)(uintptr_t) c->body;
                 req->BodyLen     = (i64) c->body_len;
+                /* v0.28.0: large body spooled to a temp file (empty
+                 * otherwise). The handler renames/deletes it. */
+                req->BodyFile    = (code_string) Amalgame_Net_Http_H1Conn_BodyFile(c);
                 /* RemoteAddr captured at accept time, formatted
                  * "ip:port". If missing on older builds the field
                  * stays empty and RateLimit "ip" strategy falls

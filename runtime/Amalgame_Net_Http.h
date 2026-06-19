@@ -300,11 +300,33 @@ static long amalgame_net_http_max_conns    = 0;   /* 0 = unlimited */
  * shared instance at link time, so the setter and the reader agree. */
 long amalgame_net_http_max_body __attribute__((weak)) = 0;   /* 0 = library default */
 
+/* Request-body spooling (v0.28.0). When a request's Content-Length is >=
+ * the threshold (and threshold > 0), the H1 parser streams the body straight
+ * to a temp file in the spool dir instead of buffering it in RAM — so peak
+ * RAM stays flat (~64 KiB) regardless of upload size. The handler reads the
+ * path via H1Conn.BodyFile / HttpRequest.BodyFile and typically rename()s it
+ * into place (atomic on the same volume). Weak + external linkage for the
+ * same cross-TU reason as amalgame_net_http_max_body. */
+long  amalgame_net_http_body_spool_threshold __attribute__((weak)) = 0;   /* 0 = never spool */
+char* amalgame_net_http_body_spool_dir       __attribute__((weak)) = 0;   /* NULL = /tmp */
+
 static inline void Amalgame_Net_Http_Http1_SetMaxConnections(i64 n) {
     amalgame_net_http_max_conns = (long) n;
 }
 static inline void Amalgame_Net_Http_Http1_SetMaxBodyBytes(i64 n) {
     amalgame_net_http_max_body = (long) n;
+}
+static inline void Amalgame_Net_Http_Http1_SetBodySpoolThreshold(i64 n) {
+    amalgame_net_http_body_spool_threshold = (long) n;
+}
+static inline void Amalgame_Net_Http_Http1_SetBodySpoolDir(code_string dir) {
+    /* Copy so the caller's AM string can't be GC'd out from under us. */
+    if (!dir) { amalgame_net_http_body_spool_dir = 0; return; }
+    size_t n = strlen(dir);
+    char* p = (char*) malloc(n + 1);
+    if (!p) return;
+    memcpy(p, dir, n + 1);
+    amalgame_net_http_body_spool_dir = p;
 }
 static inline i64 Amalgame_Net_Http_Http1_ActiveConnections(void) {
     return (i64) __sync_add_and_fetch(&amalgame_net_http_active_conns, 0);
@@ -2162,6 +2184,11 @@ typedef struct AmalgameH1Conn {
     char*     version;       /* "HTTP/1.1" */
     char*     body;
     int32_t   body_len;
+    /* v0.28.0: when the body was spooled to disk (Content-Length >=
+     * spool threshold), this holds the temp-file path and `body` is the
+     * empty string. NULL/empty = body is in RAM at `body`. */
+    char*     body_file;
+    int64_t   body_file_len;
     AmalgameH1Header headers[AMALGAME_H1_MAX_HEADERS];
     int32_t   header_count;
     int32_t   response_sent;
@@ -2484,14 +2511,68 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     if (!amalgame_h1_framing_ok(c->headers, c->header_count)) return -1;
 
     /* ── Body — only if Content-Length present ─────────────────── */
-    int content_length = 0;
+    long content_length = 0;
     for (int i = 0; i < c->header_count; i++) {
         if (strcmp(c->headers[i].name, "content-length") == 0) {
-            content_length = atoi(c->headers[i].value);
+            content_length = atoll(c->headers[i].value);
             break;
         }
     }
-    /* Body-size cap. Precedence: per-conn config (Http1.ServeWith) >
+    if (content_length < 0) return -1;
+
+    /* ── Large-body spooling (v0.28.0) ─────────────────────────────
+     * When SetBodySpoolThreshold(n>0) is set and Content-Length >= n,
+     * stream the body straight to a temp file in the spool dir instead
+     * of buffering it in RAM — peak RAM stays ~64 KiB regardless of
+     * upload size. The handler reads the path via H1Conn.BodyFile and
+     * owns it (rename into place / delete). The in-RAM max_body cap does
+     * NOT apply here (the body never sits in RAM); size is bounded by
+     * disk + the handler. */
+    if (amalgame_net_http_body_spool_threshold > 0 &&
+        content_length >= amalgame_net_http_body_spool_threshold) {
+        const char* sdir = amalgame_net_http_body_spool_dir
+                         ? amalgame_net_http_body_spool_dir : "/tmp";
+        char tmpl[4096];
+        snprintf(tmpl, sizeof(tmpl), "%s/amh1body-XXXXXX", sdir);
+        int tfd = mkstemp(tmpl);
+        if (tfd < 0) return -1;
+        FILE* tf = fdopen(tfd, "wb");
+        if (!tf) { close(tfd); unlink(tmpl); return -1; }
+        long written = 0;
+        /* bytes already pulled past the headers by the initial recv */
+        int body_in_buf = total - (headers_len + 4);
+        if (body_in_buf > 0) {
+            long copy = (long)body_in_buf > content_length
+                      ? content_length : (long)body_in_buf;
+            if (copy > 0 &&
+                fwrite(eoh + 4, 1, (size_t)copy, tf) != (size_t)copy) {
+                fclose(tf); unlink(tmpl); return -1;
+            }
+            written = copy;
+        }
+        i64 body_to_ms = amalgame_h1_async_body_timeout_ms(c);
+        char sbuf[65536];
+        while (written < content_length) {
+            long want = content_length - written;
+            if (want > (long)sizeof(sbuf)) want = (long)sizeof(sbuf);
+            ssize_t rn = amalgame_h1_recv_into(c, sbuf, (size_t)want, body_to_ms);
+            if (rn <= 0) { fclose(tf); unlink(tmpl); return -1; }
+            if (fwrite(sbuf, 1, (size_t)rn, tf) != (size_t)rn) {
+                fclose(tf); unlink(tmpl); return -1;
+            }
+            written += rn;
+        }
+        if (fclose(tf) != 0) { unlink(tmpl); return -1; }
+        char* bf = (char*) GC_MALLOC_ATOMIC(strlen(tmpl) + 1);
+        strcpy(bf, tmpl);
+        c->body_file     = bf;
+        c->body_file_len = written;
+        c->body          = "";
+        c->body_len      = 0;
+        return 1;
+    }
+
+    /* In-RAM body cap. Precedence: per-conn config (Http1.ServeWith) >
      * process-global (Http1.SetMaxBodyBytes) > compile-time constant.
      * Zero at a level = fall through to the next. */
     int max_body = AMALGAME_H1_MAX_BODY;
@@ -2501,7 +2582,7 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     if (c->config && c->config->max_body_bytes > 0) {
         max_body = (int)c->config->max_body_bytes;
     }
-    if (content_length > max_body) return -1;
+    if (content_length > (long)max_body) return -1;
 
     if (content_length > 0) {
         c->body = (char*)GC_MALLOC_ATOMIC(content_length + 1);
@@ -2621,6 +2702,12 @@ static inline code_string Amalgame_Net_Http_H1Conn_Body(AmalgameH1Conn* c) {
 }
 static inline i64 Amalgame_Net_Http_H1Conn_BodyLen(AmalgameH1Conn* c) {
     return (c && c->body) ? (i64)c->body_len : 0;
+}
+/* v0.28.0: path of the temp file the body was spooled to (large uploads),
+ * or "" when the body is in RAM at `body`. The handler owns the file: move
+ * it into place (rename) or delete it. */
+static inline code_string Amalgame_Net_Http_H1Conn_BodyFile(AmalgameH1Conn* c) {
+    return (c && c->body_file) ? c->body_file : "";
 }
 /* v0.14.0: raw body byte at index i (0..BodyLen-1), as an i64 0..255;
  * -1 when out of range or no body. H1Conn_Body returns a char* that AM

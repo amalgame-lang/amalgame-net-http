@@ -289,8 +289,16 @@ static long amalgame_net_http_max_conns    = 0;   /* 0 = unlimited */
  * AMALGAME_H1_MAX_BODY default. Set via Http1.SetMaxBodyBytes(n); applies
  * to every accept loop (HTTP/1.1, HTTPS-H1) regardless of per-conn config,
  * so a server (e.g. a WebDAV NAS) can lift the 8 MiB default without
- * threading an HttpServerConfig through ServeHttps. */
-static long amalgame_net_http_max_body     = 0;   /* 0 = library default */
+ * threading an HttpServerConfig through ServeHttps.
+ *
+ * WEAK + external linkage (not `static`): this header is inlined into many
+ * translation units (the caller's main, plus every package archive — incl.
+ * amalgame-web's MosaicServer, which is where the HTTPS accept loop + parser
+ * actually run). A `static` global would give each TU its own copy, so a
+ * SetMaxBodyBytes() call from the app's TU would never reach the parser
+ * running inside the web archive. A weak definition collapses to a single
+ * shared instance at link time, so the setter and the reader agree. */
+long amalgame_net_http_max_body __attribute__((weak)) = 0;   /* 0 = library default */
 
 static inline void Amalgame_Net_Http_Http1_SetMaxConnections(i64 n) {
     amalgame_net_http_max_conns = (long) n;

@@ -4315,6 +4315,207 @@ static inline i64 Amalgame_Net_Http_Http1_ServeMtWith(i64 port,
     return 0;
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ *  Bounded worker-pool servers (v0.29.0) — Http1.ServePool /
+ *  HttpsH1Server.ServePool
+ * ══════════════════════════════════════════════════════════════════
+ * The ServeMt* family spawns one detached thread PER connection with no
+ * ceiling. Under a connection flood — or merely many keep-alive / SSE
+ * connections each pinning a thread — the process accumulates pthread
+ * stacks until GC_pthread_create returns EAGAIN; ServeMt* then runs the
+ * handler INLINE and the accept loop stalls, wedging the whole server
+ * (and any sibling listener in the same process, via thread/RAM
+ * exhaustion). That is exactly the failure the ServeMt comment warns
+ * about ("v2 can swap to a bounded thread-pool + queue").
+ *
+ * ServePool is that v2, done the simple way: a FIXED set of `workers`
+ * threads, each running its own accept→serve loop on the SAME listening
+ * socket (the classic prefork worker model — the kernel serializes
+ * accept() across them, so no userspace queue/condvar is needed).
+ * Concurrency is hard-bounded at `workers`; connections beyond that
+ * wait in the kernel listen backlog and, once it fills, are refused at
+ * the TCP layer (natural backpressure). Never an unbounded spawn, never
+ * an inline accept-loop stall. For HTTPS the TLS handshake runs INSIDE
+ * each worker, so handshakes of distinct clients proceed in parallel
+ * (unlike a single-accept-thread loop that serializes SSL_accept).
+ *
+ * Memory: each worker gets a 1 MiB stack (vs the 8 MiB pthread default),
+ * so even a large pool stays modest in address space — and RSS only
+ * grows with stacks actually touched.
+ *
+ * Keep-alive: each worker serves its connection with the same
+ * parse→handler→ResetForReuse loop as ServeMtWith, bounded by `idle_sec`
+ * (SO_RCVTIMEO). idle_sec <= 0 disables keep-alive (one request then
+ * close — the right choice for a :80→:443 redirect listener, whose
+ * workers should free up immediately).
+ *
+ * Caveat: a worker inside a long-lived handler (an SSE stream looping
+ * until shutdown) is unavailable until that handler returns. Size the
+ * pool comfortably above the expected count of concurrent long-lived
+ * streams.
+ *
+ * Graceful shutdown: the calling thread runs one of the worker loops, so
+ * ServePool BLOCKS until SIGTERM/SIGINT flips amalgame_net_http_stopping
+ * and shutdown(2) on the listen fd wakes every blocked accept(). The
+ * detached sibling workers observe the flag and exit too; an in-flight
+ * request finishes first (the stop check is at the top of each loop).
+ */
+typedef struct amalgame_pool_ctx {
+    void*                        srv;       /* AmalgameH1Server* | AmalgameHttpsH1Server* */
+    int                          is_https;
+    AmalgameClosure*             handler;
+    AmalgameNetHttpServerConfig* config;    /* may be NULL (HTTPS path passes NULL) */
+    int                          idle_sec;
+} amalgame_pool_ctx;
+
+/* Serve ONE accepted connection with the keep-alive request loop.
+ * Mirrors amalgame_h1_mt_with_worker / HttpsH1Server_ServeConnOn; works
+ * for both plain and TLS conns (H1Conn ops branch on c->ssl). */
+static void amalgame_pool_serve_one(AmalgameH1Conn* conn, amalgame_pool_ctx* c) {
+    AmalgameNetHttpServerConfig* cfg = c->config;
+    if (cfg) {
+        conn->config = cfg;
+        Amalgame_Net_Http_HttpServerConfig_ApplyToFd(conn->fd, cfg);
+    }
+    int idle = (cfg && cfg->idle_timeout_sec > 0) ? cfg->idle_timeout_sec : c->idle_sec;
+    int keep = idle > 0 ? 1 : 0;
+    if (keep) {
+        struct timeval tv; tv.tv_sec = idle; tv.tv_usec = 0;
+        setsockopt(conn->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    while (1) {
+        int parsed = amalgame_h1_parse_request(conn);
+        if (parsed <= 0) break;
+        conn->keep_alive = keep ? amalgame_h1_request_keep_alive(conn) : 0;
+        AmalgameClosure_call1(c->handler, (void*) conn);
+        if (!conn->keep_alive) break;
+        Amalgame_Net_Http_H1Conn_ResetForReuse(conn);
+    }
+    Amalgame_Net_Http_H1Conn_Close(conn);
+}
+
+static void* amalgame_pool_worker(void* p) {
+    amalgame_pool_ctx* c = (amalgame_pool_ctx*) p;
+    while (!amalgame_net_http_stopping) {
+        AmalgameH1Conn* conn;
+#if defined(AMALGAME_HAS_OPENSSL)
+        if (c->is_https) {
+            AmalgameHttpsH1Server* s = (AmalgameHttpsH1Server*) c->srv;
+            if (!s->listening) break;
+            conn = Amalgame_Net_Http_HttpsH1Server_Accept(s);   /* TLS handshake here */
+        } else
+#endif
+        {
+            AmalgameH1Server* s = (AmalgameH1Server*) c->srv;
+            if (!s->listening) break;
+            conn = Amalgame_Net_Http_H1Server_Accept(s);
+        }
+        if (!conn) {
+            if (amalgame_net_http_stopping) break;
+            continue;   /* failed handshake / transient accept error */
+        }
+        /* Honor the optional process-wide cap (0 = unlimited) on top of
+         * the pool's own structural bound. */
+        if (!amalgame_net_http_conn_admit()) {
+            Amalgame_Net_Http_H1Conn_Close(conn);
+            continue;
+        }
+        amalgame_pool_serve_one(conn, c);
+        amalgame_net_http_conn_release();
+    }
+    return NULL;
+}
+
+static inline i64 amalgame_serve_pool_run(void* srv, int is_https,
+        AmalgameClosure* handler, AmalgameNetHttpServerConfig* config,
+        i64 idle_sec, i64 workers) {
+    if (!srv || !handler) return -1;
+    int n = (int) workers;
+    if (n <= 0)   n = 256;     /* sane default */
+    if (n > 4096) n = 4096;    /* sanity ceiling */
+
+    amalgame_pool_ctx* ctx = (amalgame_pool_ctx*) GC_MALLOC(sizeof(*ctx));
+    ctx->srv = srv; ctx->is_https = is_https; ctx->handler = handler;
+    ctx->config = config; ctx->idle_sec = (int) idle_sec;
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    /* 1 MiB stacks — request handlers don't need the 8 MiB default, and
+     * this keeps a large pool's address-space footprint modest. */
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
+
+    /* Spawn n-1 sibling workers; the calling thread runs the n-th loop so
+     * ServePool blocks until shutdown. No join needed — siblings are
+     * detached and exit on the stopping flag. */
+    for (int i = 0; i < n - 1; i++) {
+        pthread_t th;
+        if (GC_pthread_create(&th, &attr, amalgame_pool_worker, ctx) != 0) {
+            /* Ran out of thread resources before reaching n — serve with
+             * the workers we got; the pool is simply smaller. */
+            break;
+        }
+    }
+    pthread_attr_destroy(&attr);
+    amalgame_pool_worker(ctx);   /* run on the caller's thread; blocks until stopping */
+    return 0;
+}
+
+/* Http1.ServePool(port, config, handler, workers) — bounded-pool HTTP/1.1.
+ * Drop-in for ServeMtWith with a hard concurrency ceiling. config may be
+ * NULL (defaults: no keep-alive, no size limits). */
+static inline i64 Amalgame_Net_Http_Http1_ServePool(i64 port,
+        AmalgameNetHttpServerConfig* config, AmalgameClosure* handler,
+        i64 workers) {
+    if (!handler) { fprintf(stderr, "Http1.ServePool: handler is NULL\n"); return -1; }
+    AmalgameH1Server* srv = Amalgame_Net_Http_H1Server_Listen(
+        port, config ? config->listen_backlog : 0);
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "Http1.ServePool: failed to listen on :%lld (%s)\n",
+                (long long)port, strerror(errno));
+        return -2;
+    }
+    int idle = config ? config->idle_timeout_sec : 0;
+    fprintf(stdout, "Http1.ServePool: listening on :%lld (HTTP/1.1, pool=%lld, keep-alive=%ds)\n",
+            (long long)port, (long long)(workers > 0 ? (workers > 4096 ? 4096 : workers) : 256), idle);
+    fflush(stdout);
+    i64 rc = amalgame_serve_pool_run((void*)srv, 0, handler, config, idle, workers);
+    amalgame_net_http_unregister_listen_fd(srv->fd);
+    Amalgame_Net_Http_H1Server_Close(srv);
+    return rc;
+}
+
+#if defined(AMALGAME_HAS_OPENSSL)
+/* HttpsH1Server.ServePool(srv, handler, idleSec, workers) — bounded-pool
+ * HTTPS-H1 on an ALREADY-listening server (caller did Listen + AddSni for
+ * the SNI multi-site case). Replaces a hand-rolled "accept in main +
+ * ThreadSpawn per conn" loop, which is unbounded. Takes ownership of the
+ * accepted conns (serves + closes each); does NOT close `srv` (the caller
+ * owns the listener). */
+static inline i64 Amalgame_Net_Http_HttpsH1Server_ServePool(
+        AmalgameHttpsH1Server* srv, AmalgameClosure* handler,
+        i64 idle_sec, i64 workers) {
+    if (!srv || !srv->listening) {
+        fprintf(stderr, "HttpsH1Server.ServePool: server not listening\n");
+        return -2;
+    }
+    if (!handler) { fprintf(stderr, "HttpsH1Server.ServePool: handler is NULL\n"); return -1; }
+    fprintf(stdout, "HttpsH1Server.ServePool: serving :%lld (HTTPS h1, pool=%lld, keep-alive=%llds)\n",
+            (long long)srv->port,
+            (long long)(workers > 0 ? (workers > 4096 ? 4096 : workers) : 256),
+            (long long)idle_sec);
+    fflush(stdout);
+    return amalgame_serve_pool_run((void*)srv, 1, handler, NULL, idle_sec, workers);
+}
+#else
+static inline i64 Amalgame_Net_Http_HttpsH1Server_ServePool(
+        void* srv, AmalgameClosure* handler, i64 idle_sec, i64 workers) {
+    (void)srv; (void)handler; (void)idle_sec; (void)workers;
+    fprintf(stderr, "HttpsH1Server.ServePool: built without OpenSSL.\n");
+    return -3;
+}
+#endif
+
 /* ── Http1.ServeWith(port, config, handler) — Http1.Serve + config ─
  * Same shape as Http1.Serve but applies HttpServerConfig to every
  * accepted connection. Today that means setting SO_RCVTIMEO /

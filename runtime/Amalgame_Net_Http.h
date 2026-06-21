@@ -3498,10 +3498,15 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
      * "https proxy request" probes that hit :443) blocks SSL_accept
      * forever — and since it's reading the *client* socket, shutting down
      * the listen fd on SIGINT can't wake it, so the whole server hangs on
-     * Ctrl-C. A 15 s ceiling makes the loop return to its IsStopping()
-     * check and doubles as slowloris hardening. Cleared (0 = no timeout)
-     * after a successful handshake so keep-alive reads aren't affected. */
-    struct timeval hs_to; hs_to.tv_sec = 15; hs_to.tv_usec = 0;
+     * Ctrl-C. A 10 s ceiling makes the loop return to its IsStopping()
+     * check and doubles as slowloris hardening (a stalled handshake frees
+     * its worker in 10 s, not 15). Perf-safe: this timeout only ever fires
+     * on a handshake that STALLS — it's cleared (0 = no timeout) the instant
+     * the handshake succeeds, so a legitimate client (TLS handshake completes
+     * in well under 1 s) never sees it; only silent scanners/slowloris hit
+     * the ceiling. 10 s still leaves ample margin for a real client on a slow
+     * / lossy link. */
+    struct timeval hs_to; hs_to.tv_sec = 10; hs_to.tv_usec = 0;
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &hs_to, sizeof(hs_to));
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &hs_to, sizeof(hs_to));
     SSL* ssl = SSL_new(s->ssl_ctx);
@@ -4448,6 +4453,7 @@ static inline i64 amalgame_serve_pool_run(void* srv, int is_https,
     /* Spawn n-1 sibling workers; the calling thread runs the n-th loop so
      * ServePool blocks until shutdown. No join needed — siblings are
      * detached and exit on the stopping flag. */
+    int started = 1;   /* the caller's own loop, below, counts as one worker */
     for (int i = 0; i < n - 1; i++) {
         pthread_t th;
         if (GC_pthread_create(&th, &attr, amalgame_pool_worker, ctx) != 0) {
@@ -4455,8 +4461,20 @@ static inline i64 amalgame_serve_pool_run(void* srv, int is_https,
              * the workers we got; the pool is simply smaller. */
             break;
         }
+        started++;
     }
     pthread_attr_destroy(&attr);
+    /* Surface the effective pool size: silent under-provisioning (e.g. the
+     * systemd TasksMax cap or RLIMIT_NPROC clipping the pool) would otherwise
+     * read as "fine" while concurrency is quietly lower than configured. */
+    if (started < n) {
+        fprintf(stderr, "ServePool: started %d/%d workers (thread limit hit — "
+                "check TasksMax / RLIMIT_NPROC); serving with %d.\n",
+                started, n, started);
+    } else {
+        fprintf(stdout, "ServePool: %d worker threads ready.\n", started);
+    }
+    fflush(stdout); fflush(stderr);
     amalgame_pool_worker(ctx);   /* run on the caller's thread; blocks until stopping */
     return 0;
 }

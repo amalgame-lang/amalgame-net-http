@@ -423,11 +423,33 @@ public class HttpClient {
                             } else {
                                 /* Read up to 1 MiB into a growable
                                  * buffer; loop until clean close
-                                 * (rn <= 0) or cap. */
+                                 * (rn <= 0) or the 1 MiB safety ceiling.
+                                 *
+                                 * BUGFIX (v0.29.3): the old exit condition
+                                 * was `total >= cap`, which conflated "the
+                                 * CURRENT (still-growable) buffer happens to
+                                 * be exactly full" with "the response is
+                                 * complete". Whenever a read landed such
+                                 * that total exactly filled cap without a
+                                 * resize being triggered on that same
+                                 * iteration, the loop stopped even though
+                                 * the peer still had more bytes queued —
+                                 * silently truncating any response whose
+                                 * size happened to land on that boundary
+                                 * (~64 KiB, then ~128 KiB, etc). Verified in
+                                 * the wild: a 105 263-byte JSON response
+                                 * truncated to 65 115 bytes, breaking the
+                                 * caller's JSON parse with no error at the
+                                 * HTTP layer (status still 200). The resize
+                                 * block already grows `cap` up to the real
+                                 * 1 MiB ceiling as needed, so the only
+                                 * legitimate reason to stop reading (short
+                                 * of a clean close) is hitting that ceiling. */
                                 size_t cap = 65536;
                                 size_t total = 0;
                                 char* buf = (char*) GC_MALLOC(cap);
                                 char chunk[4096];
+                                size_t maxBody = 1048576;
                                 for (;;) {
                                     i64 rn = Amalgame_Tls_TlsStream_ReadBytes(
                                         stream, chunk, (i64) sizeof(chunk));
@@ -435,7 +457,7 @@ public class HttpClient {
                                     if (total + rn > cap) {
                                         size_t newCap = cap * 2;
                                         while (newCap < total + (size_t) rn) newCap *= 2;
-                                        if (newCap > 1048576) newCap = 1048576;
+                                        if (newCap > maxBody) newCap = maxBody;
                                         char* nbuf = (char*) GC_MALLOC(newCap);
                                         memcpy(nbuf, buf, total);
                                         buf = nbuf;
@@ -445,7 +467,7 @@ public class HttpClient {
                                     if (total + can > cap) can = cap - total;
                                     memcpy(buf + total, chunk, can);
                                     total += can;
-                                    if (total >= cap) break;
+                                    if (total >= maxBody) break;
                                 }
                                 Amalgame_Tls_TlsStream_Close(stream);
                                 char* nul = (char*) GC_MALLOC(total + 1);

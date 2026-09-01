@@ -2169,6 +2169,9 @@ static inline i64 Amalgame_Net_Http_H2_Available(void) {
 
 #define AMALGAME_H1_MAX_HEADERS 64
 #define AMALGAME_H1_RECV_BUF    65536
+/* v0.29.6: body-spool buffers, heap-allocated — see parse_request. */
+#define AMALGAME_H1_SPOOL_BUF   65536
+#define AMALGAME_H1_SPOOL_PATH  4096
 #define AMALGAME_H1_MAX_BODY    (8 * 1024 * 1024)
 
 typedef struct AmalgameH1Header {
@@ -2543,8 +2546,10 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
         content_length >= amalgame_net_http_body_spool_threshold) {
         const char* sdir = amalgame_net_http_body_spool_dir
                          ? amalgame_net_http_body_spool_dir : "/tmp";
-        char tmpl[4096];
-        snprintf(tmpl, sizeof(tmpl), "%s/amh1body-XXXXXX", sdir);
+        /* v0.29.6: heap too, same reason — 4 KiB of frame reserved on
+         * every parse, for a path that is used only when spooling. */
+        char* tmpl = (char*) GC_MALLOC_ATOMIC(AMALGAME_H1_SPOOL_PATH);
+        snprintf(tmpl, AMALGAME_H1_SPOOL_PATH, "%s/amh1body-XXXXXX", sdir);
         int tfd = mkstemp(tmpl);
         if (tfd < 0) return -1;
         FILE* tf = fdopen(tfd, "wb");
@@ -2562,10 +2567,19 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
             written = copy;
         }
         i64 body_to_ms = amalgame_h1_async_body_timeout_ms(c);
-        char sbuf[65536];
+        /* v0.29.6: HEAP, not stack. This buffer is only used on the
+         * spool path, but gcc reserves its space in the prologue of
+         * parse_request whatever branch runs — the frame measured
+         * 69 760 bytes (-fstack-usage) against a 64 KiB fiber stack
+         * (Amalgame_Async.h: f->stack_size = 64 * 1024). ServeAsync
+         * therefore blew its stack on the FIRST request, every time,
+         * before reading a byte: the smoke test had been segfaulting
+         * since v0.28.0 for that reason alone. Same allocation shape
+         * as the recv buffer at the top of this function. */
+        char* sbuf = (char*) GC_MALLOC_ATOMIC(AMALGAME_H1_SPOOL_BUF);
         while (written < content_length) {
             long want = content_length - written;
-            if (want > (long)sizeof(sbuf)) want = (long)sizeof(sbuf);
+            if (want > (long)AMALGAME_H1_SPOOL_BUF) want = (long)AMALGAME_H1_SPOOL_BUF;
             ssize_t rn = amalgame_h1_recv_into(c, sbuf, (size_t)want, body_to_ms);
             if (rn <= 0) { fclose(tf); unlink(tmpl); return -1; }
             if (fwrite(sbuf, 1, (size_t)rn, tf) != (size_t)rn) {

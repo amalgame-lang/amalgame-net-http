@@ -32,6 +32,19 @@ fi
 echo "Using amc: $AMC"
 
 BUILD_DIR=$(mktemp -d -t amalgame-net-http-XXXXXX)
+
+# `gcc ... 2>&1 | head -N` KILLS gcc with SIGPIPE as soon as its output
+# exceeds N lines: head exits, the pipe closes, and gcc dies before
+# emitting the binary. The test then reports "smoke build" failure while
+# the code compiles perfectly — and whether it triggers depends on how
+# chatty a THIRD-PARTY header happens to be (amalgame-async v0.3.1 warns
+# about AmalgameList_size, 12 lines, enough to trip every 5-line head).
+# Capture first, truncate after.
+cc_quiet() {
+    local lines=$1; shift
+    "$@" > "$BUILD_DIR/cc.log" 2>&1 || true
+    head -n "$lines" "$BUILD_DIR/cc.log"
+}
 trap 'rm -rf "$BUILD_DIR"; [ -n "$SERVER_PID" ] && kill $SERVER_PID 2>/dev/null' EXIT
 
 # Resolve the runtime headers dir (need it for gcc -I).
@@ -100,7 +113,7 @@ done
 # ── Build facade.o once ───────────────────────────────────────────
 echo -e "\n── Building facade.o ──"
 "$AMC" --lib -o "$BUILD_DIR/facade" $NETHTTP_SOURCES 2>&1 | tail -2
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" -c "$BUILD_DIR/facade.c" -o "$BUILD_DIR/facade.o" 2>&1 | head -5
+gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" -c "$BUILD_DIR/facade.c" -o "$BUILD_DIR/facade.o"
 if [ ! -s "$BUILD_DIR/facade.o" ]; then
     echo -e "${RED}FAIL${NC} (facade compile)"
     exit 1
@@ -116,9 +129,9 @@ build_test() {
     # via amalgame_h1_send_all / amalgame_h1_recv_into branches
     # on c->ssl. Link -lssl -lcrypto unconditionally; users on
     # OpenSSL-less builds (rare) can override via a -U define.
-    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
         "$out.c" "$BUILD_DIR/facade.o" \
-        -lgc -lm -lcurl -lz -lpthread -lssl -lcrypto -lnghttp2 -o "$out" 2>&1 | head -5
+        -lgc -lm -lcurl -lz -lpthread -lssl -lcrypto -lnghttp2 -o "$out"
     [ -x "$out" ]
 }
 
@@ -184,8 +197,8 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/cfg_smoke.c" \
-    -lgc -lssl -lcrypto -o "$BUILD_DIR/cfg_smoke" 2>&1 | head -5
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/cfg_smoke.c" \
+    -lgc -lssl -lcrypto -o "$BUILD_DIR/cfg_smoke"
 if [ ! -x "$BUILD_DIR/cfg_smoke" ]; then
     echo -e "${RED}FAIL${NC} (HttpServerConfig smoke build)"
     exit 1
@@ -286,8 +299,8 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
-    "$BUILD_DIR/respondfile_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/respondfile_smoke" 2>&1 | head -5
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/respondfile_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/respondfile_smoke"
 if [ ! -x "$BUILD_DIR/respondfile_smoke" ]; then
     echo -e "${RED}FAIL${NC} (RespondFile smoke build)"
     exit 1
@@ -364,8 +377,8 @@ int main(void) {
     return ok ? 0 : 1;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
-    "$BUILD_DIR/stream_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/stream_smoke" 2>&1 | head -5
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/stream_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/stream_smoke"
 if [ ! -x "$BUILD_DIR/stream_smoke" ]; then
     echo -e "${RED}FAIL${NC} (streaming smoke build)"
     exit 1
@@ -406,8 +419,8 @@ int main(void) {
     return ok ? 0 : 1;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
-    "$BUILD_DIR/wsproto_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/wsproto_smoke" 2>&1 | head -5
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/wsproto_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/wsproto_smoke"
 if [ ! -x "$BUILD_DIR/wsproto_smoke" ]; then
     echo -e "${RED}FAIL${NC} (wsproto smoke build)"
     exit 1
@@ -474,8 +487,8 @@ int main(void) {
     printf("FAIL (%d)\n", fails); return 1;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
-    "$BUILD_DIR/security_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/security_smoke" 2>&1 | head -8
+cc_quiet 8 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    "$BUILD_DIR/security_smoke.c" -lgc -lssl -lcrypto -o "$BUILD_DIR/security_smoke"
 if [ ! -x "$BUILD_DIR/security_smoke" ]; then
     echo -e "${RED}FAIL${NC} (security smoke build)"
     exit 1
@@ -529,8 +542,8 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/mt_smoke.c" \
-    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/mt_smoke" 2>&1 | head -5
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/mt_smoke.c" \
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/mt_smoke"
 if [ ! -x "$BUILD_DIR/mt_smoke" ]; then
     echo -e "${RED}FAIL${NC} (Http1.ServeMt smoke build)"
     exit 1
@@ -565,8 +578,8 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2c_smoke.c" \
-    -lnghttp2 -lssl -lcrypto -lgc -o "$BUILD_DIR/h2c_smoke" 2>&1 | head -5
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2c_smoke.c" \
+    -lnghttp2 -lssl -lcrypto -lgc -o "$BUILD_DIR/h2c_smoke"
 if [ ! -x "$BUILD_DIR/h2c_smoke" ]; then
     echo -e "${RED}FAIL${NC} (h2c smoke build)"
     exit 1
@@ -666,8 +679,8 @@ int main(void){
     return ok?0:1;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/grpc_h2_smoke.c" \
-    -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/grpc_h2_smoke" 2>&1 | head -8
+cc_quiet 8 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/grpc_h2_smoke.c" \
+    -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/grpc_h2_smoke"
 if [ ! -x "$BUILD_DIR/grpc_h2_smoke" ]; then
     echo -e "${RED}FAIL${NC} (gRPC-over-H2 smoke build)"
     exit 1
@@ -727,8 +740,8 @@ int main(void){
     return ok?0:1;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2client_smoke.c" \
-    -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/h2client_smoke" 2>&1 | head -8
+cc_quiet 8 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2client_smoke.c" \
+    -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/h2client_smoke"
 if [ ! -x "$BUILD_DIR/h2client_smoke" ]; then echo -e "${RED}FAIL${NC} (H2 client smoke build)"; exit 1; fi
 if "$BUILD_DIR/h2client_smoke"; then
     echo -e "${GREEN}PASS${NC} (H2Client.Unary round-trips status + grpc trailer + binary body)"
@@ -783,8 +796,8 @@ int main(void){
     return ((status==200)&&(gs==0)&&ok)?0:1;
 }
 EOF
-    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2tls_smoke.c" \
-        -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/h2tls_smoke" 2>&1 | head -6
+    cc_quiet 6 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" "$BUILD_DIR/h2tls_smoke.c" \
+        -lnghttp2 -lpthread -lssl -lcrypto -lgc -o "$BUILD_DIR/h2tls_smoke"
     if [ ! -x "$BUILD_DIR/h2tls_smoke" ]; then echo -e "${RED}FAIL${NC} (TLS client smoke build)"; exit 1; fi
     if "$BUILD_DIR/h2tls_smoke"; then
         echo -e "${GREEN}PASS${NC} (H2Client.ConnectTls round-trips over TLS)"
@@ -806,6 +819,11 @@ echo -e "\n── Http1.ServeAsync e2e (link + fibers + epoll) ──"
 SERVE_ASYNC_PORT=18091
 cat > "$BUILD_DIR/serve_async_smoke.c" <<EOF
 #include "Amalgame_Net_Http.h"
+/* GC_THREADS before gc.h: without it GC_pthread_create/join are only
+ * resolved at link time, through an implicit declaration. It worked,
+ * but it hid the prototypes behind a warning on every run. */
+#define GC_THREADS 1
+#include <gc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
@@ -859,9 +877,9 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
     "$BUILD_DIR/serve_async_smoke.c" \
-    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/serve_async_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/serve_async_smoke"
 if [ ! -x "$BUILD_DIR/serve_async_smoke" ]; then
     echo -e "${RED}FAIL${NC} (ServeAsync smoke build)"
     exit 1
@@ -965,9 +983,9 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
     "$BUILD_DIR/serve_async_with_smoke.c" \
-    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/serve_async_with_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/serve_async_with_smoke"
 if [ ! -x "$BUILD_DIR/serve_async_with_smoke" ]; then
     echo -e "${RED}FAIL${NC} (ServeAsyncWith smoke build)"
     exit 1
@@ -1058,9 +1076,9 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+cc_quiet 3 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
     "$BUILD_DIR/header_timeout_smoke.c" \
-    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/header_timeout_smoke" 2>&1 | head -3
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/header_timeout_smoke"
 if [ ! -x "$BUILD_DIR/header_timeout_smoke" ]; then
     echo -e "${RED}FAIL${NC} (header-timeout smoke build)"
     exit 1
@@ -1183,9 +1201,9 @@ int main(void) {
     return 0;
 }
 EOF
-gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
     "$BUILD_DIR/graceful_shutdown_smoke.c" \
-    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/graceful_shutdown_smoke" 2>&1 | head -5
+    -lgc -lpthread -lssl -lcrypto -o "$BUILD_DIR/graceful_shutdown_smoke"
 if [ ! -x "$BUILD_DIR/graceful_shutdown_smoke" ]; then
     echo -e "${RED}FAIL${NC} (graceful-shutdown smoke build)"
     exit 1
@@ -1268,9 +1286,9 @@ int main(void) {
     return 0;
 }
 EOF
-    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
         "$BUILD_DIR/https_h1_smoke.c" \
-        -lssl -lcrypto -lnghttp2 -lgc -lpthread -o "$BUILD_DIR/https_h1_smoke" 2>&1 | head -5
+        -lssl -lcrypto -lnghttp2 -lgc -lpthread -o "$BUILD_DIR/https_h1_smoke"
     if [ ! -x "$BUILD_DIR/https_h1_smoke" ]; then
         echo -e "${RED}FAIL${NC} (https_h1_smoke build)"
         exit 1
@@ -1360,10 +1378,10 @@ int main(void) {
     return 0;
 }
 EOF
-    gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
+    cc_quiet 5 gcc -O2 -Iruntime -I"$RUNTIME_DIR" -I"$ASYNC_RUNTIME_DIR" -I"$TLS_RUNTIME_DIR" \
         "$BUILD_DIR/https_cli_smoke.c" "$BUILD_DIR/facade.o" \
         -lgc -lpthread -lssl -lcrypto -lnghttp2 \
-        -o "$BUILD_DIR/https_cli_smoke" 2>&1 | head -5
+        -o "$BUILD_DIR/https_cli_smoke"
     if [ ! -x "$BUILD_DIR/https_cli_smoke" ]; then
         echo -e "${YELLOW}SKIP${NC} (https_cli_smoke build failed — likely facade symbol mangling drift)"
     else

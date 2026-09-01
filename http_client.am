@@ -26,6 +26,7 @@ import Amalgame.String
     #include <strings.h>   /* strncasecmp */
     #include <stdio.h>     /* binary download → FILE* */
     #include <stdlib.h>
+    #include <errno.h>
 
     /* v0.27.0 — binary-safe download-to-file plumbing. Reading a binary
      * response into an AM string truncates at the first NUL; instead we
@@ -492,8 +493,66 @@ public class HttpClient {
         }
 
         // Plain TCP path (http://).
+        //
+        // BUGFIX (v0.29.5) — READ UNTIL THE RESPONSE IS ACTUALLY OVER.
+        //
+        // This used to be a single TcpClient_Receive(). That primitive
+        // is one recv(), and one recv() returns whatever has arrived at
+        // that instant — never a guarantee of a whole HTTP message. On
+        // loopback against a healthy server it failed roughly a third of
+        // the time, in two flavours that look nothing alike:
+        //
+        //   - a fragment of the status line  → ParseResponse fails,
+        //     the caller sees "HTTP 0" and blames the network;
+        //   - headers without the body       → a perfectly valid
+        //     "200 OK" with an empty body, which is far worse: the
+        //     caller believes it.
+        //
+        // The second one is why this mattered: a downstream agent read
+        // "200" and an empty desired-state, and kept routing on stale
+        // data with nothing anywhere saying so.
+        //
+        // The request carries `Connection: close`, so end-of-stream IS
+        // end-of-message; we read until the server closes. The HTTPS
+        // path already did this — only the plaintext path was naive.
         TcpClient_Send(conn, s)
-        let raw: string = TcpClient_Receive(conn, 1048576)   // 1 MB cap
+        var raw: string = null
+        @c {
+            /* A read timeout, which the single-recv version also lacked.
+             * Without one, a server that accepts a connection and then
+             * says nothing hangs the caller for ever. Thirty seconds of
+             * SILENCE — not thirty seconds total — so a large slow body
+             * still comes through. */
+            #ifndef _WIN32
+            struct timeval _tv; _tv.tv_sec = 30; _tv.tv_usec = 0;
+            setsockopt(conn->_fd, SOL_SOCKET, SO_RCVTIMEO, &_tv, sizeof(_tv));
+            #endif
+            size_t _cap = 8192, _total = 0;
+            char* _buf = (char*) GC_MALLOC(_cap);
+            const size_t _MAXB = 1048576;   /* 1 MB cap, as before */
+            if (_buf) {
+                for (;;) {
+                    if (_total + 1 >= _cap) {
+                        size_t _n = _cap * 2;
+                        if (_n > _MAXB + 1) _n = _MAXB + 1;
+                        if (_n <= _cap) break;          /* ceiling reached */
+                        char* _nb = (char*) GC_MALLOC(_n);
+                        if (!_nb) break;
+                        memcpy(_nb, _buf, _total);
+                        _buf = _nb; _cap = _n;
+                    }
+                    ssize_t _r = recv(conn->_fd, _buf + _total, _cap - _total - 1, 0);
+                    if (_r < 0) {
+                        if (errno == EINTR) continue;
+                        break;                          /* timeout or error */
+                    }
+                    if (_r == 0) break;                 /* server closed: done */
+                    _total += (size_t) _r;
+                    if (_total >= _MAXB) break;
+                }
+                if (_total > 0) { _buf[_total] = 0; raw = _buf; }
+            }
+        }
         TcpClient_Close(conn)
         if (raw == null) {
             return HttpResponse.New().Status(0).Text("read failed")

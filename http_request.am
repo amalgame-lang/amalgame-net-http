@@ -35,6 +35,15 @@ public class HttpRequest {
     // The handler owns the file — move it into place or delete it. "" when
     // the body is in RAM at `Body`.
     public BodyFile:    string
+    // v0.29.4: octets lus au-delà des en-têtes d'une requête SANS
+    // Content-Length — un flux d'encodeur (ingest audio sans fin) est
+    // exactement ce cas. Ils étaient jetés en silence, et le premier
+    // fragment du flux disparaissait à chaque connexion. À consommer
+    // AVANT de lire sur le fd brut, sinon le flux commence au mauvais
+    // endroit. 0 / 0 quand la requête avait un Content-Length (ces
+    // octets-là sont dans Body) ou qu'il n'y avait rien de plus à lire.
+    public PendingPtr:  int
+    public PendingLen:  int
 
     public HttpRequest() {
         this.Method      = ""
@@ -49,6 +58,8 @@ public class HttpRequest {
         this.BodyPtr     = 0
         this.BodyLen     = 0
         this.BodyFile    = ""
+        this.PendingPtr  = 0
+        this.PendingLen  = 0
     }
 
     // Get a header value (case-insensitive lookup).
@@ -208,6 +219,8 @@ public class HttpRequest {
                 /* v0.28.0: large body spooled to a temp file (empty
                  * otherwise). The handler renames/deletes it. */
                 req->BodyFile    = (code_string) Amalgame_Net_Http_H1Conn_BodyFile(c);
+                req->PendingPtr  = Amalgame_Net_Http_H1Conn_Pending(c);
+                req->PendingLen  = Amalgame_Net_Http_H1Conn_PendingLen(c);
                 /* RemoteAddr captured at accept time, formatted
                  * "ip:port". If missing on older builds the field
                  * stays empty and RateLimit "ip" strategy falls

@@ -2235,6 +2235,17 @@ typedef struct AmalgameH1Conn {
      * returns (framing is Connection: close — the response ends when
      * the socket closes). Cleared by ResetForReuse for completeness. */
     int32_t                  streaming;
+    /* v0.29.4: octets lus AU-DELÀ des en-têtes quand la requête n'a pas
+     * de Content-Length — un flux d'encodeur (ingest audio sans fin) est
+     * exactement ce cas. Ils étaient jetés en silence : le lecteur brut
+     * qui prend ensuite la main sur RawFd() ne les voyait jamais, et le
+     * premier fragment du flux disparaissait à chaque connexion.
+     * Mesuré sur le projet webradio : 60 000 octets reçus sur 72 000
+     * poussés, le premier bloc manquant, les suivants intacts.
+     * NULL / 0 quand il n'y avait rien à garder — le cas de loin le plus
+     * fréquent, une requête sans corps tenant dans une seule lecture. */
+    char*                    pending;
+    int32_t                  pending_len;
 } AmalgameH1Conn;
 
 typedef struct AmalgameH1Server {
@@ -2604,6 +2615,22 @@ static int amalgame_h1_parse_request(AmalgameH1Conn* c) {
     } else {
         c->body = "";
         c->body_len = 0;
+        /* v0.29.4 — pas de Content-Length : ce qui a été lu au-delà des
+         * en-têtes n'est pas un corps au sens HTTP, mais ce n'est pas
+         * une raison pour le perdre. Un client qui pousse un flux sans
+         * fin (ingest audio, upload en continu) envoie ses premiers
+         * octets dans la même lecture TCP que ses en-têtes. On les
+         * garde ; H1Conn_Pending les rend au gestionnaire, qui les
+         * traite avant de passer au fd brut. */
+        int extra = total - (headers_len + 4);
+        if (extra > 0) {
+            c->pending = (char*)GC_MALLOC_ATOMIC(extra + 1);
+            if (c->pending) {
+                memcpy(c->pending, eoh + 4, extra);
+                c->pending[extra] = 0;
+                c->pending_len = extra;
+            }
+        }
     }
     return 1;
 }
@@ -2702,6 +2729,17 @@ static inline code_string Amalgame_Net_Http_H1Conn_Body(AmalgameH1Conn* c) {
 }
 static inline i64 Amalgame_Net_Http_H1Conn_BodyLen(AmalgameH1Conn* c) {
     return (c && c->body) ? (i64)c->body_len : 0;
+}
+/* v0.29.4: octets lus au-delà des en-têtes d'une requête SANS
+ * Content-Length. Binaire — la longueur fait foi, pas un NUL final.
+ * À consommer AVANT de lire sur RawFd(), sinon le flux commence au
+ * mauvais endroit. Toujours 0 quand la requête avait un Content-Length
+ * (ces octets-là sont dans body). */
+static inline i64 Amalgame_Net_Http_H1Conn_Pending(AmalgameH1Conn* c) {
+    return (c && c->pending) ? (i64)(uintptr_t) c->pending : 0;
+}
+static inline i64 Amalgame_Net_Http_H1Conn_PendingLen(AmalgameH1Conn* c) {
+    return (c && c->pending) ? (i64)c->pending_len : 0;
 }
 /* v0.28.0: path of the temp file the body was spooled to (large uploads),
  * or "" when the body is in RAM at `body`. The handler owns the file: move
@@ -3258,6 +3296,8 @@ static inline void Amalgame_Net_Http_H1Conn_ResetForReuse(AmalgameH1Conn* c) {
     c->header_count  = 0;
     c->response_sent = 0;
     c->streaming     = 0;
+    c->pending       = NULL;
+    c->pending_len   = 0;
     /* fd / config / keep_alive are intentionally preserved. */
 }
 

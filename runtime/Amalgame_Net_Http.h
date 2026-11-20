@@ -89,6 +89,7 @@ extern int GC_pthread_create(pthread_t* new_thread,
                               const pthread_attr_t* attr,
                               void* (*start_routine)(void*),
                               void* arg);
+extern int GC_pthread_join(pthread_t thread, void** retval);
 
 /* nghttp2 header probe — multi-OS, mirrors the OpenSSL pattern in
  * amalgame-tls. macOS gets a Homebrew path fallback. */

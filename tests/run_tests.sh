@@ -820,9 +820,6 @@ SERVE_ASYNC_PORT=18091
 cat > "$BUILD_DIR/serve_async_smoke.c" <<EOF
 #include "Amalgame_Net_Http.h"
 #include <pthread.h>
-/* gc.h is already in through the package header, without GC_THREADS :
- * declare the join wrapper ourselves (gcc 14 rejects implicit ones). */
-extern int GC_pthread_join(pthread_t thread, void** retval);
 #include <stdio.h>
 #include <time.h>
 

@@ -1407,4 +1407,13 @@ else
     exit 1
 fi
 
+# ── HTTPS handshake vs collector signals (v0.29.7) ───────────────
+echo -e "\n── GC signals during the TLS handshake ──"
+if AMC_RUNTIME="$RUNTIME_DIR" ASYNC_RT="$ASYNC_RUNTIME_DIR" TLS_RT="$TLS_RUNTIME_DIR" bash tests/gc_signal_test.sh; then
+    echo -e "${GREEN}PASS${NC} (handshake survives GC stop-the-world signals)"
+else
+    echo -e "${RED}FAIL${NC} (handshake dropped on EINTR)"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

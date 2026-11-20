@@ -528,6 +528,33 @@ static inline void amalgame_net_http_peer_str(
 #define AMALGAME_H2_MAX_HEADERS 64
 #define AMALGAME_H2_RECV_BUF    16384
 
+#ifdef AMALGAME_HAS_OPENSSL
+/* v0.29.7: SSL_accept that survives signals. bdwgc stops the world by
+ * signalling every thread ; a blocking read on a socket that carries
+ * SO_RCVTIMEO (the 10 s handshake ceiling) is never restarted after a
+ * signal, even with SA_RESTART (signal(7)) : it fails with EINTR, OpenSSL
+ * reports SSL_ERROR_WANT_READ, and the handshake was dropped. Any
+ * allocating thread beside the server (a collection every few seconds)
+ * made 1 handshake in 3 fail under load. Retry on EINTR only : a real
+ * timeout (EAGAIN) still fails, and the whole retry loop keeps the same
+ * 10 s deadline, so slowloris hardening is unchanged. */
+static inline int amalgame_ssl_accept(SSL* ssl) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;) {
+        errno = 0;
+        int rv = SSL_accept(ssl);
+        if (rv == 1) return rv;
+        int err = SSL_get_error(ssl, rv);
+        if (errno != EINTR || (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE
+                               && err != SSL_ERROR_SYSCALL)) return rv;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (t1.tv_sec - t0.tv_sec >= 10) return rv;
+        ERR_clear_error();
+    }
+}
+#endif
+
 typedef struct AmalgameH2Header {
     char* name;
     char* value;
@@ -1777,7 +1804,7 @@ static inline AmalgameH2Conn* Amalgame_Net_Http_HttpsServer_Accept(
     SSL* ssl = SSL_new(s->ssl_ctx);
     if (!ssl) { close(cfd); return NULL; }
     SSL_set_fd(ssl, cfd);
-    int rv = SSL_accept(ssl);
+    int rv = amalgame_ssl_accept(ssl);
     if (rv != 1) {
         /* Routine on a public :443 (scanners, old clients) — silent unless
          * AMALGAME_TLS_DEBUG. Clear the OpenSSL error queue. */
@@ -3566,7 +3593,7 @@ static inline AmalgameH1Conn* Amalgame_Net_Http_HttpsH1Server_Accept(
     SSL* ssl = SSL_new(s->ssl_ctx);
     if (!ssl) { close(cfd); return NULL; }
     SSL_set_fd(ssl, cfd);
-    int rv = SSL_accept(ssl);
+    int rv = amalgame_ssl_accept(ssl);
     if (rv != 1) {
         /* Failed handshakes are ROUTINE on a public :443 — port scanners,
          * old/SSLv3 clients, plain-HTTP-to-HTTPS mistakes, slowloris cut at
@@ -5479,7 +5506,7 @@ static inline AmalgameWsConn* Amalgame_Net_Http_WssServer_Accept(
     SSL* ssl = SSL_new(s->ssl_ctx);
     if (!ssl) { close(cfd); return NULL; }
     SSL_set_fd(ssl, cfd);
-    int rv = SSL_accept(ssl);
+    int rv = amalgame_ssl_accept(ssl);
     if (rv != 1) {
         fprintf(stderr, "Wss.Serve: TLS handshake failed\n");
         ERR_print_errors_fp(stderr);
@@ -5635,7 +5662,7 @@ static inline i64 Amalgame_Net_Http_Wss_ServeWith(
         SSL* ssl = SSL_new(srv->ssl_ctx);
         if (!ssl) { close(cfd); continue; }
         SSL_set_fd(ssl, cfd);
-        int rv = SSL_accept(ssl);
+        int rv = amalgame_ssl_accept(ssl);
         if (rv != 1) {
             fprintf(stderr, "Wss.ServeWith: TLS handshake failed\n");
             ERR_print_errors_fp(stderr);

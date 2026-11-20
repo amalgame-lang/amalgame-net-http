@@ -38,7 +38,6 @@ static void* churn(void* p) {
 }
 int main(void){
     GC_INIT();
-    GC_allow_register_threads();
     SSL_library_init(); SSL_load_error_strings(); OpenSSL_add_all_algorithms();
     AmalgameHttpsH1Server* s = Amalgame_Net_Http_HttpsH1Server_Listen(
         $PORT, "$B/c.pem", "$B/k.pem", 0);

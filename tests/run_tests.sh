@@ -819,12 +819,10 @@ echo -e "\n── Http1.ServeAsync e2e (link + fibers + epoll) ──"
 SERVE_ASYNC_PORT=18091
 cat > "$BUILD_DIR/serve_async_smoke.c" <<EOF
 #include "Amalgame_Net_Http.h"
-/* GC_THREADS before gc.h: without it GC_pthread_create/join are only
- * resolved at link time, through an implicit declaration. It worked,
- * but it hid the prototypes behind a warning on every run. */
-#define GC_THREADS 1
-#include <gc.h>
 #include <pthread.h>
+/* gc.h is already in through the package header, without GC_THREADS :
+ * declare the join wrapper ourselves (gcc 14 rejects implicit ones). */
+extern int GC_pthread_join(pthread_t thread, void** retval);
 #include <stdio.h>
 #include <time.h>
 

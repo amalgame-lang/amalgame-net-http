@@ -1411,4 +1411,13 @@ else
     exit 1
 fi
 
+# ── HTTPS keep-alive idle timeout vs collector signals (v0.29.8) ──
+echo -e "\n── TLS keep-alive idle timeout ──"
+if AMC_RUNTIME="$RUNTIME_DIR" ASYNC_RT="$ASYNC_RUNTIME_DIR" TLS_RT="$TLS_RUNTIME_DIR" bash tests/tls_idle_timeout_test.sh; then
+    echo -e "${GREEN}PASS${NC} (idle keep-alive connection closed on time)"
+else
+    echo -e "${RED}FAIL${NC} (idle keep-alive connection held past its timeout)"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

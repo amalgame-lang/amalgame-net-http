@@ -67,6 +67,9 @@
   #include <stdio.h>
   #include <signal.h>       /* v0.8.0: graceful SIGTERM/SIGINT shutdown */
   #include <fcntl.h>
+  #include <poll.h>         /* v0.29.8: TLS read/write deadline after EINTR */
+  #include <limits.h>
+  #include <time.h>
 #endif
 /* v0.9.1: Http1.ServeAsync uses amalgame-async for I/O parking.
  * Declared as a [dependencies] entry in amalgame.toml so users
@@ -2312,6 +2315,42 @@ static inline i64 amalgame_h1_async_body_timeout_ms(AmalgameH1Conn* c) {
     return AMALGAME_H1_ASYNC_READ_TIMEOUT_MS;
 }
 
+#ifndef _WIN32
+/* v0.29.8: a blocking TLS read/write interrupted by a signal. bdwgc stops
+ * the world by signalling every thread, and under SO_RCVTIMEO /
+ * SO_SNDTIMEO the kernel never restarts the call (signal(7)): it fails
+ * with EINTR. Re-entering SSL_read/SSL_write at once re-armed the FULL
+ * socket timeout, so with collections more frequent than the timeout —
+ * any loaded server — the keep-alive idle timeout never fired. Instead,
+ * wait for the fd ourselves until the deadline the socket timeout set
+ * when the call began (`t0`). Returns 0 to retry the SSL call, -1 with
+ * errno = EAGAIN once the deadline has passed. A socket with no timeout
+ * (0) retries at once, as before. `to_ms` caches the timeout (-1 = not
+ * read yet). Windows needs none of this: its collector suspends threads
+ * without signals. */
+static int amalgame_tls_wait_after_eintr(int fd, int want_write, int optname,
+                                         const struct timespec* t0, long long* to_ms) {
+    if (*to_ms < 0) {
+        struct timeval tv; socklen_t l = sizeof(tv);
+        *to_ms = getsockopt(fd, SOL_SOCKET, optname, &tv, &l) == 0
+               ? (long long) tv.tv_sec * 1000 + tv.tv_usec / 1000 : 0;
+    }
+    if (*to_ms == 0) return 0;
+    for (;;) {
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+        long long left = *to_ms - ((now.tv_sec - t0->tv_sec) * 1000LL
+                                   + (now.tv_nsec - t0->tv_nsec) / 1000000LL);
+        if (left <= 0) { errno = EAGAIN; return -1; }
+        struct pollfd pfd;
+        pfd.fd = fd; pfd.events = want_write ? POLLOUT : POLLIN; pfd.revents = 0;
+        int pr = poll(&pfd, 1, left > INT_MAX ? INT_MAX : (int) left);
+        if (pr > 0) return 0;                        /* ready: retry the SSL call */
+        if (pr == 0) { errno = EAGAIN; return -1; }  /* deadline reached */
+        if (errno != EINTR) return -1;
+    }
+}
+#endif
+
 static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n,
                                      i64 timeout_ms) {
     /* v0.10.0: TLS branch. SSL_read fully drains its own internal
@@ -2321,7 +2360,12 @@ static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n,
      * pattern. The plain-text path below stays bit-identical to
      * v0.9.x. */
     if (c->ssl) {
+#ifndef _WIN32
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        long long to_ms = -1;
+#endif
         while (1) {
+            errno = 0;
             int r = SSL_read(c->ssl, buf, (int) n);
             if (r > 0) return (ssize_t) r;
             int err = SSL_get_error(c->ssl, r);
@@ -2334,12 +2378,24 @@ static ssize_t amalgame_h1_recv_into(AmalgameH1Conn* c, void* buf, size_t n,
                     if (!ok) { errno = ETIMEDOUT; return -1; }
                     continue;
                 }
-                /* Blocking SSL — OpenSSL handles waits internally;
-                 * a WANT_* from a blocking BIO is unusual. Retry. */
-                continue;
+                /* Blocking SSL: a WANT_* means the socket read failed
+                 * with a "retry" errno. EINTR (a GC signal — never
+                 * restarted under SO_RCVTIMEO, signal(7)) is retried.
+                 * v0.29.8: EAGAIN is SO_RCVTIMEO expiring — the keep-alive
+                 * idle / header timeout. It used to be retried too, so on
+                 * TLS that timeout never fired: an idle keep-alive client
+                 * held its ServePool worker until it hung up (minutes for
+                 * a browser), and `workers` idle connections froze the
+                 * server. Report it like the plain-text path: -1, EAGAIN. */
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+            } else if (!(err == SSL_ERROR_SYSCALL && errno == EINTR)) {
+                return -1;
             }
-            if (err == SSL_ERROR_SYSCALL && errno == EINTR) continue;
-            return -1;
+#ifndef _WIN32
+            if (errno == EINTR && amalgame_tls_wait_after_eintr(
+                    c->fd, err == SSL_ERROR_WANT_WRITE, SO_RCVTIMEO, &t0, &to_ms) != 0)
+                return -1;
+#endif
         }
     }
     int flags = c->async_io ? MSG_DONTWAIT : 0;
@@ -2364,7 +2420,12 @@ static int amalgame_h1_send_all(AmalgameH1Conn* c, const void* buf, size_t n) {
      * into the SSL record buffer; partial writes manifest as WANT_*
      * rather than short returns, so the loop pattern is the same. */
     if (c->ssl) {
+#ifndef _WIN32
+        struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+        long long to_ms = -1;
+#endif
         while (left > 0) {
+            errno = 0;
             int w = SSL_write(c->ssl, p, (int) left);
             if (w > 0) {
                 p    += w;
@@ -2380,10 +2441,17 @@ static int amalgame_h1_send_all(AmalgameH1Conn* c, const void* buf, size_t n) {
                     if (!ok) { errno = ETIMEDOUT; return -1; }
                     continue;
                 }
-                continue;
+                /* v0.29.8: same as the read side — EAGAIN is SO_SNDTIMEO
+                 * expiring (body_timeout_sec), not a reason to retry. */
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return -1;
+            } else if (!(err == SSL_ERROR_SYSCALL && errno == EINTR)) {
+                return -1;
             }
-            if (err == SSL_ERROR_SYSCALL && errno == EINTR) continue;
-            return -1;
+#ifndef _WIN32
+            if (errno == EINTR && amalgame_tls_wait_after_eintr(
+                    c->fd, err == SSL_ERROR_WANT_READ ? 0 : 1, SO_SNDTIMEO, &t0, &to_ms) != 0)
+                return -1;
+#endif
         }
         return 0;
     }

@@ -87,8 +87,18 @@ let post: HttpResponse = HttpClient.Post(
 let custom = HttpClient.Request("PATCH", "http://api.example.com/users/42")
     .Header("Authorization", "Bearer ...")
     .BodyJson("{\"name\":\"Bob\"}")
+    .Timeout(120000)          // ms of silence before giving up (default 30000)
     .Send()
 ```
+
+Over `https://` the server is checked twice (v0.29.9): its certificate
+must chain to a CA of the system store **and** be issued for the host in
+the URL (DNS name, or an IP address in the certificate's SAN for an IP
+URL). A certificate valid for another name is refused: `StatusCode` 0,
+`BodyText` `tls error -3 (handshake failed or certificate not valid for
+<host>)`. A request that times out gives `StatusCode` 0 and `BodyText`
+`timeout`, never a truncated body. To trust a private CA (a site PKI, a
+test CA), point OpenSSL at it: `SSL_CERT_FILE=/path/ca.pem`.
 
 ## Classes
 
@@ -324,7 +334,7 @@ high-level entry point.
 ## What's NOT in v0.1 (deferred to v0.1.x)
 
 - HTTP/2 via nghttp2 (the runtime header stub is in place for the binding)
-- HTTPS in `HttpClient.Execute` (the TCP path works, TLS path waits for amalgame-tls integration)
+- ~~HTTPS in `HttpClient.Execute`~~ (done in v0.11.0 ; server name checked since v0.29.9)
 - Keep-alive (each connection currently handles one request)
 - Streaming body / chunked transfer encoding
 - Multipart form parsing

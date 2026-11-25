@@ -1420,4 +1420,13 @@ else
     exit 1
 fi
 
+# ── HttpClient : server name checked, timeout, GC signals (v0.29.9) ──
+echo -e "\n── HttpClient HTTPS : certificate name, timeout, GC signals ──"
+if AMC="$AMC" FACADE_O="$BUILD_DIR/facade.o" AMC_RUNTIME="$RUNTIME_DIR" ASYNC_RT="$ASYNC_RUNTIME_DIR" TLS_RT="$TLS_RUNTIME_DIR" bash tests/client_verify_test.sh; then
+    echo -e "${GREEN}PASS${NC} (wrong-name certificate refused, timeouts reported, reads survive GC signals)"
+else
+    echo -e "${RED}FAIL${NC} (HttpClient HTTPS verification)"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

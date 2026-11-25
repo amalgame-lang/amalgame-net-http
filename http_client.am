@@ -27,13 +27,77 @@ import Amalgame.String
     #include <stdio.h>     /* binary download → FILE* */
     #include <stdlib.h>
     #include <errno.h>
+    #include <openssl/x509v3.h>   /* X509_VERIFY_PARAM_set1_ip_asc, X509_CHECK_FLAG_* */
+
+    /* v0.29.9 — the server's NAME is checked, not only its chain.
+     * Until then the client verified that the certificate was signed by
+     * a trusted CA, but not that it was issued for the host it called :
+     * anyone on the path holding any valid certificate (for their own
+     * domain) could impersonate the server and read the request — an
+     * API key, a password. The host is pinned on the SSL object before
+     * the handshake : a DNS name with SSL_set1_host (no partial
+     * wildcards), an IP literal with X509_VERIFY_PARAM_set1_ip_asc.
+     * A mismatch fails the handshake (SSL_VERIFY_PEER). Returns 0 when
+     * the host could not be pinned (the caller refuses the request). */
+    static int amnh_pin_host(SSL* ssl, const char* host) {
+        if (!ssl || !host || !host[0]) return 0;
+        unsigned char ipbuf[16];
+        if (inet_pton(AF_INET, host, ipbuf) == 1 || inet_pton(AF_INET6, host, ipbuf) == 1) {
+            return X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host) == 1;
+        }
+        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        return SSL_set1_host(ssl, host) == 1;
+    }
+
+    /* v0.29.9 — a read/write timeout on the socket : `ms` of SILENCE
+     * (not a total), so a large slow body still comes through. */
+    static void amnh_set_timeout(int fd, long ms) {
+        if (fd < 0 || ms <= 0) return;
+        #ifdef _WIN32
+        DWORD t = (DWORD) ms;
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_RCVTIMEO, (const char*) &t, sizeof(t));
+        setsockopt((SOCKET) fd, SOL_SOCKET, SO_SNDTIMEO, (const char*) &t, sizeof(t));
+        #else
+        struct timeval tv; tv.tv_sec = ms / 1000; tv.tv_usec = (ms % 1000) * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        #endif
+    }
+    /* After a failed read : 1 = interrupted (a signal — the GC's stop
+     * signals among them), read again ; 2 = the timeout ; 0 = the end. */
+    static int amnh_read_failed(void) {
+        #ifdef _WIN32
+        int w = WSAGetLastError();
+        if (w == WSAEINTR) return 1;
+        if (w == WSAETIMEDOUT || w == WSAEWOULDBLOCK) return 2;
+        return 0;
+        #else
+        if (errno == EINTR) return 1;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 2;
+        return 0;
+        #endif
+    }
+    /* The TLS handshake, started again when a signal interrupted it. */
+    static int amnh_handshake(AmalgameTlsStream* st) {
+        for (int tries = 0; tries < 20; tries++) {
+            errno = 0;
+            if (Amalgame_Tls_TlsStream_Handshake(st)) return 1;
+            if (amnh_read_failed() != 1) return 0;
+        }
+        return 0;
+    }
 
     /* v0.27.0 — binary-safe download-to-file plumbing. Reading a binary
      * response into an AM string truncates at the first NUL; instead we
      * stream the response body straight to a FILE* on disk. */
     static long amnh_rd(AmalgameTlsStream* st, int fd, char* buf, long n) {
-        if (st) return (long) Amalgame_Tls_TlsStream_ReadBytes(st, buf, (i64) n);
-        return (long) recv(fd, buf, (size_t) n, 0);
+        for (;;) {   /* v0.29.9 : read again when a signal interrupted the read */
+            errno = 0;
+            long r = st ? (long) Amalgame_Tls_TlsStream_ReadBytes(st, buf, (i64) n)
+                        : (long) recv(fd, buf, (size_t) n, 0);
+            if (r < 0 && amnh_read_failed() == 1) continue;
+            return r;
+        }
     }
     static long amnh_wr(AmalgameTlsStream* st, int fd, const char* buf, long n) {
         if (st) return (long) Amalgame_Tls_TlsStream_WriteBytes(st, (char*) buf, (i64) n);
@@ -54,7 +118,7 @@ import Amalgame.String
             if (!ctx || !ctx->_ctx) return -2;
             st = Amalgame_Tls_TlsStream_Wrap((i64) fd, ctx, false);
             if (st && st->_ssl && host) SSL_set_tlsext_host_name((SSL*) st->_ssl, host);
-            if (!st || !Amalgame_Tls_TlsStream_Handshake(st)) {
+            if (!st || !st->_ssl || !amnh_pin_host((SSL*) st->_ssl, host) || !amnh_handshake(st)) {
                 if (st) Amalgame_Tls_TlsStream_Close(st);
                 return -3;
             }
@@ -112,7 +176,15 @@ import Amalgame.String
             long want = (long) sizeof(dlbuf);
             if (contentLen >= 0 && contentLen - written < want) want = contentLen - written;
             long rn = amnh_rd(st, fd, dlbuf, want);
-            if (rn <= 0) break;
+            if (rn <= 0) {
+                /* v0.29.9 : a body shorter than announced is an error, not a file */
+                if (contentLen >= 0 && written < contentLen) {
+                    fclose(fp); remove(outPath);
+                    if (st) Amalgame_Tls_TlsStream_Close(st);
+                    return -8;
+                }
+                break;
+            }
             fwrite(dlbuf, 1, (size_t) rn, fp);
             written += rn;
         }
@@ -134,12 +206,22 @@ public class HttpRequestBuilder {
     public Url:     string
     public Headers: Map<string, string>
     public Body:    string
+    // v0.29.9 : milliseconds of silence before the request is given up
+    // (the server says nothing, or stops halfway). A response cut by the
+    // timeout is an error (Status 0, "timeout"), never a short body.
+    public TimeoutMs: int
 
     public HttpRequestBuilder() {
         this.Method  = "GET"
         this.Url     = ""
         this.Headers = new Map<string, string>()
         this.Body    = ""
+        this.TimeoutMs = 30000
+    }
+
+    public HttpRequestBuilder Timeout(int ms) {
+        this.TimeoutMs = ms
+        return this
     }
 
     public HttpRequestBuilder Header(string name, string value) {
@@ -314,6 +396,7 @@ public class HttpClient {
                 + "Connection: close" + crlf + crlf
             let conn = TcpClient_Connect(u.Host, port)
             if (!TcpClient_IsConnected(conn)) { return false }
+            @c { amnh_set_timeout(conn ? conn->_fd : -1, 30000); }
             var rc: int = -1
             var location: string = ""
             let reqC: string = req
@@ -391,6 +474,7 @@ public class HttpClient {
             // "http/1.1" for parity with the plaintext path.
             let host: string = u.Host
             let req:  string = s
+            let timeoutMs: int = b.TimeoutMs
             var status: int = 0
             var rawResp: string = ""
             @c {
@@ -398,6 +482,7 @@ public class HttpClient {
                 if (fd < 0) {
                     status = -1;
                 } else {
+                    amnh_set_timeout(fd, (long) timeoutMs);
                     AmalgameTlsConfig* cfg =
                         Amalgame_Tls_TlsConfig_Default();
                     cfg = Amalgame_Tls_TlsConfig_WithAlpn(cfg, "http/1.1");
@@ -410,14 +495,21 @@ public class HttpClient {
                         if (stream && stream->_ssl && host) {
                             SSL_set_tlsext_host_name((SSL*) stream->_ssl, host);
                         }
-                        if (!stream || !Amalgame_Tls_TlsStream_Handshake(stream)) {
+                        if (!stream || !stream->_ssl || !amnh_pin_host((SSL*) stream->_ssl, host)
+                            || !amnh_handshake(stream)) {
                             status = -3;
                             if (stream) Amalgame_Tls_TlsStream_Close(stream);
                         } else {
-                            /* Send request bytes via TLS. */
+                            /* Send request bytes via TLS (again, same
+                             * bytes, when a signal interrupted it). */
                             size_t reqLen = req ? strlen(req) : 0;
-                            i64 wn = Amalgame_Tls_TlsStream_WriteBytes(
-                                stream, req ? req : "", (i64) reqLen);
+                            i64 wn = -1;
+                            for (int tries = 0; tries < 20; tries++) {
+                                errno = 0;
+                                wn = Amalgame_Tls_TlsStream_WriteBytes(
+                                    stream, req ? req : "", (i64) reqLen);
+                                if (wn >= 0 || amnh_read_failed() != 1) break;
+                            }
                             if (wn < 0) {
                                 status = -4;
                                 Amalgame_Tls_TlsStream_Close(stream);
@@ -451,10 +543,21 @@ public class HttpClient {
                                 char* buf = (char*) GC_MALLOC(cap);
                                 char chunk[4096];
                                 size_t maxBody = 1048576;
+                                int timedOut = 0;
                                 for (;;) {
+                                    errno = 0;
                                     i64 rn = Amalgame_Tls_TlsStream_ReadBytes(
                                         stream, chunk, (i64) sizeof(chunk));
-                                    if (rn <= 0) break;
+                                    if (rn < 0) {
+                                        /* v0.29.9 : a signal is not the end
+                                         * (read again), and a timeout is an
+                                         * error, never a short response. */
+                                        int why = amnh_read_failed();
+                                        if (why == 1) continue;
+                                        if (why == 2) timedOut = 1;
+                                        break;
+                                    }
+                                    if (rn == 0) break;
                                     if (total + rn > cap) {
                                         size_t newCap = cap * 2;
                                         while (newCap < total + (size_t) rn) newCap *= 2;
@@ -475,13 +578,19 @@ public class HttpClient {
                                 if (total > 0) memcpy(nul, buf, total);
                                 nul[total] = 0;
                                 rawResp = nul;
-                                status = 0;
+                                status = timedOut ? -8 : 0;
                             }
                         }
                     }
                 }
             }
             TcpClient_Close(conn)
+            if (status == -8) {
+                return HttpResponse.New().Status(0).Text("timeout")
+            }
+            if (status == -3) {
+                return HttpResponse.New().Status(0).Text("tls error -3 (handshake failed or certificate not valid for " + host + ")")
+            }
             if (status != 0) {
                 return HttpResponse.New().Status(0).Text("tls error " + String_FromInt(status))
             }
@@ -517,16 +626,15 @@ public class HttpClient {
         // path already did this — only the plaintext path was naive.
         TcpClient_Send(conn, s)
         var raw: string = null
+        let plainTimeoutMs: int = b.TimeoutMs
+        var plainTimedOut: bool = false
         @c {
             /* A read timeout, which the single-recv version also lacked.
              * Without one, a server that accepts a connection and then
              * says nothing hangs the caller for ever. Thirty seconds of
              * SILENCE — not thirty seconds total — so a large slow body
              * still comes through. */
-            #ifndef _WIN32
-            struct timeval _tv; _tv.tv_sec = 30; _tv.tv_usec = 0;
-            setsockopt(conn->_fd, SOL_SOCKET, SO_RCVTIMEO, &_tv, sizeof(_tv));
-            #endif
+            amnh_set_timeout(conn->_fd, (long) plainTimeoutMs);   /* v0.29.9 : TimeoutMs, Windows too */
             size_t _cap = 8192, _total = 0;
             char* _buf = (char*) GC_MALLOC(_cap);
             const size_t _MAXB = 1048576;   /* 1 MB cap, as before */
@@ -543,8 +651,10 @@ public class HttpClient {
                     }
                     ssize_t _r = recv(conn->_fd, _buf + _total, _cap - _total - 1, 0);
                     if (_r < 0) {
-                        if (errno == EINTR) continue;
-                        break;                          /* timeout or error */
+                        int _why = amnh_read_failed();
+                        if (_why == 1) continue;
+                        if (_why == 2) plainTimedOut = true;   /* v0.29.9 : an error, not a short body */
+                        break;
                     }
                     if (_r == 0) break;                 /* server closed: done */
                     _total += (size_t) _r;
@@ -554,6 +664,9 @@ public class HttpClient {
             }
         }
         TcpClient_Close(conn)
+        if (plainTimedOut) {
+            return HttpResponse.New().Status(0).Text("timeout")
+        }
         if (raw == null) {
             return HttpResponse.New().Status(0).Text("read failed")
         }

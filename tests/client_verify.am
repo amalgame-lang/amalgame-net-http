@@ -1,0 +1,70 @@
+// Client side of tests/client_verify_test.sh (v0.29.9) : HttpClient over
+// HTTPS with certificate verification on. Parameters come from the
+// environment : CV_URL, CV_TIMEOUT (ms), CV_COUNT (requests), CV_CHURN (1 :
+// a thread allocates and collects meanwhile, so GC signals interrupt the
+// reads). One line per request :
+//   status=<code> ms=<elapsed> complete=<1 when the body ends with </HTML>> text=<error text>
+
+namespace Tests
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net
+import Amalgame.Net.Http
+
+@c {
+    #include <pthread.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <time.h>
+    #include <unistd.h>
+    /* gc.h declares it only under GC_THREADS ; gcc 14+ rejects the implicit declaration */
+    extern int GC_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+    static volatile int cv_stop = 0;
+    static void* cv_churn(void* p) {
+        (void) p;
+        while (!cv_stop) {
+            for (int i = 0; i < 2000; i++) { volatile char* x = (char*) GC_MALLOC(256); x[0] = 1; }
+            GC_gcollect();
+            usleep(1000);
+        }
+        return NULL;
+    }
+    static long cv_now_ms(void) {
+        struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+        return (long) t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+    }
+    static const char* cv_env(const char* k, const char* d) { const char* v = getenv(k); return v ? v : d; }
+}
+
+public class Program {
+    public static void Main(string[] args) {
+        var url: string = ""
+        var timeoutMs: int = 30000
+        var count: int = 1
+        @c {
+            url = (code_string) cv_env("CV_URL", "");
+            timeoutMs = atol(cv_env("CV_TIMEOUT", "30000"));
+            count = atol(cv_env("CV_COUNT", "1"));
+            if (atoi(cv_env("CV_CHURN", "0"))) {
+                pthread_t t; GC_pthread_create(&t, NULL, cv_churn, NULL);
+            }
+        }
+        for i in 0..count {
+            let b: HttpRequestBuilder = HttpClient.Request("GET", url).Timeout(timeoutMs)
+            var t0: int = 0
+            @c { t0 = cv_now_ms(); }
+            let r: HttpResponse = b.Send()
+            var ms: int = 0
+            @c { ms = cv_now_ms() - t0; }
+            let body: string = r.BodyText
+            var complete: int = 0
+            @c { complete = (body && strstr((const char*) body, "</HTML>")) ? 1 : 0; }
+            var text: string = ""
+            if (r.StatusCode == 0) { text = body }
+            Console.WriteLine("status=" + String_FromInt(r.StatusCode) + " ms=" + String_FromInt(ms)
+                + " complete=" + String_FromInt(complete) + " text=" + text)
+        }
+        @c { cv_stop = 1; }
+    }
+}

@@ -110,6 +110,22 @@ for src in $NETHTTP_SOURCES; do
     NETHTTP_EXTERNAL_FLAGS="$NETHTTP_EXTERNAL_FLAGS --external $src"
 done
 
+# ── The manifest is valid TOML (v0.30.1) ─────────────────────────
+# v0.30.0 shipped unescaped quotes in the description : amc could no longer
+# read the manifest, and every package depending on net-http stopped seeing
+# its classes. The compiler tolerates some damage silently ; this does not.
+echo -e "\n── amalgame.toml is valid TOML ──"
+if command -v python3 >/dev/null 2>&1 && python3 -c "import tomllib" 2>/dev/null; then
+    if python3 -c "import tomllib,sys; d=tomllib.load(open('amalgame.toml','rb')); assert d['package']['name'] == 'amalgame-net-http' and d['stdlib']['functions']; print('version', d['package']['version'], '-', len(d['stdlib']['functions']), 'functions')"; then
+        echo -e "${GREEN}PASS${NC} (manifest)"
+    else
+        echo -e "${RED}FAIL${NC} (amalgame.toml is not valid TOML)"
+        exit 1
+    fi
+else
+    echo "SKIP (python3 with tomllib missing)"
+fi
+
 # ── Build facade.o once ───────────────────────────────────────────
 echo -e "\n── Building facade.o ──"
 "$AMC" --lib -o "$BUILD_DIR/facade" $NETHTTP_SOURCES 2>&1 | tail -2

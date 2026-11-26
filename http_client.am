@@ -28,6 +28,7 @@ import Amalgame.String
     #include <stdlib.h>
     #include <errno.h>
     #include <openssl/x509v3.h>   /* X509_VERIFY_PARAM_set1_ip_asc, X509_CHECK_FLAG_* */
+    #include <openssl/evp.h>      /* EVP_EncodeBlock (proxy credentials) */
 
     /* v0.29.9 — the server's NAME is checked, not only its chain.
      * Until then the client verified that the certificate was signed by
@@ -77,6 +78,39 @@ import Amalgame.String
         return 0;
         #endif
     }
+    /* v0.30.0 — a CONNECT tunnel through an HTTP proxy, on a connected fd :
+     * "CONNECT host:port", optional Basic credentials, then the proxy's
+     * status line. Returns the status (200 = tunnel open), -1 on I/O error.
+     * The proxy's reply is read byte by byte up to the blank line, so not a
+     * byte of the tunnel (the server's TLS) is consumed. */
+    static int amnh_tunnel(int fd, const char* host, int port, const char* auth) {
+        if (fd < 0 || !host) return -1;
+        char req[1024];
+        int n;
+        if (auth && auth[0]) n = snprintf(req, sizeof(req), "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Authorization: Basic %s\r\n\r\n", host, port, host, port, auth);
+        else n = snprintf(req, sizeof(req), "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n", host, port, host, port);
+        if (n <= 0 || n >= (int) sizeof(req)) return -1;
+        long sent = 0;
+        while (sent < n) {
+            errno = 0;
+            long w = (long) send(fd, req + sent, (size_t)(n - sent), 0);
+            if (w < 0 && amnh_read_failed() == 1) continue;
+            if (w <= 0) return -1;
+            sent += w;
+        }
+        char buf[8192]; int got = 0;
+        while (got < (int) sizeof(buf) - 1) {
+            errno = 0;
+            long r = (long) recv(fd, buf + got, 1, 0);
+            if (r < 0 && amnh_read_failed() == 1) continue;
+            if (r <= 0) return -1;
+            got += 1; buf[got] = 0;
+            if (got >= 4 && memcmp(buf + got - 4, "\r\n\r\n", 4) == 0) break;
+        }
+        char* sp = strchr(buf, ' ');
+        return sp ? atoi(sp + 1) : -1;
+    }
+
     /* The TLS handshake, started again when a signal interrupted it. */
     static int amnh_handshake(AmalgameTlsStream* st) {
         for (int tries = 0; tries < 20; tries++) {
@@ -210,6 +244,9 @@ public class HttpRequestBuilder {
     // (the server says nothing, or stops halfway). A response cut by the
     // timeout is an error (Status 0, "timeout"), never a short body.
     public TimeoutMs: int
+    // v0.30.0 : "http://[user:password@]host:port" ; "" = the environment
+    // (HTTPS_PROXY / HTTP_PROXY / NO_PROXY) ; "none" = direct, whatever it says.
+    public ProxyUrl: string
 
     public HttpRequestBuilder() {
         this.Method  = "GET"
@@ -217,6 +254,12 @@ public class HttpRequestBuilder {
         this.Headers = new Map<string, string>()
         this.Body    = ""
         this.TimeoutMs = 30000
+        this.ProxyUrl = ""
+    }
+
+    public HttpRequestBuilder Proxy(string url) {
+        this.ProxyUrl = url
+        return this
     }
 
     public HttpRequestBuilder Timeout(int ms) {
@@ -272,7 +315,102 @@ public class ParsedUrl {
     }
 }
 
+// v0.30.0 — an HTTP proxy : "http://[user:password@]host:port".
+// Auth is the base64 of "user:password" (Proxy-Authorization: Basic).
+public class ProxySpec {
+    public Host: string
+    public Port: int
+    public Auth: string
+    public Bad:  string    // why the proxy setting cannot be used ("" when fine)
+
+    public ProxySpec() {
+        this.Host = ""
+        this.Port = 0
+        this.Auth = ""
+        this.Bad  = ""
+    }
+
+    public static ProxySpec Parse(string raw) {
+        let p = new ProxySpec()
+        var rest: string = String_Trim(raw)
+        let sep: int = String_IndexOf(rest, "://")
+        if (sep >= 0) {
+            let scheme: string = String_ToLower(String_Substring(rest, 0, sep))
+            if (scheme != "http") { p.Bad = "proxy scheme " + scheme + " not supported (http:// only)" ; return p }
+            rest = String_Substring(rest, sep + 3, String_Length(rest) - sep - 3)
+        }
+        let slash: int = String_IndexOf(rest, "/")
+        if (slash >= 0) { rest = String_Substring(rest, 0, slash) }
+        let at: int = String_LastIndexOf(rest, "@")
+        if (at >= 0) {
+            let userinfo: string = String_Substring(rest, 0, at)
+            rest = String_Substring(rest, at + 1, String_Length(rest) - at - 1)
+            var enc: string = ""
+            @c {
+                const char* ui = (const char*) userinfo;
+                size_t ul = ui ? strlen(ui) : 0;
+                char* out = (char*) GC_MALLOC(4 * ((ul + 2) / 3) + 1);
+                EVP_EncodeBlock((unsigned char*) out, (const unsigned char*) ui, (int) ul);
+                enc = out;
+            }
+            p.Auth = enc
+        }
+        let colon: int = String_LastIndexOf(rest, ":")
+        if (colon < 0) { p.Bad = "proxy port missing (http://host:port)" ; return p }
+        p.Host = String_Substring(rest, 0, colon)
+        p.Port = String_ToInt(String_Substring(rest, colon + 1, String_Length(rest) - colon - 1))
+        if (String_Length(p.Host) == 0 || p.Port <= 0) { p.Bad = "proxy address : http://host:port" }
+        return p
+    }
+}
+
 public class HttpClient {
+    // v0.30.0 — the proxy for this request, or null (direct) : the
+    // request's own Proxy(...) ("none" forces direct), else the environment
+    // (HTTPS_PROXY for https://, HTTP_PROXY for http://, either case) unless
+    // NO_PROXY names the host.
+    public static ProxySpec ProxyFor(HttpRequestBuilder b, ParsedUrl u) {
+        var raw: string = b.ProxyUrl
+        if (raw == "none") { return null }
+        if (String_Length(raw) == 0) {
+            if (u.Scheme == "https") { raw = HttpClient.EnvOf("HTTPS_PROXY", "https_proxy") } else { raw = HttpClient.EnvOf("HTTP_PROXY", "http_proxy") }
+            if (String_Length(raw) == 0) { return null }
+            if (HttpClient.NoProxy(u.Host, HttpClient.EnvOf("NO_PROXY", "no_proxy"))) { return null }
+        }
+        return ProxySpec.Parse(raw)
+    }
+
+    public static string EnvOf(string a, string b) {
+        var v: string = ""
+        @c {
+            const char* x = getenv((const char*) a);
+            if (!x || !x[0]) x = getenv((const char*) b);
+            if (x) v = (code_string) x;
+        }
+        return v
+    }
+
+    // NO_PROXY : comma-separated names ; "*" = everything ; an entry matches
+    // the host itself and its subdomains (".example.com" or "example.com").
+    public static bool NoProxy(string host, string list) {
+        if (String_Length(list) == 0) { return false }
+        let h: string = String_ToLower(host)
+        let items: List<string> = String_Split(list, ",")
+        let n: int = items.Count()
+        for i in 0..n {
+            var e: string = String_ToLower(String_Trim(items.Get(i)))
+            if (String_Length(e) == 0) { continue }
+            if (e == "*") { return true }
+            if (String_StartsWith(e, ".")) { e = String_Substring(e, 1, String_Length(e) - 1) }
+            if (h == e) { return true }
+            let suffix: string = "." + e
+            let hl: int = String_Length(h)
+            let sl: int = String_Length(suffix)
+            if (hl > sl && String_Substring(h, hl - sl, sl) == suffix) { return true }
+        }
+        return false
+    }
+
     // Quick GET — returns the response (or a stub 0 if connect fails).
     public static HttpResponse Get(string url) {
         let b = new HttpRequestBuilder()
@@ -388,15 +526,36 @@ public class HttpClient {
             let isTls: bool = u.Scheme == "https"
             var port: int = u.Port
             if (port == 0) { if (isTls) { port = 443 } else { port = 80 } }
+            // v0.30.0 : through the proxy of the environment, like Execute.
+            let pb = new HttpRequestBuilder()
+            pb.Url = cur
+            let px: ProxySpec = HttpClient.ProxyFor(pb, u)
+            if (px != null && String_Length(px.Bad) > 0) { return false }
             let crlf: string = String_FromByte(13) + "\n"
-            let req: string = "GET " + u.Path + " HTTP/1.1" + crlf
-                + "Host: " + u.Host + crlf
-                + "User-Agent: amalgame-net-http/0.27" + crlf
+            var target: string = u.Path
+            var pauth: string = ""
+            if (px != null && !isTls) {
+                target = "http://" + u.Host + ":" + String_FromInt(port) + u.Path
+                if (String_Length(px.Auth) > 0) { pauth = "Proxy-Authorization: Basic " + px.Auth + crlf }
+            }
+            let req: string = "GET " + target + " HTTP/1.1" + crlf
+                + "Host: " + u.Host + crlf + pauth
+                + "User-Agent: amalgame-net-http/0.30" + crlf
                 + "Accept: */*" + crlf
                 + "Connection: close" + crlf + crlf
-            let conn = TcpClient_Connect(u.Host, port)
+            var connHost: string = u.Host
+            var connPort: int = port
+            if (px != null) { connHost = px.Host ; connPort = px.Port }
+            let conn = TcpClient_Connect(connHost, connPort)
             if (!TcpClient_IsConnected(conn)) { return false }
             @c { amnh_set_timeout(conn ? conn->_fd : -1, 30000); }
+            if (px != null && isTls) {
+                let thost: string = u.Host
+                let tauth: string = px.Auth
+                var tst: int = 0
+                @c { tst = amnh_tunnel(conn ? conn->_fd : -1, (const char*) thost, (int) port, (const char*) tauth); }
+                if (tst != 200) { TcpClient_Close(conn) ; return false }
+            }
             var rc: int = -1
             var location: string = ""
             let reqC: string = req
@@ -442,11 +601,20 @@ public class HttpClient {
             if (isTls) { port = 443 } else { port = 80 }
         }
 
+        // v0.30.0 — a proxy, when one applies : b.ProxyUrl, else HTTPS_PROXY
+        // (https://) or HTTP_PROXY (http://), unless NO_PROXY names the host.
+        let px: ProxySpec = HttpClient.ProxyFor(b, u)
+        if (px != null && String_Length(px.Bad) > 0) { return HttpResponse.New().Status(0).Text(px.Bad) }
+
         // Build request bytes.
         let crlf: string = String_FromByte(13) + "\n"
         let cl: int = String_Length(b.Body)
-        var s: string = b.Method + " " + u.Path + " HTTP/1.1" + crlf
+        var target: string = u.Path
+        // Plain HTTP through a proxy : the absolute form (RFC 9112 §3.2.2).
+        if (px != null && !isTls) { target = "http://" + u.Host + ":" + String_FromInt(port) + u.Path }
+        var s: string = b.Method + " " + target + " HTTP/1.1" + crlf
         s = s + "Host: " + u.Host + crlf
+        if (px != null && !isTls && String_Length(px.Auth) > 0) { s = s + "Proxy-Authorization: Basic " + px.Auth + crlf }
         s = s + "Content-Length: " + String_FromInt(cl) + crlf
         s = s + "Connection: close" + crlf
         let hk: List<string> = b.Headers.Keys()
@@ -457,10 +625,32 @@ public class HttpClient {
         }
         s = s + crlf + b.Body
 
-        // Connect (TCP — TLS upgrade follows for https://).
-        let conn = TcpClient_Connect(u.Host, port)
+        // Connect (TCP — TLS upgrade follows for https://). Through a proxy :
+        // to the proxy ; for https:// a CONNECT tunnel to the server first,
+        // then TLS end to end inside it (the proxy sees only ciphertext, and
+        // the server's certificate and name are checked exactly as direct).
+        var connHost: string = u.Host
+        var connPort: int = port
+        if (px != null) { connHost = px.Host ; connPort = px.Port }
+        let conn = TcpClient_Connect(connHost, connPort)
         if (!TcpClient_IsConnected(conn)) {
+            if (px != null) { return HttpResponse.New().Status(0).Text("proxy connect failed (" + connHost + ":" + String_FromInt(connPort) + ")") }
             return HttpResponse.New().Status(0).Text("connect failed")
+        }
+        if (px != null && isTls) {
+            let thost: string = u.Host
+            let tauth: string = px.Auth
+            let ttmo: int = b.TimeoutMs
+            var tst: int = 0
+            @c {
+                int fd = conn ? conn->_fd : -1;
+                amnh_set_timeout(fd, (long) ttmo);
+                tst = amnh_tunnel(fd, (const char*) thost, (int) port, (const char*) tauth);
+            }
+            if (tst != 200) {
+                TcpClient_Close(conn)
+                return HttpResponse.New().Status(0).Text("proxy refused the tunnel (" + String_FromInt(tst) + ")")
+            }
         }
 
         if (isTls) {

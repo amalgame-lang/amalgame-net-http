@@ -1,6 +1,7 @@
 // Client side of tests/client_verify_test.sh (v0.29.9) : HttpClient over
 // HTTPS with certificate verification on. Parameters come from the
-// environment : CV_URL, CV_TIMEOUT (ms), CV_COUNT (requests), CV_CHURN (1 :
+// environment : CV_URL, CV_PROXY (Proxy(...) of the request, v0.30.0 ;
+// HTTPS_PROXY & co are read by the client itself), CV_TIMEOUT (ms), CV_COUNT (requests), CV_CHURN (1 :
 // a thread allocates and collects meanwhile, so GC signals interrupt the
 // reads). One line per request :
 //   status=<code> ms=<elapsed> complete=<1 when the body ends with </HTML>> text=<error text>
@@ -42,8 +43,10 @@ public class Program {
         var url: string = ""
         var timeoutMs: int = 30000
         var count: int = 1
+        var proxy: string = ""
         @c {
             url = (code_string) cv_env("CV_URL", "");
+            proxy = (code_string) cv_env("CV_PROXY", "");
             timeoutMs = atol(cv_env("CV_TIMEOUT", "30000"));
             count = atol(cv_env("CV_COUNT", "1"));
             if (atoi(cv_env("CV_CHURN", "0"))) {
@@ -52,6 +55,7 @@ public class Program {
         }
         for i in 0..count {
             let b: HttpRequestBuilder = HttpClient.Request("GET", url).Timeout(timeoutMs)
+            if (String_Length(proxy) > 0) { b.Proxy(proxy) }
             var t0: int = 0
             @c { t0 = cv_now_ms(); }
             let r: HttpResponse = b.Send()

@@ -1429,4 +1429,13 @@ else
     exit 1
 fi
 
+# ── HttpClient through an HTTP proxy (v0.30.0) ──
+echo -e "\n── HttpClient through a proxy (CONNECT, credentials, NO_PROXY) ──"
+if AMC="$AMC" FACADE_O="$BUILD_DIR/facade.o" AMC_RUNTIME="$RUNTIME_DIR" ASYNC_RT="$ASYNC_RUNTIME_DIR" TLS_RT="$TLS_RUNTIME_DIR" bash tests/proxy_test.sh; then
+    echo -e "${GREEN}PASS${NC} (proxy : tunnel, credentials, end-to-end TLS, NO_PROXY, absolute form)"
+else
+    echo -e "${RED}FAIL${NC} (HttpClient proxy)"
+    exit 1
+fi
+
 echo -e "\n${GREEN}All tests completed${NC}"

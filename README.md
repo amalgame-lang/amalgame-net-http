@@ -100,6 +100,19 @@ URL). A certificate valid for another name is refused: `StatusCode` 0,
 `timeout`, never a truncated body. To trust a private CA (a site PKI, a
 test CA), point OpenSSL at it: `SSL_CERT_FILE=/path/ca.pem`.
 
+**Through a proxy** (v0.30.0): the environment's `HTTPS_PROXY` (for
+`https://`) or `HTTP_PROXY` (for `http://`), either case, unless `NO_PROXY`
+names the host (`a.com,.b.org,*`); or per request with
+`.Proxy("http://[user:password@]host:port")`, and `.Proxy("none")` to go
+direct whatever the environment says. `https://` goes through a `CONNECT`
+tunnel and TLS stays end to end inside it: the proxy only carries
+ciphertext, and the server's certificate and name are checked exactly as
+when direct (a proxy that tries to terminate TLS is refused). `http://`
+uses the absolute form. Proxy credentials go as `Proxy-Authorization:
+Basic`; a refusal is reported (`proxy refused the tunnel (407)`). Only
+`http://` proxies are supported: `socks5://` or `https://` is reported as
+such, never silently ignored. `DownloadToFile` follows the same proxy.
+
 ## Classes
 
 | Class | Purpose |

@@ -117,8 +117,8 @@ if [ "$ok" = 40 ]; then echo "[PASS] 5. 40 requêtes HTTPS sous les signaux du c
 else echo "[FAIL] 5. sous les signaux du collecteur : $ok/40 complètes"; echo "$out" | grep -v "complete=1" | head -3; FAILS=$((FAILS+1)); fi
 
 if [ -n "${OLD_DIR:-}" ] && [ -s "${OLD_FACADE_O:-}" ]; then
-    # The older client has no Timeout() : the witness drops it.
-    sed 's/\.Timeout(timeoutMs)//' "$PKG/tests/client_verify.am" > "$B/client_old.am"
+    # The older client has no Timeout() nor Proxy() : the witness drops them.
+    sed -e 's/\.Timeout(timeoutMs)//' -e '/b\.Proxy(proxy)/d' "$PKG/tests/client_verify.am" > "$B/client_old.am"
     if build "$OLD_DIR" "$OLD_FACADE_O" "$B/client_old.am" "$B/cli_old"; then
         out=$(run "$B/cli_old" https://localhost:18462/ 5000 1 0 2>&1 || true)
         echo "[TÉMOIN] version précédente, certificat valide d'un autre nom : $out"
